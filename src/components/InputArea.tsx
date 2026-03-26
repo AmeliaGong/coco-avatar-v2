@@ -39,7 +39,7 @@ export function InputArea({ onSend, disabled }: InputAreaProps) {
           className="flex-1 resize-none rounded-2xl border border-warm-grey/30 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-sage/50 focus:border-transparent disabled:bg-gray-50 disabled:text-gray-400 bg-warm-beige/10"
           style={{ minHeight: '48px', maxHeight: '120px' }}
           onInput={(e) => {
-            const target = e.target as HTMLTextAreaElement;
+            const target = e.currentTarget as HTMLTextAreaElement;
             target.style.height = 'auto';
             target.style.height = Math.min(target.scrollHeight, 120) + 'px';
           }}
