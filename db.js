@@ -118,8 +118,24 @@ export function migrateSchema(db) {
   ];
   for (const [table, column, type] of additions) {
     const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+    // PRAGMA table_info 对**不存在的表不报错**，只是返回空数组 ——
+    // 所以「表压根不存在」得自己看出来（否则下一步的 ALTER TABLE 会抛一句
+    // 干巴巴的 "no such table: xxx"，看不出该怎么办）。
+    if (!cols.length) {
+      throw new Error(
+        `migrateSchema：表 ${table} 不存在 —— 先跑 initSchema 建表，再补列`
+      );
+    }
     if (!cols.some(c => c.name === column)) {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      try {
+        db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      } catch (err) {
+        throw new Error(
+          `migrateSchema：给 ${table} 补列 ${column} 失败（${
+            err && err.message ? err.message : err
+          }）`
+        );
+      }
     }
   }
 }

@@ -51,8 +51,11 @@
 //   - 候选列表按出现位置**从后往前**排（**最新的在前**）。
 //   - 有 validator 时**正着遍历**这份列表，取**第一个通过校验的** ——
 //     即**最新**的那份合法卡点。
-//   - **没有 validator 时行为与从前完全一致**（extractStructured：取最后
-//     一个合法块）。两者方向一致，都偏向靠后出现的交付物。
+//   - **没有 validator 时**（extractStructured）：取**最新**那个**带值**的
+//     合法块。「带值」的意思是 marker 的值不是 null/undefined —— 这条
+//     规则由 structuredOutput.js 的 valueAtSpan 统一给出，有 validator 与
+//     没有 validator 的两条路径完全一致（否则「最后一个块的 marker 是
+//     null」这种输入下两条路径会给出不同答案）。
 //   - 全部候选都不过校验时，回退到**最新的**那个合法块，并标记
 //     structuredValidated=false。回退用的那份是**语法合法**的、**契约没过**
 //     的（多半是模型复述格式时抄的占位骨架），所以路由**不落库**。
