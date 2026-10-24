@@ -1384,12 +1384,16 @@ feat(engine): 引擎支持 1v1 转写注入；新增教练分析服务
 >
 > Express 4 **不接** async handler 返回的 promise rejection。一个没被接住的 rejection → Node 的 `unhandledRejection` → **进程直接退出**。fly.io 上是单进程，进程退出 = 整站掉线，而且能被反复触发成 crash-loop。
 >
-> 这不是假设：底座 Task 8 的代码质量评审就抓到一个同类的 Critical —— `/api/chat` 的 `client_id` 没做类型校验就绑进 SQL，传一个对象进去，better-sqlite3 抛 `RangeError`，一路逃到进程层。**它正在被修（Tide 那边），修完会给出 `server.js` 里一个可复用的写法 —— 直接照着用，不要自己另发明一套。**
+> 这不是假设：底座 Task 8 的代码质量评审就抓到一个同类的 Critical —— `/api/chat` 的 `client_id` 没做类型校验就绑进 SQL，传一个对象进去，better-sqlite3 抛 `RangeError`，一路逃到进程层。**它正在被修（Tide 那边）。**
+>
+> **可复用的包装形式定在哪：底座会把它抽成 `server/asyncRoute.js`，导出 `asyncRoute(handler)`。**（一开始它内联在 `server.js` 里 —— 但那样 `server.js` → `server/delivery/*` → `server.js` 会形成循环依赖，所以抽成独立模块，两边共用一份。）本任务的模块在 `server/delivery/` 下，import 路径是 `import { asyncRoute } from '../asyncRoute.js';`
+>
+> **不要自己另发明一套。**「统一 async 错误处理」这种事一重复就会漂 —— 底座那边也会加一条同名的测试（断言 5xx + 进程仍存活 + 下一次请求仍然正常），两边语义一致。底座部署后第一件事就是确认这个文件的最终名字与导出形状，**对不上就改这一行 import，不要改别的**。
 >
 > **本任务的所有新路由都是 async 的**，所以每一条都要满足：
 >
 > 1. handler 里所有可能抛的地方（数据库读写、JSON 解析、`await` 的下游）都要 try 住，**错误要变成 4xx/5xx 的 JSON 响应**，不能让它逃出去；
-> 2. handler 用底座给的那个可复用的 async 包装形式（或者等价的 `.catch(next)` + 一个 error middleware）；
+> 2. handler 用底座那个可复用的 `asyncRoute` 包装（`import { asyncRoute } from '../asyncRoute.js';`）—— 本任务所有新路由都写成 `app.post('/api/admin/...', asyncRoute(async (req, res) => { ... }));`；
 > 3. **有一条测试钉住它**：制造一个数据库错误（比如把一个必然失败的 SQL 塞进去），断言响应是 5xx 的 JSON，**且进程还活着**（后续的请求仍然能通）。
 >
 > 第 3 条不是形式主义 —— 「进程还活着」这件事必须有一个测试守着，否则下一次有人加一条 async 路由，rejection 又能逃出去。
