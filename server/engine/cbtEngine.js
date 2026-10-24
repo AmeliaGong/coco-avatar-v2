@@ -28,13 +28,15 @@
 //                 结构化指令 —— 同一串 promptVersion 可能对应两种不同的
 //                 装配结果，这是已知且有意的取舍。
 //
-// 错误语义（抛出的都是 CbtEngineError）：
-//   - code='empty_content'       模型没返回任何内容
-//   - code='invalid_content_type' 模型返回的内容不是字符串
-//   - code='empty_reply'         剥掉结构化块后正文为空。**错误对象上带着
-//                                 structured 与 usage** —— 这一轮的卡点/方案
-//                                 与 token 消耗都还在，调用方应据此落库与记账，
-//                                 而不是把整轮丢掉。
+// 错误语义：
+//   - 引擎自己抛的错都是 CbtEngineError，带一个 code（清单见类上的注释），
+//     调用方靠 code 分流 400 / 500 / 502。
+//   - 注入进来的组件自己抛的错**不是**这个类型：getPrompt / getPromptMeta 抛
+//     的是 promptRegistry 的错（未知场景），callModel 抛的是网关的错。
+//     它们原样往外冒，不要包成 CbtEngineError。
+//   - code='empty_reply'（剥掉结构化块后正文为空）的错误对象上带着
+//     structured 与 usage —— 这一轮的卡点/方案与 token 消耗都还在，调用方
+//     应据此落库与记账，而不是把整轮丢掉。
 
 import { buildStructuredInstruction, extractStructured, stripAllStructured } from './structuredOutput.js';
 import { toText } from '../contracts/shared.js';
@@ -59,6 +61,36 @@ const MAX_KNOWLEDGE_CHARS = 2000;
 // 2000 字。总量闸门在这里兜底：超出时**明确标注被截断**，不静默砍掉。
 const MAX_CONTEXT_CHARS = 4000;
 
+// 引擎抛出的错误。带上 structured 与 usage，是为了让调用方在「这一轮没拿到
+// 正文」时仍然能落库、仍然能记账 —— 丢掉 usage 就等于丢掉这一轮的成本账。
+//
+// **引擎自己抛的每一个错都是这个类型**，都带一个 code，调用方靠 code 分流：
+//   - invalid_config             引擎构造参数不对（编程错误）        → 500
+//   - invalid_structured_output  structuredOutput 不是字符串/是空串   → 400
+//   - unknown_structured_output  未知的结构化输出类型                 → 400
+//   - invalid_history            history 不是消息数组                 → 400
+//   - invalid_schema             schemas 里的 schema 写坏了（配置错） → 500
+//   - empty_content              模型没返回任何内容                   → 502
+//   - invalid_content_type       模型返回的内容不是字符串             → 502
+//   - empty_reply                剥掉结构化块后正文为空               → 502
+//
+// 注意：**注入进来的组件自己抛的错不是这个类型** —— getPrompt / getPromptMeta
+// 抛的是 promptRegistry 的错（未知场景），callModel 抛的是网关的错。那些错
+// 原样往外冒，不要包成 CbtEngineError。
+export class CbtEngineError extends Error {
+  constructor(message, { code = 'engine_error', structured = null, usage = null, content = '' } = {}) {
+    super(message);
+    this.name = 'CbtEngineError';
+    this.code = code;
+    // 本轮模型交付的结构化内容（没请求结构化输出时为 null）
+    this.structured = structured;
+    // 本轮的 token 用量
+    this.usage = usage;
+    // 模型的原始输出，排障用
+    this.content = content;
+  }
+}
+
 // schemas 的值有两种写法，必须靠「自有属性是否存在」来区分，不能靠真值判断：
 //   - 直接就是 schema（值级示例，只有形状）
 //   - { schema, notes } —— 形状 + 字段语义
@@ -81,28 +113,13 @@ function resolveSchemaEntry(entry, type) {
   // 但那是底层的英文报错，调用方看不出是哪个结构化输出类型坏了，
   // 所以这里先拦一道，给出带类型名的中文错误。
   if (schema === undefined || schema === null || typeof schema !== 'object') {
-    throw new Error(
-      `结构化输出「${type}」的 schema 无效：必须是对象或数组（值级示例），收到 ${JSON.stringify(schema) ?? String(schema)}`
+    throw new CbtEngineError(
+      `结构化输出「${type}」的 schema 无效：必须是对象或数组（值级示例），收到 ${JSON.stringify(schema) ?? String(schema)}`,
+      { code: 'invalid_schema' }
     );
   }
   const notes = Object.prototype.hasOwnProperty.call(entry, 'notes') ? entry.notes : null;
   return { schema, notes };
-}
-
-// 引擎抛出的错误。带上 structured 与 usage，是为了让调用方在「这一轮没拿到
-// 正文」时仍然能落库、仍然能记账 —— 丢掉 usage 就等于丢掉这一轮的成本账。
-export class CbtEngineError extends Error {
-  constructor(message, { code = 'engine_error', structured = null, usage = null, content = '' } = {}) {
-    super(message);
-    this.name = 'CbtEngineError';
-    this.code = code;
-    // 本轮模型交付的结构化内容（没请求结构化输出时为 null）
-    this.structured = structured;
-    // 本轮的 token 用量
-    this.usage = usage;
-    // 模型的原始输出，排障用
-    this.content = content;
-  }
 }
 
 // 净化要注入 prompt 的文本。
@@ -149,10 +166,14 @@ function renderEvidence(value) {
 
 export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas = {} } = {}) {
   if (!getPrompt) {
-    throw new Error('createCbtEngine 需要 getPrompt：拼装 system prompt 的底座段与场景段');
+    throw new CbtEngineError('createCbtEngine 需要 getPrompt：拼装 system prompt 的底座段与场景段', {
+      code: 'invalid_config',
+    });
   }
   if (!callModel) {
-    throw new Error('createCbtEngine 需要 callModel：真正去调模型的那一层');
+    throw new CbtEngineError('createCbtEngine 需要 callModel：真正去调模型的那一层', {
+      code: 'invalid_config',
+    });
   }
 
   function buildContextSection(clientContext) {
@@ -204,7 +225,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
   // JSON.stringify 丢掉，让网关 400。
   function sanitizeHistory(history) {
     if (!Array.isArray(history)) {
-      throw new Error('history 必须是消息数组（[{ role, content }]）');
+      throw new CbtEngineError('history 必须是消息数组（[{ role, content }]）', {
+        code: 'invalid_history',
+      });
     }
     return history
       .filter(m => m && typeof m === 'object' && m.role !== 'system')
@@ -223,12 +246,15 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     // 当成「本轮不要结构化输出」。这两种都不该悄悄通过。
     if (structuredOutput !== undefined && structuredOutput !== null) {
       if (typeof structuredOutput !== 'string') {
-        throw new Error(
-          'structuredOutput 必须是字符串（结构化输出类型的名字），或者 null 表示本轮不要结构化输出'
+        throw new CbtEngineError(
+          'structuredOutput 必须是字符串（结构化输出类型的名字），或者 null 表示本轮不要结构化输出',
+          { code: 'invalid_structured_output' }
         );
       }
       if (!structuredOutput.trim()) {
-        throw new Error('structuredOutput 不能是空字符串（本轮不要结构化输出请传 null）');
+        throw new CbtEngineError('structuredOutput 不能是空字符串（本轮不要结构化输出请传 null）', {
+          code: 'invalid_structured_output',
+        });
       }
     }
 
@@ -247,7 +273,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       const hasEntry = Object.prototype.hasOwnProperty.call(schemas, structuredOutput);
       const entry = hasEntry ? schemas[structuredOutput] : undefined;
       if (!entry) {
-        throw new Error(`未知的结构化输出类型：${structuredOutput}`);
+        throw new CbtEngineError(`未知的结构化输出类型：${structuredOutput}`, {
+          code: 'unknown_structured_output',
+        });
       }
       // schemas 的值可以是：
       //   - 直接就是 schema（值级示例，只有形状）

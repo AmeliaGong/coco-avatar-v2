@@ -402,3 +402,68 @@ test('嵌套守卫不影响顶层就是结构化块的正常情形', () => {
   assert.deepEqual(extractStructured(text), { title: 'x' });
   assert.equal(findAllStructuredSpans(text).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// 嵌套判定：两个信号同时成立才算嵌套
+// ---------------------------------------------------------------------------
+
+test('复述被截断、后面才是真块时，真块必须被认出来', () => {
+  // 模型先复述一遍格式（复述写到一半断了），再给出真正的块。
+  // 残缺的复述里那个 '{' 没配平 —— 只看「前面有没有没配平的 '{'」会把
+  // 真正的块也误判成嵌在复述里，整轮的卡点就没了。
+  const text = [
+    '这是你要的格式：',
+    '{"__structured__": {"title": "卡点的一句话概括"',
+    '然后是真正的：',
+    '{"__structured__": {"title": "我不能停下来"}}',
+  ].join('\n');
+  assert.deepEqual(extractStructured(text), { title: '我不能停下来' });
+  // 复述的残骸也不该留在正文里
+  const stripped = stripAllStructured(text);
+  assert.ok(!stripped.includes('卡点的一句话概括'));
+  assert.ok(!stripped.includes(STRUCTURED_MARKER));
+  assert.ok(stripped.includes('这是你要的格式：'));
+});
+
+test('正文里有个没闭合的 { 时，后面的真块必须被认出来', () => {
+  const text = '参考 {核心信念 这样，然后给出：\n{"__structured__": {"title": "我不能停下来"}}';
+  assert.deepEqual(extractStructured(text), { title: '我不能停下来' });
+});
+
+test('真嵌套（块后面跟着逗号）不算结构化块，也不留破碎 JSON', () => {
+  // 外层对象还开着（后面跟着 ','），两个信号都成立 → 嵌在别人身上，不是
+  // 这一轮的结构化输出。
+  const text = '参考这个 {"data": {"__structured__": 1}, "note": "x"}';
+  assert.equal(extractStructured(text), null);
+  assert.deepEqual(findAllStructuredSpans(text), []);
+  assert.equal(stripAllStructured(text), text);
+  assert.ok(!stripAllStructured(text).includes('"data":,'));
+});
+
+test('正文里引号个数是奇数时，顶层结构化块仍能被认出来', () => {
+  // 引号配对是启发式，判错时的方向要是「认得出来」而不是「认不出来」——
+  // 认错成嵌套的代价是丢掉整轮的卡点。
+  const text = '他说 "先这样，然后给出：\n{"__structured__": {"title": "x"}}';
+  assert.deepEqual(extractStructured(text), { title: 'x' });
+});
+
+test('字符串里的 { 不算未配平的括号', () => {
+  // 带引号的片段里的 '{' 不是对象字面量的开始，不该算进配平。
+  // 这里后面还跟着逗号（外层还开着），所以引号处理错了就会误杀这个块。
+  const text = '参考 "{核心信念" 这样，给出：\n{"__structured__": {"title": "x"}}, 结束';
+  assert.deepEqual(extractStructured(text), { title: 'x' });
+});
+
+test('正文里提到 marker 的那句不能被当成残骸吃掉', () => {
+  // 前面有真块时，正文里随口提一句 marker 也不能被当成「写坏的残骸」删掉 ——
+  // 残骸的判据是「{ 与 marker 之间只有空白」，这里显然不是。
+  const text = [
+    '他说 {这样}，我会输出 "__structured__" 这种块。',
+    '{"__structured__": {"a": 1}}',
+  ].join('\n');
+  const stripped = stripAllStructured(text);
+  assert.ok(stripped.includes('我会输出'));
+  assert.ok(stripped.includes('这种块。'));
+  // 真正的那个块被剥掉了（正文里随口提一句 marker 当然留着）
+  assert.ok(!stripped.includes('"a": 1'));
+});

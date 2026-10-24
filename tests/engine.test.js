@@ -687,3 +687,147 @@ test('正文里嵌在别的对象中的 marker 不会被剥成破碎的 JSON', a
   assert.ok(result.reply.includes('参考这个'));
   assert.ok(!result.reply.includes('"data":,'));
 });
+
+// ---------------------------------------------------------------------------
+// 复述被截断 + 真块：真块必须拿到，残骸不能进用户气泡
+// ---------------------------------------------------------------------------
+
+test('复述被截断时，真卡点仍然拿得到，残骸不进 reply', async () => {
+  const content = [
+    '这是你要的格式：',
+    '{"__structured__": {"title": "卡点的一句话概括"',
+    '然后是真正的：',
+    '{"__structured__": {"title": "我不能停下来"}}',
+  ].join('\n');
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => ({ content, usage: { total_tokens: 1 } }),
+    schemas: { stuck_point: { title: '卡点标题' } },
+  });
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+  });
+  assert.deepEqual(result.structured, { title: '我不能停下来' });
+  assert.ok(!result.reply.includes('卡点的一句话概括'));
+  assert.ok(!result.reply.includes('__structured__'));
+});
+
+test('正文里有个没闭合的 { 时，后面的真卡点仍然拿得到', async () => {
+  const content = '参考 {核心信念 这样，然后给出：\n{"__structured__": {"title": "我不能停下来"}}';
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => ({ content, usage: { total_tokens: 1 } }),
+    schemas: { stuck_point: { title: '卡点标题' } },
+  });
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+  });
+  assert.deepEqual(result.structured, { title: '我不能停下来' });
+});
+
+// ---------------------------------------------------------------------------
+// 引擎抛出的每一个错都是 CbtEngineError，都带 code
+// ---------------------------------------------------------------------------
+
+test('引擎抛出的错都带 code，调用方靠它分流', async () => {
+  const calls = [];
+  const base = {
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => {
+      calls.push(1);
+      return { content: 'ok', usage: { total_tokens: 1 } };
+    },
+    schemas: { stuck_point: { title: '卡点标题' }, plan: { schema: undefined, notes: {} } },
+  };
+  const engine = createCbtEngine(base);
+  const cases = [
+    {
+      code: 'invalid_structured_output',
+      run: () => engine({ scenario: 'chat', history: [], structuredOutput: ['stuck_point'] }),
+    },
+    {
+      code: 'invalid_structured_output',
+      run: () => engine({ scenario: 'chat', history: [], structuredOutput: '' }),
+    },
+    {
+      code: 'unknown_structured_output',
+      run: () => engine({ scenario: 'chat', history: [], structuredOutput: 'nope' }),
+    },
+    {
+      code: 'invalid_history',
+      run: () => engine({ scenario: 'chat', history: '不是数组' }),
+    },
+    {
+      code: 'invalid_schema',
+      run: () => engine({ scenario: 'chat', history: [], structuredOutput: 'plan' }),
+    },
+  ];
+  for (const c of cases) {
+    await assert.rejects(
+      () => c.run(),
+      (err) => {
+        assert.equal(err.name, 'CbtEngineError');
+        assert.equal(err.code, c.code);
+        return true;
+      }
+    );
+  }
+  assert.equal(calls.length, 0);
+});
+
+test('构造参数不对时抛的也是 CbtEngineError', () => {
+  assert.throws(
+    () => createCbtEngine({}),
+    (err) => {
+      assert.equal(err.name, 'CbtEngineError');
+      assert.equal(err.code, 'invalid_config');
+      return true;
+    }
+  );
+});
+
+test('注入组件自己抛的错不被包成引擎错误', async () => {
+  // getPrompt 抛的是 promptRegistry 的错（未知场景），原样往外冒。
+  const engine = createCbtEngine({
+    getPrompt: () => {
+      throw new Error('未知的 prompt 场景：nope');
+    },
+    callModel: async () => ({ content: 'ok', usage: { total_tokens: 1 } }),
+  });
+  await assert.rejects(
+    () => engine({ scenario: 'nope', history: [] }),
+    (err) => {
+      assert.notEqual(err.name, 'CbtEngineError');
+      assert.match(err.message, /未知的 prompt 场景/);
+      return true;
+    }
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 注入段的总量闸门：截断的是尾巴，卡点段必须完整
+// ---------------------------------------------------------------------------
+
+test('注入段超上限时，卡点段完整保留，被截断的是知识库那段', async () => {
+  const knowledge = Array.from({ length: 30 }, (_, i) => ({
+    kind: 'case',
+    title: `条目${i}`,
+    content: 'w'.repeat(200),
+  }));
+  const prompt = await captureSystemPrompt({
+    stuckPoint: { title: '我不能停下来', belief: '停下来就会被抛弃', evidence_against: ['我上周完成了整周冥想'] },
+    knowledge,
+  });
+  // 卡点段在最前面，完整保留
+  assert.ok(prompt.includes('--- 这位来访者当前的卡点（已确认）---'));
+  assert.ok(prompt.includes('卡点：我不能停下来'));
+  assert.ok(prompt.includes('限制性信念：停下来就会被抛弃'));
+  assert.ok(prompt.includes('已有的反向证据：我上周完成了整周冥想'));
+  // 被砍掉的是知识库的尾巴
+  assert.ok(prompt.includes('已截断'));
+  assert.ok(!prompt.includes('条目29'));
+});
