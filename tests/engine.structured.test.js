@@ -384,3 +384,21 @@ test('stripStructured 的语义不变：只剥最后一个块', () => {
   assert.ok(stripped.includes('卡点的一句话概括'));
   assert.deepEqual(extractStructured(text), { title: '我不能停下来' });
 });
+
+test('嵌套在别的对象里的 marker 不算结构化块', () => {
+  // {"data": {"__structured__": 1}, "note": "x"} —— 内层对象自身「顶层带
+  // marker 键」，会被误认成结构化块；剥掉它会在正文里留下一段语法非法的
+  // JSON（'{"data":, "note": "x"}'）给用户看。
+  const text = '参考这个 {"data": {"__structured__": 1}, "note": "x"}';
+  assert.equal(extractStructured(text), null);
+  assert.deepEqual(findAllStructuredSpans(text), []);
+  // 一个字都不动，更不能留下破碎的 JSON
+  assert.equal(stripAllStructured(text), text);
+  assert.ok(!stripAllStructured(text).includes('"data":,'));
+});
+
+test('嵌套守卫不影响顶层就是结构化块的正常情形', () => {
+  const text = '正文\n{"__structured__": {"title": "x"}}';
+  assert.deepEqual(extractStructured(text), { title: 'x' });
+  assert.equal(findAllStructuredSpans(text).length, 1);
+});

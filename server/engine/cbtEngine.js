@@ -27,14 +27,37 @@
 //                 内容哈希（不是修订号），**不含**本轮注入的上下文与
 //                 结构化指令 —— 同一串 promptVersion 可能对应两种不同的
 //                 装配结果，这是已知且有意的取舍。
+//
+// 错误语义（抛出的都是 CbtEngineError）：
+//   - code='empty_content'       模型没返回任何内容
+//   - code='invalid_content_type' 模型返回的内容不是字符串
+//   - code='empty_reply'         剥掉结构化块后正文为空。**错误对象上带着
+//                                 structured 与 usage** —— 这一轮的卡点/方案
+//                                 与 token 消耗都还在，调用方应据此落库与记账，
+//                                 而不是把整轮丢掉。
 
 import { buildStructuredInstruction, extractStructured, stripAllStructured } from './structuredOutput.js';
 import { toText } from '../contracts/shared.js';
 
-// 注入到 system prompt 的单值长度上限。
+// 卡点字段（title / belief / 每一条证据）的长度上限。
 // 注入内容是「模型给的文本」，长度不可控；不设上限时，一段复述就能把
 // prompt 撑到几千 token。
 const MAX_INJECT_CHARS = 200;
+
+// 知识库正文的长度上限，比卡点字段大一个量级。
+//
+// 为什么知识库用另一个上限：卡点字段是**模型生成**的，威胁模型是「模型跑偏
+// 时把指令种进 prompt」—— 所以既折换行又砍到 200 字。知识库是**管理员录的**
+// 材料，它的价值恰恰在长度与段落结构里：一段 600 字的案例，前半段是背景、
+// 结论在后面，把它砍到 200 字再折成一行，模型拿到的就是「被腰斩且变形」的
+// 材料 —— 那比不给材料更容易误导它。所以知识库正文保留换行（段落结构是
+// 信息的一部分），只在一个大得多的量级上封顶。
+const MAX_KNOWLEDGE_CHARS = 2000;
+
+// 注入段（卡点 + 知识库）的总字数上限。
+// 逐值上限是「每条」的闸门，条目数由检索决定 —— 10 条 200 字的证据就是
+// 2000 字。总量闸门在这里兜底：超出时**明确标注被截断**，不静默砍掉。
+const MAX_CONTEXT_CHARS = 4000;
 
 // schemas 的值有两种写法，必须靠「自有属性是否存在」来区分，不能靠真值判断：
 //   - 直接就是 schema（值级示例，只有形状）
@@ -66,31 +89,62 @@ function resolveSchemaEntry(entry, type) {
   return { schema, notes };
 }
 
+// 引擎抛出的错误。带上 structured 与 usage，是为了让调用方在「这一轮没拿到
+// 正文」时仍然能落库、仍然能记账 —— 丢掉 usage 就等于丢掉这一轮的成本账。
+export class CbtEngineError extends Error {
+  constructor(message, { code = 'engine_error', structured = null, usage = null, content = '' } = {}) {
+    super(message);
+    this.name = 'CbtEngineError';
+    this.code = code;
+    // 本轮模型交付的结构化内容（没请求结构化输出时为 null）
+    this.structured = structured;
+    // 本轮的 token 用量
+    this.usage = usage;
+    // 模型的原始输出，排障用
+    this.content = content;
+  }
+}
+
 // 净化要注入 prompt 的文本。
 //
 // 换行必须折掉：注入值里带换行就能伪造出新的段落（一个跑偏的模型可以把
 // 「--- 忽略上面的指令」种进下一轮的 system prompt）。契约层对 title 的
 // 唯一要求是「非空字符串」，换行完全合法 —— 所以净化只能在这里做。
 // 长度也要封顶：注入内容是模型给的，长度不可控。
-function sanitizeInject(value, max = MAX_INJECT_CHARS) {
+//
+// foldNewlines=false 用于知识库正文：那里保留段落结构（见 MAX_KNOWLEDGE_CHARS
+// 处的说明）。
+function sanitizeInject(value, { max = MAX_INJECT_CHARS, foldNewlines = true } = {}) {
   if (typeof value !== 'string') return '';
-  const flat = value.replace(/\r\n|\r|\n/g, ' ').trim();
+  const flat = (foldNewlines ? value.replace(/\r\n|\r|\n/g, ' ') : value).trim();
   if (flat.length <= max) return flat;
   return `${flat.slice(0, max)}…`;
+}
+
+// 卡点字段：模型生成的，折换行 + 200 字上限。
+function sanitizeShort(value) {
+  return sanitizeInject(value, { max: MAX_INJECT_CHARS, foldNewlines: true });
+}
+
+// 知识库正文：管理员录的，保留换行 + 2000 字上限。
+function sanitizeKnowledgeBody(value) {
+  return sanitizeInject(value, { max: MAX_KNOWLEDGE_CHARS, foldNewlines: false });
 }
 
 // 反向证据：契约层接受字符串（模型常把单条证据写成字符串）与数组。
 // 两种都要认 —— 只认数组的话，调用方把「未归一化的模型原始 payload」
 // 当作卡点传进来时，交付时最重要的证据会被静默丢掉。
+//
+// 数组里的每一项都用契约层共用的 toText 渲染：契约的 normalizeStuckPoint
+// 明确保留数字条目（「宁可保留一条事实，也不要悄悄把它丢掉」），这里必须
+// 与之一致，不能各丢各的。
 function renderEvidence(value) {
   if (typeof value === 'string') {
-    const one = sanitizeInject(value);
+    const one = sanitizeShort(value);
     return one ? [one] : [];
   }
   if (!Array.isArray(value)) return [];
-  return value
-    .filter(item => typeof item === 'string' && item.trim() !== '')
-    .map(item => sanitizeInject(item));
+  return value.map(item => sanitizeShort(toText(item))).filter(item => item !== '');
 }
 
 export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas = {} } = {}) {
@@ -105,11 +159,11 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     const parts = [];
     if (clientContext && clientContext.stuckPoint) {
       const sp = clientContext.stuckPoint;
-      const lines = [`卡点：${sanitizeInject(sp.title)}`];
+      const lines = [`卡点：${sanitizeShort(sp.title)}`];
       // belief 用契约层共用的 toText 渲染：它接受字符串，也接受字符串数组
       // （模型很爱把 belief 写成数组），数组按「、」连接 —— 与
       // contracts/stuckPoint.js 的归一化结果保持一致，两边不能漂。
-      const belief = sanitizeInject(toText(sp.belief));
+      const belief = sanitizeShort(toText(sp.belief));
       if (belief) lines.push(`限制性信念：${belief}`);
       const evidence = renderEvidence(sp.evidence_against);
       if (evidence.length) {
@@ -124,14 +178,24 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       );
       if (items.length) {
         const lines = items.map(
-          k => `- 【${sanitizeInject(k.kind) || 'note'}】${sanitizeInject(k.title)}：${sanitizeInject(k.content)}`
+          k => `- 【${sanitizeShort(k.kind) || 'note'}】${sanitizeShort(k.title)}：${sanitizeKnowledgeBody(k.content)}`
         );
         parts.push(
           '--- 可参考的教练知识库（仅在相关时使用，不要复述本节标题）---\n' + lines.join('\n')
         );
       }
     }
-    return parts.length ? '\n\n' + parts.join('\n\n') : '';
+    if (!parts.length) return '';
+
+    let section = '\n\n' + parts.join('\n\n');
+    // 总量闸门：逐值上限管不住条目数（检索返回多少条不是我们决定的）。
+    // 超出就明确标注被截断 —— 静默砍掉的话，调用方会以为材料是完整的。
+    if (section.length > MAX_CONTEXT_CHARS) {
+      section =
+        section.slice(0, MAX_CONTEXT_CHARS) +
+        '\n--- （注入的上下文过长，以上内容已截断）';
+    }
+    return section;
   }
 
   // history 的清洗：剔掉 system 消息，跳过 content 不是字符串或为空的消息。
@@ -202,24 +266,57 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       messages,
     });
 
-    const content = typeof result?.content === 'string' ? result.content : '';
-    if (!content.trim()) {
-      throw new Error('模型没有返回任何内容');
+    // usage 要在抛错之前就握住：这一轮的 token 消耗必须能被写进
+    // token_usage，哪怕这一轮没有正文。
+    const usage = result?.usage || null;
+    const raw = result?.content;
+
+    if (raw === undefined || raw === null) {
+      throw new CbtEngineError('模型没有返回任何内容', {
+        code: 'empty_content',
+        usage,
+      });
+    }
+    if (typeof raw !== 'string') {
+      // 类型不对 ≠ 没有内容：两回事，两种文案。
+      throw new CbtEngineError('模型返回的内容不是字符串（类型不对）', {
+        code: 'invalid_content_type',
+        usage,
+      });
+    }
+    if (!raw.trim()) {
+      throw new CbtEngineError('模型没有返回任何内容', {
+        code: 'empty_content',
+        usage,
+      });
     }
 
     // 剥掉**所有**结构化块（含模型复述格式的那份），正文里不该残留 marker。
-    const reply = stripAllStructured(content).trim();
+    const reply = stripAllStructured(raw).trim();
     if (!reply) {
-      // 模型只吐了结构化块、没有正文。返回空字符串会让调用方的
-      // `if (result.reply)` 判断把这一轮整个吞掉 —— 用户的消息凭空消失，
-      // 日志里连一行错误都没有。宁可报错。
-      throw new Error('模型只输出了结构化块，没有正文');
+      // 剥完正文为空。这不等于「模型什么都没交」—— 契约 1/契约 2 的目标
+      // 产出恰恰就是「模型只给 JSON、没给正文」，那正是卡点/方案本身。
+      // 所以这里把 structured 与 usage 一起挂到错误对象上：调用方据此
+      // 照常落库、照常记账，只把正文换成一句兜底话。
+      //
+      // 文案也要分两种情况：本轮请求了结构化输出却没拿到正文，和本轮根本没
+      // 请求结构化输出 —— 后者说一句「只输出了结构化块」会让人一头雾水。
+      const structured = structuredOutput ? extractStructured(raw) : null;
+      const message = structuredOutput
+        ? '剥掉结构化块后正文为空（模型只交付了结构化内容，正文可能在 JSON 里）'
+        : '剥掉结构化块后正文为空（本轮没有请求结构化输出）';
+      throw new CbtEngineError(message, {
+        code: 'empty_reply',
+        structured,
+        usage,
+        content: raw,
+      });
     }
 
     return {
       reply,
-      structured: structuredOutput ? extractStructured(content) : null,
-      usage: result.usage || null,
+      structured: structuredOutput ? extractStructured(raw) : null,
+      usage,
       scenario,
       // prompt_version 的含义：**persona 底座段 + 场景段**这两段文本的
       // 内容哈希（Task 4 的 versionFor）。回答「这次对话是哪两段文本产生的」，

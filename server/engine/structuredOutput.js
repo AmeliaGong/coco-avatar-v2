@@ -96,9 +96,43 @@ export function findStructuredSpan(text) {
 // 一个 marker 候选到底算不算「结构化块」：
 // 能配平、能 JSON.parse、且顶层有 marker 键 —— 三条都要满足。
 // 「取最后一个」与「取全部」两套行为共用这段判断，判定标准才不会漂。
+// 这个 span 是不是嵌在别的对象里。
+//
+// {"data": {"__structured__": 1}, "note": "x"} —— 内层对象自身「顶层带
+// marker 键」，会被误认成结构化块；剥掉它会在正文里留下一段语法非法的
+// JSON（'{"data":, "note": "x"}'）给用户看。嵌在别人身上的 marker 不是
+// 「这一轮的结构化输出」。
+//
+// 判据是「起点之前有没有还没配平的 '{'」：有就是嵌在某个对象里。
+// 比「前一个字符是不是 ':' 或 ','」准 —— 正文里写「答案: {"__structured__"…」
+// 这种紧挨着的冒号会把顶层块也误杀，丢掉的可是整轮的卡点。
+function isNestedInObject(text, start) {
+  let depth = 0;
+  let inString = false;
+  for (let i = start - 1; i >= 0; i--) {
+    const ch = text[i];
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === '}') {
+      depth++;
+      continue;
+    }
+    if (ch === '{') {
+      if (depth === 0) return true;
+      depth--;
+    }
+  }
+  return false;
+}
+
 function spanAt(text, markerIdx) {
   const start = text.lastIndexOf('{', markerIdx);
   if (start < 0) return null;
+
+  if (isNestedInObject(text, start)) return null;
 
   const span = scanBraceSpan(text, start);
   if (!span) return null;
