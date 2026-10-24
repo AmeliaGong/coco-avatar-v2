@@ -12,20 +12,41 @@ export function isPlainObject(value) {
 
 // 转成文本。空值变空串，非字符串的标量保留其字符串形态（0 是 0，
 // 不是空 —— 用 `||` 会把 0 吞掉，那是在丢信息）。
+//
+// 数组：逐项 toText，去掉空串后用「、」连接。模型很爱把一个散文字段
+// 写成数组（emotion: ['焦虑']），与其把整份数据丢掉，不如拍平成一句
+// 人话。
 export function toText(value) {
   if (typeof value === 'string') return value.trim();
   if (value === null || value === undefined) return '';
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '';
-  if (typeof value === 'boolean') return String(value);
+  // 布尔不是散文。`toText(false)` 返回 'false' 会让一张卡点的标题
+  // 字面上写着「false」——那是模型没填，不是内容。跟数字 0 的情况
+  // 不同：0 是有意义的值，true/false 从来不是。
+  if (typeof value === 'boolean') return '';
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => toText(item))
+      .filter((item) => item !== '')
+      .join('、');
+  }
   return '';
 }
+
+// 数字字符串长什么样。只认「普通十进制写法」，不认 Number() 那套
+// 宽松解析：'0x10' 会被 Number() 变成 16、'1e3' 变成 1000 —— 那是
+// 换了个数量级，不是「读到了用户写的那个数」。
+const NUMERIC_TEXT = /^[+-]?\d+(\.\d+)?$/;
 
 // 转成数字。数字字符串（模型常这么写）也算；无法解析返回 null。
 export function toNumber(value) {
   if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (typeof value === 'string' && value.trim() !== '') {
-    const n = Number(value);
-    if (Number.isFinite(n)) return n;
+  if (typeof value === 'string') {
+    const t = value.trim();
+    if (NUMERIC_TEXT.test(t)) {
+      const n = Number(t);
+      if (Number.isFinite(n)) return n;
+    }
   }
   return null;
 }

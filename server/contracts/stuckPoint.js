@@ -1,7 +1,10 @@
 // 契约 1：stuck_point —— 游民纪元急救箱与教练交付共用的卡点结构。
 // 游民纪元的小程序（未来）会按同样的结构产出卡点，两边不断链。
 //
-// 使用顺序：先 validate（校验模型原始输出），再 normalize（结构归一化）。
+// 推荐入口是 parseStuckPoint：先 validate，再 normalize，一步步来不得。
+// validate 与 normalize 也单独导出（便于分别使用与测试），但它们是
+// 「内部步骤」—— 只调 normalize 的话，非法值会一路带到客户端。
+//
 // normalize 只保证结构统一，不负责「修正」业务内容。
 //
 // 纯函数：不依赖数据库、HTTP、时钟，方便被 BFF 复用到另一个项目。
@@ -45,26 +48,16 @@ export function validateStuckPoint(value) {
   ) {
     errors.push('evidence_against: 必须是数组或字符串');
   }
-  if (
-    value.belief !== undefined &&
-    value.belief !== null &&
-    typeof value.belief !== 'string'
-  ) {
-    errors.push('belief: 必须是字符串');
-  }
-  if (
-    value.emotion !== undefined &&
-    value.emotion !== null &&
-    typeof value.emotion !== 'string'
-  ) {
-    errors.push('emotion: 必须是字符串');
-  }
-  if (
-    value.micro_action !== undefined &&
-    value.micro_action !== null &&
-    typeof value.micro_action !== 'string'
-  ) {
-    errors.push('micro_action: 必须是字符串');
+  // belief / emotion / micro_action 接受字符串或字符串数组。模型很爱
+  // 把单个情绪写成数组（emotion: ['焦虑']）—— 硬拒非字符串等于把一
+  // 份好卡点整个丢掉，而它本来可以拍平成一句人话。数字、布尔、对象
+  // 则没有这样的余地，直接报错。
+  for (const key of ['belief', 'emotion', 'micro_action']) {
+    const v = value[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v === 'string') continue;
+    if (Array.isArray(v) && v.every((item) => typeof item === 'string')) continue;
+    errors.push(`${key}: 必须是字符串或字符串数组`);
   }
   return { ok: errors.length === 0, errors };
 }
@@ -79,9 +72,22 @@ export function normalizeStuckPoint(value) {
         : [src.evidence_against];
   return {
     title: toText(src.title),
+    // 数组值由 toText 拍平成「、」连接的文本（emotion: ['焦虑'] → '焦虑'）。
     belief: toText(src.belief),
+    // 数组里的元素逐项 toText：数字条目会保留成字符串。这是有意的
+    // 选择 —— 宁可保留一条事实，也不要悄悄把它丢掉。
     evidence_against: raw.map(toText).filter((e) => e !== ''),
     emotion: toText(src.emotion),
     micro_action: toText(src.micro_action),
   };
+}
+
+// 原子入口：先校验，通过了才归一化。
+// validate/normalize 仍单独导出（便于分别使用与测试），但对外的
+// 推荐入口是这个 —— 否则调用方很容易只调 normalize，把非法值
+// 悄悄带进下游。
+export function parseStuckPoint(value) {
+  const result = validateStuckPoint(value);
+  if (!result.ok) return { ok: false, errors: result.errors, value: null };
+  return { ok: true, errors: [], value: normalizeStuckPoint(value) };
 }

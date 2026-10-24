@@ -1,7 +1,10 @@
 // 契约 2：教练分析的产出 —— 一次 1v1 交付的结构化方案。
 // worth_practicing 为 false 表示「这一轮只交付诊断，不安排练习」。
 //
-// 使用顺序：先 validate（校验模型原始输出），再 normalize（结构归一化）。
+// 推荐入口是 parsePlanPayload：先 validate，再 normalize，一步步来不得。
+// validate 与 normalize 也单独导出（便于分别使用与测试），但它们是
+// 「内部步骤」—— 只调 normalize 的话，非法值会一路带到客户端。
+//
 // normalize 只保证结构统一，不负责「修正」业务内容 —— 尤其不会替模型
 // 编造一个它没给过的 vision.horizon。
 //
@@ -65,41 +68,78 @@ export function validatePlanPayload(value) {
   if (!isPlainObject(value)) {
     return { ok: false, errors: ['方案 payload 必须是一个对象'] };
   }
+  // 字段说明（PLAN_FIELD_NOTES）承诺的必填项，这里必须真的拦住 ——
+  // 说明说必填、校验放行，等于告诉模型「漏了也没事」，那这份说明
+  // 就是假的。子字段只在父对象存在时才查，避免报一堆噪声错误。
   if (!isPlainObject(value.diagnosis)) {
     errors.push('diagnosis: 必填');
+  } else {
+    for (const key of ['core_belief', 'pattern', 'root_cause']) {
+      const v = value.diagnosis[key];
+      if (typeof v !== 'string' || !v.trim()) {
+        errors.push(`diagnosis.${key}: 必填且必须是非空字符串`);
+      }
+    }
   }
   if (!isPlainObject(value.vision)) {
     errors.push('vision: 必填');
-  } else if (!PLAN_HORIZONS.includes(value.vision.horizon)) {
-    errors.push(`vision.horizon: 必须是 ${PLAN_HORIZONS.join(' / ')} 之一`);
-  }
-  if (!Array.isArray(value.practices)) {
-    errors.push('practices: 必须是数组');
   } else {
-    value.practices.forEach((p, i) => {
-      if (!isPlainObject(p)) {
-        errors.push(`practices[${i}]: 必须是对象`);
-        return;
+    for (const key of ['title', 'narrative']) {
+      const v = value.vision[key];
+      if (typeof v !== 'string' || !v.trim()) {
+        errors.push(`vision.${key}: 必填且必须是非空字符串`);
       }
-      if (typeof p.title !== 'string' || !p.title.trim()) {
-        errors.push(`practices[${i}].title: 必填且必须是非空字符串`);
-      }
-      // action 缺失意味着来访者拿到一个「做不了」的练习，却没有任何
-      // 地方报错 —— 这里必须拦住。
-      if (typeof p.action !== 'string' || !p.action.trim()) {
-        errors.push(`practices[${i}].action: 必填且必须是非空字符串`);
-      }
-      if (p.day !== undefined && p.day !== null && toNumber(p.day) === null) {
-        errors.push(`practices[${i}].day: 必须是数字`);
-      }
-    });
+    }
+    if (!PLAN_HORIZONS.includes(value.vision.horizon)) {
+      errors.push(`vision.horizon: 必须是 ${PLAN_HORIZONS.join(' / ')} 之一`);
+    }
   }
-  if (
-    value.worth_practicing !== undefined &&
-    value.worth_practicing !== null &&
-    !isBooleanLike(value.worth_practicing)
-  ) {
+  // worth_practicing 必填：它决定 practices 该不该存在。先判定它，
+  // 再据此决定 practices 的规则。
+  let worthPracticing;
+  if (value.worth_practicing === undefined || value.worth_practicing === null) {
+    errors.push('worth_practicing: 必填且必须是布尔值');
+  } else if (!isBooleanLike(value.worth_practicing)) {
     errors.push('worth_practicing: 必须是布尔值');
+  } else {
+    worthPracticing = toBoolean(value.worth_practicing, undefined);
+  }
+  if (worthPracticing === true) {
+    // 说了要练习却没给练习 —— 来访者拿到一份「有方案」但里面是空的。
+    if (!Array.isArray(value.practices)) {
+      errors.push('practices: 必填且必须是数组');
+    } else {
+      value.practices.forEach((p, i) => {
+        if (!isPlainObject(p)) {
+          errors.push(`practices[${i}]: 必须是对象`);
+          return;
+        }
+        if (typeof p.title !== 'string' || !p.title.trim()) {
+          errors.push(`practices[${i}].title: 必填且必须是非空字符串`);
+        }
+        // action 缺失意味着来访者拿到一个「做不了」的练习，却没有任何
+        // 地方报错 —— 这里必须拦住。
+        if (typeof p.action !== 'string' || !p.action.trim()) {
+          errors.push(`practices[${i}].action: 必填且必须是非空字符串`);
+        }
+        if (p.day !== undefined && p.day !== null) {
+          const day = toNumber(p.day);
+          if (day === null || !Number.isInteger(day)) {
+            errors.push(`practices[${i}].day: 必须是整数`);
+          }
+        }
+      });
+    }
+  } else if (worthPracticing === false) {
+    // 不安排练习时 practices 可以整个不写（当作空数组），但写了就
+    // 必须真的是空数组 —— 里面藏着步骤却标着「不练习」，那是自相矛盾。
+    if (value.practices !== undefined && value.practices !== null) {
+      if (!Array.isArray(value.practices)) {
+        errors.push('practices: 必须是数组');
+      } else if (value.practices.length > 0) {
+        errors.push('practices: worth_practicing 为 false 时必须是空数组');
+      }
+    }
   }
   return { ok: errors.length === 0, errors };
 }
@@ -138,4 +178,14 @@ export function normalizePlanPayload(value) {
       : [],
     worth_practicing: worthPracticing,
   };
+}
+
+// 原子入口：先校验，通过了才归一化。
+// validate/normalize 仍单独导出（便于分别使用与测试），但对外的
+// 推荐入口是这个 —— 否则调用方很容易只调 normalize，把非法值
+// 悄悄带进下游。
+export function parsePlanPayload(value) {
+  const result = validatePlanPayload(value);
+  if (!result.ok) return { ok: false, errors: result.errors, value: null };
+  return { ok: true, errors: [], value: normalizePlanPayload(value) };
 }

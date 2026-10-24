@@ -3,14 +3,17 @@ import assert from 'node:assert/strict';
 import {
   validateStuckPoint,
   normalizeStuckPoint,
+  parseStuckPoint,
   STUCK_POINT_FIELD_NOTES,
 } from '../server/contracts/stuckPoint.js';
 import {
   validatePlanPayload,
   normalizePlanPayload,
+  parsePlanPayload,
   PLAN_HORIZONS,
   PLAN_FIELD_NOTES,
 } from '../server/contracts/plan.js';
+import { toText, toNumber } from '../server/contracts/shared.js';
 
 const validDiagnosis = { core_belief: 'a', pattern: 'b', root_cause: 'c' };
 const validVision = { title: 't', narrative: 'n', horizon: '1_year' };
@@ -290,4 +293,261 @@ test('plan：字段说明里写清了 worth_practicing 的 false 语义', () => 
 
 test('plan：horizon 枚举就是三个值', () => {
   assert.deepEqual(PLAN_HORIZONS, ['3_months', '1_year', 'life']);
+});
+
+// ---------- plan：必填校验必须跟字段说明一致 ----------
+
+test('plan：diagnosis 的三个必填字段缺失时报错，且错误带对应路径', () => {
+  for (const key of ['core_belief', 'pattern', 'root_cause']) {
+    const diagnosis = { ...validDiagnosis };
+    delete diagnosis[key];
+    const ok = validatePlanPayload({
+      diagnosis,
+      vision: validVision,
+      practices: [],
+      worth_practicing: true,
+    });
+    assert.equal(ok.ok, false, `${key} 缺失时应该报错`);
+    assert.ok(
+      ok.errors.some(e => e.includes(`diagnosis.${key}`)),
+      `错误信息里应含 diagnosis.${key}，实际: ${ok.errors.join('; ')}`,
+    );
+  }
+});
+
+test('plan：vision.title 与 vision.narrative 缺失时报错，且错误带对应路径', () => {
+  for (const key of ['title', 'narrative']) {
+    const vision = { ...validVision };
+    delete vision[key];
+    const ok = validatePlanPayload({
+      diagnosis: validDiagnosis,
+      vision,
+      practices: [],
+      worth_practicing: true,
+    });
+    assert.equal(ok.ok, false, `${key} 缺失时应该报错`);
+    assert.ok(
+      ok.errors.some(e => e.includes(`vision.${key}`)),
+      `错误信息里应含 vision.${key}，实际: ${ok.errors.join('; ')}`,
+    );
+  }
+});
+
+test('plan：diagnosis 里的必填字段是空字符串也算缺失', () => {
+  const ok = validatePlanPayload({
+    diagnosis: { ...validDiagnosis, pattern: '   ' },
+    vision: validVision,
+    practices: [],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('diagnosis.pattern')));
+});
+
+test('plan：缺少 worth_practicing 报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [],
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('worth_practicing')),
+    `实际: ${ok.errors.join('; ')}`,
+  );
+  assert.ok(
+    ok.errors.some(e => e.includes('worth_practicing') && e.includes('必填')),
+    `缺失应该报「必填」: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('plan：worth_practicing 为 null 也算缺失', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [],
+    worth_practicing: null,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('worth_practicing')));
+});
+
+test('plan：worth_practicing 为 false 且 practices 非空时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: false,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('practices')),
+    `实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('plan：worth_practicing 为 false 且 practices 是空数组时通过', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [],
+    worth_practicing: false,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+});
+
+test('plan：worth_practicing 为 false 且完全不传 practices 时通过', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    worth_practicing: false,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+});
+
+test('plan：worth_practicing 为 true 却不传 practices 报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('practices')),
+    `实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('plan：practices 不是数组时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: { day: 1 },
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('practices')));
+});
+
+test('plan：day 是科学计数法字符串时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [{ day: '1e3', title: '这一步', action: '做点事' }],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('day')));
+});
+
+test('plan：day 是小数时报错（day 必须是整数）', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [{ day: 1.5, title: '这一步', action: '做点事' }],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('day')));
+});
+
+test('plan：day 是数字字符串时通过', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [{ day: '3', title: '这一步', action: '做点事' }],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+});
+
+// ---------- 原子入口 parse* ----------
+
+test('parsePlanPayload：非法 payload 返回 ok:false 与 null value', () => {
+  const parsed = parsePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: { title: 't', narrative: 'n', horizon: '10_years' },
+    practices: [],
+    worth_practicing: true,
+  });
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.value, null);
+  assert.ok(parsed.errors.length > 0);
+});
+
+test('parsePlanPayload：合法 payload 返回归一化后的结构', () => {
+  const parsed = parsePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [{ day: '3', title: '  这一步  ', action: '做点事' }],
+    worth_practicing: true,
+  });
+  assert.equal(parsed.ok, true, `不该报错: ${parsed.errors.join('; ')}`);
+  assert.deepEqual(parsed.errors, []);
+  assert.equal(parsed.value.practices[0].day, 3);
+  assert.equal(parsed.value.practices[0].title, '这一步');
+});
+
+test('parsePlanPayload：非法 horizon 不会被悄悄改成 1_year（先校验后归一化）', () => {
+  const parsed = parsePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: { title: 't', narrative: 'n', horizon: '10_years' },
+    practices: [],
+    worth_practicing: true,
+  });
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.value, null);
+  // 直接调 normalize 会把非法值原样留着 —— 这正是必须走 parse 的原因。
+  const loose = normalizePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: { title: 't', narrative: 'n', horizon: '10_years' },
+    practices: [],
+    worth_practicing: true,
+  });
+  assert.equal(loose.vision.horizon, '10_years');
+});
+
+test('parseStuckPoint：emotion 是数组时通过且归一化成一段文本', () => {
+  const parsed = parseStuckPoint({
+    title: '我不能停下来，因为一旦停下来就会被抛弃',
+    belief: '停下来就会被抛弃',
+    evidence_against: ['上周请假一天，年底考核并没有变差'],
+    emotion: ['焦虑'],
+    micro_action: '今天记录一次「我可以慢下来」的时刻',
+  });
+  assert.equal(parsed.ok, true, `不该报错: ${parsed.errors.join('; ')}`);
+  assert.equal(parsed.value.emotion, '焦虑');
+});
+
+test('parseStuckPoint：非法 payload 返回 ok:false 与 null value', () => {
+  const parsed = parseStuckPoint({ belief: 'x' });
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.value, null);
+  assert.ok(parsed.errors.length > 0);
+});
+
+test('stuck_point：belief / emotion / micro_action 是数字时报错', () => {
+  for (const key of ['belief', 'emotion', 'micro_action']) {
+    const ok = validateStuckPoint({ title: '卡点', [key]: 42 });
+    assert.equal(ok.ok, false, `${key} 为数字时应该报错`);
+    assert.ok(ok.errors.some(e => e.includes(key)));
+  }
+});
+
+// ---------- 共享归一化规则 ----------
+
+test('shared：toText 对布尔返回空串（布尔不是散文）', () => {
+  assert.equal(toText(false), '');
+  assert.equal(toText(true), '');
+});
+
+test('shared：toText 把数组拍平成顿号连接的文本', () => {
+  assert.equal(toText(['焦虑', '害怕']), '焦虑、害怕');
+  assert.equal(toText(['焦虑', '']), '焦虑');
+});
+
+test('shared：toNumber 不接受十六进制与科学计数法字符串', () => {
+  assert.equal(toNumber('0x10'), null);
+  assert.equal(toNumber('1e3'), null);
+  assert.equal(toNumber('3'), 3);
 });
