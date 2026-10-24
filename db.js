@@ -77,5 +77,17 @@ function initSchema(db) {
       avatar TEXT,
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS prompt_scenarios (
+      id TEXT NOT NULL,
+      version INTEGER NOT NULL,
+      body TEXT NOT NULL,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (id, version)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_prompt_scenarios_active
+      ON prompt_scenarios(id, is_active);
   `);
 }
