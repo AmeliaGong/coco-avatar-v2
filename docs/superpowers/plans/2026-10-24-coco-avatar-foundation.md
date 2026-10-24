@@ -1117,6 +1117,18 @@ test('结构化指令里包含 marker 与 schema', () => {
   assert.ok(instr.includes('卡点标题'));
 });
 
+test('字段说明单独成段，不混进 JSON 里', () => {
+  const schema = { worth_practicing: true };
+  const instr = buildStructuredInstruction(schema, {
+    worth_practicing: 'false 表示这一轮只交付诊断',
+  });
+  // 说明文字必须在指令里
+  assert.ok(instr.includes('worth_practicing: false 表示这一轮只交付诊断'));
+  // JSON 块必须还是「纯形状」—— 说明混进去模型会照抄进输出
+  const expectedJson = JSON.stringify({ [STRUCTURED_MARKER]: schema }, null, 2);
+  assert.ok(instr.includes(expectedJson));
+});
+
 test('能从回复中提取结构化对象', () => {
   const text = [
     '很好，这个触发场景已经很清晰了。',
@@ -1204,15 +1216,25 @@ Expected: FAIL —— `Cannot find module '../server/engine/structuredOutput.js'
 ```js
 export const STRUCTURED_MARKER = '__structured__';
 
-export function buildStructuredInstruction(schemaHint) {
-  return [
+// schemaHint 是「值级示例」—— 模型照着它输出，所以它只描述形状。
+// fieldNotes 承载语义（哪个必填、枚举有哪些、false 是什么意思），
+// 单独一段渲染，不混进 JSON 里 —— 混进去模型会照抄成输出的一部分。
+export function buildStructuredInstruction(schemaHint, fieldNotes) {
+  const lines = [
     '',
     '---',
     '在你这一轮回复的最后，另起一行，输出一个 JSON 对象。',
     '这一行只能是 JSON，不要用代码块包裹，不要有多余解释文字。格式：',
     JSON.stringify({ [STRUCTURED_MARKER]: schemaHint }, null, 2),
-    '---',
-  ].join('\n');
+  ];
+  if (fieldNotes && Object.keys(fieldNotes).length > 0) {
+    lines.push('字段说明（只用于理解，不要出现在你输出的 JSON 里）：');
+    for (const [field, note] of Object.entries(fieldNotes)) {
+      lines.push(`- ${field}: ${note}`);
+    }
+  }
+  lines.push('---');
+  return lines.join('\n');
 }
 
 // 找到 marker 所在的 JSON 对象边界。返回 {start, end}，end 为闭区间。
@@ -1414,6 +1436,27 @@ test('引擎把 schema 提示拼进 system prompt', async () => {
   assert.ok(calls[0].systemPrompt.includes('卡点标题'));
 });
 
+test('schemas 传 { schema, notes } 时字段说明也进 system prompt', async () => {
+  const calls = [];
+  const callModel = async ({ systemPrompt }) => {
+    calls.push({ systemPrompt });
+    return { content: 'ok', usage: { total_tokens: 1 } };
+  };
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel,
+    schemas: {
+      plan: {
+        schema: { worth_practicing: true },
+        notes: { worth_practicing: 'false 表示这一轮只交付诊断' },
+      },
+    },
+  });
+  await engine({ scenario: 'analysis', history: [], structuredOutput: 'plan' });
+  assert.ok(calls[0].systemPrompt.includes('__structured__'));
+  assert.ok(calls[0].systemPrompt.includes('false 表示这一轮只交付诊断'));
+});
+
 test('引擎把卡点与知识库注入 system prompt', async () => {
   const { engine, calls } = makeEngine();
   await engine({
@@ -1486,11 +1529,17 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     systemPrompt += buildContextSection(clientContext);
 
     if (structuredOutput) {
-      const schema = schemas[structuredOutput];
-      if (!schema) {
+      const entry = schemas[structuredOutput];
+      if (!entry) {
         throw new Error(`未知的结构化输出类型：${structuredOutput}`);
       }
-      systemPrompt += buildStructuredInstruction(schema);
+      // schemas 的值可以是：
+      //   - 直接就是 schema（值级示例，只有形状）
+      //   - { schema, notes } —— 形状 + 字段语义。语义必须单独传，
+      //     混进 schema 里模型会照抄成输出的一部分。
+      const schema = entry.schema ? entry.schema : entry;
+      const notes = entry.notes ? entry.notes : null;
+      systemPrompt += buildStructuredInstruction(schema, notes);
     }
 
     const result = await callModel({
@@ -1753,7 +1802,8 @@ function migrateSchema(db) {
 ```js
 import { createModelClient } from './server/engine/modelClient.js';
 import { createCbtEngine } from './server/engine/cbtEngine.js';
-import { STUCK_POINT_SCHEMA } from './server/contracts/stuckPoint.js';
+import { STUCK_POINT_SCHEMA, STUCK_POINT_FIELD_NOTES } from './server/contracts/stuckPoint.js';
+import { PLAN_SCHEMA, PLAN_FIELD_NOTES } from './server/contracts/plan.js';
 ```
 
 在 `server.js` 的配置区（第 243–245 行，`const MINIMAX_API_KEY = ...` 那一段）加入一行，让测试可以指向一个不可达的本地地址，从而**离线且确定性地**触发失败，而不是去打真实网关：
@@ -1773,7 +1823,13 @@ const cbtEngine = createCbtEngine({
   getPrompt: promptRegistry.getPrompt,
   getPromptMeta: promptRegistry.getPromptMeta,
   callModel: modelClient,
-  schemas: { stuck_point: STUCK_POINT_SCHEMA },
+  // 形状给模型看，语义（哪个必填、枚举、worth_practicing 的 false
+  // 是什么意思）必须一起给 —— 只给形状的话模型不知道 worth_practicing
+  // 还有个有意义的 false 状态，会一律输出 true。
+  schemas: {
+    stuck_point: { schema: STUCK_POINT_SCHEMA, notes: STUCK_POINT_FIELD_NOTES },
+    plan: { schema: PLAN_SCHEMA, notes: PLAN_FIELD_NOTES },
+  },
 });
 ```
 
