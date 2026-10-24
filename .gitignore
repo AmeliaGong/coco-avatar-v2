@@ -38,3 +38,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+
+# 内部服务间密钥（不得提交）
+.internal-token

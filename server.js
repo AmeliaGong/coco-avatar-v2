@@ -16,6 +16,7 @@ import {
 } from './server/structuredTypes.js';
 import { statusForEngineError, errorBodyForStatus } from './server/errorStatus.js';
 import { asyncRoute } from './server/asyncRoute.js';
+import { createRequireAdmin, createRequireInternal } from './server/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -52,6 +53,16 @@ if (!MINIMAX_API_KEY) {
 
 // Initialize database
 const db = getDb();
+
+// 鉴权中间件。db 必须**注入进去**（server/auth.js 不 import db.js）。
+// getDb() 是懒初始化的单例，上面已经调用过，所以这里 db 已就绪。
+//
+// ADMIN_PASSWORD 不参与中间件：密码校验在 POST /api/admin/login 里，
+// 中间件只管会话 token 的有效性。这里只是把它作为一个预留选项传过去。
+const requireAdmin = createRequireAdmin({ db, adminPassword: ADMIN_PASSWORD });
+// 服务间鉴权。serviceToken 在**构造时**从环境变量读一次 —— 所以
+// INTERNAL_SERVICE_TOKEN 必须在模块加载前就设好（server/auth.js 里有说明）。
+const requireInternal = createRequireInternal();
 
 // Prompt Registry：文件是兜底真相源，数据库里的激活版本优先。
 // 这样真人教练可以随时调整话术而不需要重新部署。
@@ -108,21 +119,6 @@ function now() {
 function isExpired(expiresAt) {
   if (!expiresAt) return false;
   return new Date(expiresAt) < new Date();
-}
-
-function requireAdmin(req, res, next) {
-  const token = req.headers['x-admin-token'];
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  const session = db.prepare('SELECT * FROM admin_sessions WHERE token = ?').get(token);
-  if (!session || new Date(session.expires_at) < new Date()) {
-    if (session) {
-      db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
-    }
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
 }
 
 // --- Conversation API (frontend) ---
@@ -520,6 +516,15 @@ app.post('/api/admin/login', (req, res) => {
   db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(createdAt);
   db.prepare('INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?, ?, ?)').run(token, createdAt, expiresAt);
   res.json({ token });
+});
+
+// --- Internal API (service-to-service) ---
+//
+// 内部服务鉴权自检端点。计划 2 会在这里挂真正的业务接口。
+//
+// 必须挂在 express.static 之前（否则 dist 里有同名文件时会被静态中间件截走）。
+app.get('/api/internal/ping', requireInternal, (req, res) => {
+  res.json({ ok: true });
 });
 
 // Admin: list conversations
