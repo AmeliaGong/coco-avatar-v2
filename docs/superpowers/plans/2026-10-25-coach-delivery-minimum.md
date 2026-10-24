@@ -1417,9 +1417,21 @@ feat(engine): 引擎支持 1v1 转写注入；新增教练分析服务
 >
 > **4. 请求体里的东西都要类型守卫，不只是顶层字段。** 底座 Task 8 修的 `client_id` 是顶层字段；**数组里的元素同样会炸** —— `conversationIds: [{evil: 1}]` 绑进 better-sqlite3 一样抛 RangeError。本任务所有新路由都遵守：顶层字段要守卫，**数组的每一项也要守卫**；不守卫的写法是「查不到就跳过」，守卫的写法是「不是字符串就 400」。
 >
-> **5. 多步写入要用事务包起来。** `createDraft`（插方案 + 物化练习项）、`attachConversation`（挂会话 + 导入卡点）都不是一步写完的。中途失败会留下「方案落了、练习项没落」「会话挂了、卡点没导」的半截数据 —— 那些行是**查不出来也删不掉**的孤儿。better-sqlite3 的 `db.transaction(fn)` 在这里就是干这个的。
+> **5. 自己造出来的 id 一律用 UUID。** 底座现在对 `client_id` / `conversation_id` 都加了「≤ 128 字符，超了 400」的守卫（`conversation_id` 会直接当主键写进 `conversations.id`，超长时不是 500 而是响应头溢出、连接被掐，而行已经落了、模型的钱已经付了）。交付线自造的 id（会话 id、计划 id、练习项 id）**一律用 UUID**，不用拼接串、不用 base64、不拿 token 当 id。
+>
+> **6. 多步写入要用事务包起来。** `createDraft`（插方案 + 物化练习项）、`attachConversation`（挂会话 + 导入卡点）都不是一步写完的。中途失败会留下「方案落了、练习项没落」「会话挂了、卡点没导」的半截数据 —— 那些行是**查不出来也删不掉**的孤儿。better-sqlite3 的 `db.transaction(fn)` 在这里就是干这个的。
 
 > **关于 `client_id` 的两种含义（别混）：** 底座的 `conversations.client_id` 是**客户端自报的标签**（不是凭证，见 `server.js` 里的注释）；交付线的 `clients.id` 是**我们自己发的客户 id**。交付线把 `clients.id` 写进 `conversations.client_id`，是因为 `/c/:id/plan` 这个链接本来就把客户 id 带在 URL 里，前端调 `/api/chat` 时原样传上来。底座现在给 `client_id` 加了「必须是字符串、长度 ≤ 128」的守卫 —— 我们写进去的是 UUID（36 字符），天然合规；**但如果哪条新路由要往 `conversations.client_id` 写用户随手输入的字符串，同样要加上长度上限**，否则 12 月上线后这条路由会开始 400。
+>
+> **⚠️ 待定设计决策（Task 3 建 `clients` 表时拍板，不要拖到最后）：`conversations.client_id` 这一列迟早要拆开。**
+>
+> 现状：同一列有两种含义 —— 一边是老会话随手写的自报标签（`'manchi'`、`'a'`），一边是交付线写进去的 `clients.id`（UUID）。**当下不会造成越权**（底座这列从来不参与任何鉴权，全仓只有 INSERT，没有一处拿它做权限判断），但将来任何「按 client_id 筛会话」的功能都会筛出没法解释的结果。
+>
+> 倾向方案：给 `conversations` 加一个**独立列**（`owner_client_id`），交付线用它；`client_id` 保持「客户端自报标签」的原义不动。成本很低 —— 底座已有 `migrateSchema(db)` 这个模式（给旧表补列用的），加一列就是往 `additions` 数组里加一行。
+>
+> **在那之前**：交付线继续用 `client_id` 装 `clients.id`（UUID，过得了 ≤128 上限），并且「改嫁」检查里那个「先确认它是不是一个真实 client id」的判法**必须留着** —— 那是独立列落地之前的过渡补丁。
+
+> **`conversation_id` 现在也有 128 字符上限了。** 底座复审发现 `conversation_id` 之前没有长度上限，而它会**直接当 `conversations.id` 主键写进去** —— 实测 2 万字符时响应头溢出、连接被掐（不是 500），而库里已经落了行、模型的钱已经付了。现在改成超限 → 400，**在任何写库/调模型之前就拒掉**。交付线自己造 conversation id 时**一律用 UUID**（36 字符），不要用拼接串、带 base64 的、或者拿 token 当 id 的 —— 那些会开始 400。
 
 **API 清单：**
 
