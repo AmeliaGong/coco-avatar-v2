@@ -4,6 +4,10 @@ import path from 'path';
 
 const DB_PATH = process.env.DB_PATH || path.join(process.cwd(), 'data', 'coco.db');
 
+// 导出解析后的库路径，供测试隔离断言校验（见 tests/helpers/testDb.js）。
+// 生产行为不变：DB_PATH 仍在模块作用域捕获一次。
+export { DB_PATH };
+
 let db;
 
 export function getDb() {

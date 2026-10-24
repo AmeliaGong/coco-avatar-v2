@@ -243,6 +243,7 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
+const MINIMAX_API_URL = process.env.MINIMAX_API_URL || 'https://api.minimax.chat/v1/text/chatcompletion_v2';
 
 if (!MINIMAX_API_KEY) {
   console.error('Error: MINIMAX_API_KEY environment variable is not set');
@@ -351,7 +352,7 @@ app.post('/api/chat', async (req, res) => {
   }
 
   try {
-    const response = await fetch('https://api.minimax.chat/v1/text/chatcompletion_v2', {
+    const response = await fetch(MINIMAX_API_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
