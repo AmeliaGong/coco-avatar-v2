@@ -4,6 +4,8 @@ import {
   buildStructuredInstruction,
   extractStructured,
   stripStructured,
+  stripAllStructured,
+  findAllStructuredSpans,
   STRUCTURED_MARKER,
 } from '../server/engine/structuredOutput.js';
 import { createModelClient, ModelError } from '../server/engine/modelClient.js';
@@ -319,4 +321,66 @@ test('指令里的 JSON 块仍以 "__structured__" 作为键出现', () => {
   assert.ok(instr.includes('"__structured__"'));
   const expectedJson = JSON.stringify({ [STRUCTURED_MARKER]: { title: '卡点标题' } }, null, 2);
   assert.ok(instr.includes(expectedJson));
+});
+
+// ---------------------------------------------------------------------------
+// 剥掉「所有」结构化块（模型复述格式的那份也得剥掉）
+// ---------------------------------------------------------------------------
+
+test('findAllStructuredSpans 找出全部站得住脚的块', () => {
+  const text = [
+    '好，我按 {"__structured__": {"title": "..."}} 的格式补充。',
+    '{"__structured__": {"title": "我不能停下来"}}',
+  ].join('\n');
+  const spans = findAllStructuredSpans(text);
+  assert.equal(spans.length, 2);
+  // 没有 marker 的文本里一块都没有
+  assert.deepEqual(findAllStructuredSpans('只是一段普通回复'), []);
+});
+
+test('stripAllStructured 把复述的那份也剥掉，正文里不留 marker', () => {
+  const text = [
+    '好，我按 {"__structured__": {"title": "卡点的一句话概括"}} 的格式补充。',
+    '{"__structured__": {"title": "我不能停下来"}}',
+  ].join('\n');
+  const stripped = stripAllStructured(text);
+  assert.ok(!stripped.includes(STRUCTURED_MARKER));
+  assert.ok(!stripped.includes('卡点的一句话概括'));
+  assert.ok(stripped.includes('的格式补充'));
+});
+
+test('stripAllStructured 没认定出块时一个字都不动', () => {
+  const text = '你说的 {核心信念} 会被改写，我会输出 "__structured__"。';
+  assert.equal(stripAllStructured(text), text);
+  const broken = '这是正文。\n{"__structured__": {"title": "x"';
+  assert.equal(stripAllStructured(broken), broken);
+});
+
+test('stripAllStructured 清掉多个块留下的围栏残留', () => {
+  const text = [
+    '正文一',
+    '```json',
+    '{"__structured__": {"a": 1}}',
+    '```',
+    '正文二',
+    '{"__structured__": {"b": 2}}',
+  ].join('\n');
+  const stripped = stripAllStructured(text);
+  assert.ok(!stripped.includes('```'));
+  assert.ok(!stripped.includes(STRUCTURED_MARKER));
+  assert.ok(stripped.includes('正文一'));
+  assert.ok(stripped.includes('正文二'));
+});
+
+test('stripStructured 的语义不变：只剥最后一个块', () => {
+  // 与 stripAllStructured 的分工：stripStructured 保留「只剥最后一个」的行为，
+  // extractStructured 也仍然取最后一个有效块。这条断言是为了防止有人
+  // 「顺手」把 stripStructured 改成剥全部，悄悄改了既有语义。
+  const text = [
+    '复述 {"__structured__": {"title": "卡点的一句话概括"}}',
+    '{"__structured__": {"title": "我不能停下来"}}',
+  ].join('\n');
+  const stripped = stripStructured(text);
+  assert.ok(stripped.includes('卡点的一句话概括'));
+  assert.deepEqual(extractStructured(text), { title: '我不能停下来' });
 });

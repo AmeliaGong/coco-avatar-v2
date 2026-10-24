@@ -84,34 +84,64 @@ function scanBraceSpan(text, start) {
 export function findStructuredSpan(text) {
   if (!text) return null;
 
+  const candidates = collectMarkerIndexes(text);
+
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const span = spanAt(text, candidates[i]);
+    if (span) return span;
+  }
+  return null;
+}
+
+// 一个 marker 候选到底算不算「结构化块」：
+// 能配平、能 JSON.parse、且顶层有 marker 键 —— 三条都要满足。
+// 「取最后一个」与「取全部」两套行为共用这段判断，判定标准才不会漂。
+function spanAt(text, markerIdx) {
+  const start = text.lastIndexOf('{', markerIdx);
+  if (start < 0) return null;
+
+  const span = scanBraceSpan(text, start);
+  if (!span) return null;
+
+  let parsed;
+  try {
+    parsed = JSON.parse(text.slice(span.start, span.end + 1));
+  } catch {
+    // 这不是结构化块（比如正文里的 "{核心信念}"，或被截断的 JSON）—— 试上一个。
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  if (!Object.prototype.hasOwnProperty.call(parsed, STRUCTURED_MARKER)) return null;
+
+  return span;
+}
+
+// 收集所有 marker 出现位置。
+function collectMarkerIndexes(text) {
   const candidates = [];
+  if (!text) return candidates;
   let idx = text.indexOf(MARKER_TOKEN);
   while (idx >= 0) {
     candidates.push(idx);
     idx = text.indexOf(MARKER_TOKEN, idx + 1);
   }
+  return candidates;
+}
 
+// 找出**所有**站得住脚的结构化块，按出现位置从前往后排。
+//
+// 为什么需要「全部」：模型复述格式的那份块同样是合法 JSON，正文里留着它
+// 就等于把一份占位值 JSON 交给用户看、并存进 messages 表。取最后一个
+// （findStructuredSpan）解决的是「答案取哪一份」，解决不了「正文里还留着几份」。
+export function findAllStructuredSpans(text) {
+  const candidates = collectMarkerIndexes(text);
+  const spans = [];
   for (let i = candidates.length - 1; i >= 0; i--) {
-    const markerIdx = candidates[i];
-    const start = text.lastIndexOf('{', markerIdx);
-    if (start < 0) continue;
-
-    const span = scanBraceSpan(text, start);
-    if (!span) continue;
-
-    let parsed;
-    try {
-      parsed = JSON.parse(text.slice(span.start, span.end + 1));
-    } catch {
-      // 这不是结构化块（比如正文里的 "{核心信念}"，或被截断的 JSON）—— 试上一个。
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
-    if (!Object.prototype.hasOwnProperty.call(parsed, STRUCTURED_MARKER)) continue;
-
-    return span;
+    const span = spanAt(text, candidates[i]);
+    if (span) spans.push(span);
   }
-  return null;
+  spans.sort((a, b) => a.start - b.start);
+  return spans;
 }
 
 export function extractStructured(text) {
@@ -146,4 +176,39 @@ export function stripStructured(text) {
   const before = removeTrailingFence(text.slice(0, span.start));
   const after = removeLeadingFence(text.slice(span.end + 1));
   return [before, after].filter(Boolean).join('\n\n');
+}
+
+// 剥掉**所有**站得住脚的结构化块。
+//
+// stripStructured 只剥最后一个（findStructuredSpan 的语义）。但模型经常先在
+// 正文里复述一遍格式（把 schema 的占位值原样抄一遍），再给出真正的块 ——
+// 只剥真块的话，那份复述原样留在正文里，会被当成用户气泡展示、存进
+// messages 表，并在下一轮回灌给模型。
+//
+// 语义与 stripStructured 一致：没认定出块就一个字都不动。
+export function stripAllStructured(text) {
+  if (!text) return '';
+  const spans = findAllStructuredSpans(text);
+  if (!spans.length) return text;
+
+  // 同一段文本里 marker 嵌套时会把外块与内块都认出来；
+  // 被包住的块随外块一起消失，不要重复处理。
+  const kept = [];
+  for (const span of spans) {
+    const contained = kept.some(k => span.start >= k.start && span.end <= k.end);
+    if (!contained) kept.push(span);
+  }
+  kept.sort((a, b) => a.start - b.start);
+
+  let out = '';
+  let cursor = 0;
+  for (const span of kept) {
+    out += removeTrailingFence(text.slice(cursor, span.start));
+    cursor = span.end + 1;
+    // 块后面紧跟的围栏开头（```json）也要清掉，否则会留下空围栏。
+    const fence = /^\s*```[A-Za-z0-9_+.-]*[ \t]*\r?\n?/.exec(text.slice(cursor));
+    if (fence) cursor += fence[0].length;
+  }
+  out += removeTrailingFence(text.slice(cursor));
+  return out;
 }
