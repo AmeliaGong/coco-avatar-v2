@@ -549,6 +549,7 @@ git commit -m "feat: 契约模块 stuck_point 与方案 payload 的校验与归�
 - Create: `prompts/persona.base.md`、`prompts/persona.v2.md`、`prompts/scenario.chat.md`、`prompts/scenario.cbt_quick.md`、`prompts/scenario.cbt_delivery.md`、`prompts/scenario.analysis.md`
 - Create: `tests/fixtures/legacy-chat-prompt.txt`
 - Create: `server/promptRegistry.js`
+- Create: `scripts/split-prompt.mjs`（拆分 + 校验；`--force` 只重建 prompt 文件，`--rebaseline` 才动黄金文件）
 - Modify: `db.js`（新增 `prompt_scenarios` 表）
 - Modify: `package.json`（新增 `prompt:split` 脚本）
 - Delete: `src/constants/systemPrompt.ts`
@@ -556,7 +557,13 @@ git commit -m "feat: 契约模块 stuck_point 与方案 payload 的校验与归�
 
 **背景（实测发现）：** `src/constants/systemPrompt.ts`（5693 字符）**全项目零 import，是死代码**，且与线上 `server.js` 里的版本（5231 字符）内容不一致。改它线上不会有任何变化。这份计划会把它删掉，并把 prompt 变成文件 + 可版本化的数据库覆盖层。
 
-**核心约束：** 迁移后 `getPrompt('chat')` 必须与生产 prompt **逐字节相同**。用黄金文件断言保证。
+**核心约束：** 迁移后 `getPrompt('chat')` 必须与生产 prompt **逐字节相同**。用黄金文件断言保证 —— 而且断言必须是**不 trim 的精确比较**（生产 prompt 以一个换行开头、末尾没有换行；两边都 trim 的话这个差异在断言里就看不见了）。
+
+**三条约定（别改）：**
+
+1. `tests/fixtures/legacy-chat-prompt.txt` 是**参考**，不是**产物**。它是生产 prompt 的字节级快照，是回归锚点。拆分脚本永远不会顺手重写它。
+2. `npm run prompt:split -- --force` 只重建 `prompts/*.md`，**永远不碰黄金文件**。把黄金文件一起重写等于「把回归锚点洗白」—— 改了线上 prompt 再 `--force`，脚本照样打印「✓ 逐字节相同」，回归保护就白设了。
+3. 重新基线黄金文件是**独立动作**：`npm run prompt:split -- --rebaseline`，且要求 `server.js` 里**仍然**存在 `SYSTEM_PROMPT` 字面量（没有字面量就没有可信的新基线来源，脚本直接报错退出）。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -564,18 +571,28 @@ git commit -m "feat: 契约模块 stuck_point 与方案 payload 的校验与归�
 
 ```js
 import './helpers/testEnv.js';
-import { test, before } from 'node:test';
+import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
-import { createPromptRegistry } from '../server/promptRegistry.js';
+import { fileURLToPath } from 'node:url';
+import {
+  createPromptRegistry,
+  versionFor,
+  OVERRIDABLE_IDS,
+  SCENARIO_IDS,
+  PART_FILES,
+} from '../server/promptRegistry.js';
 import { getDb } from '../db.js';
 
-const GOLDEN = 'tests/fixtures/legacy-chat-prompt.txt';
+const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const GOLDEN = path.join(ROOT, 'tests/fixtures/legacy-chat-prompt.txt');
+const PROMPTS_DIR = path.join(ROOT, 'prompts');
+const PERSONA_V2 = path.join(PROMPTS_DIR, 'persona.v2.md');
 
-before(() => {
-  const db = getDb();
-  db.prepare('DELETE FROM prompt_scenarios').run();
+beforeEach(() => {
+  getDb().prepare('DELETE FROM prompt_scenarios').run();
 });
 
 test('黄金文件存在且非空', () => {
@@ -583,10 +600,171 @@ test('黄金文件存在且非空', () => {
   assert.ok(text.trim().length > 1000, '黄金文件内容异常短');
 });
 
-test('装配出的 chat prompt 与生产快照逐字节相同', () => {
+test('装配出的 chat prompt 与生产快照逐字节相同（不 trim）', () => {
   const registry = createPromptRegistry({ db: getDb() });
-  const golden = fs.readFileSync(GOLDEN, 'utf8').trim();
-  assert.equal(registry.getPrompt('chat').trim(), golden);
+  const golden = fs.readFileSync(GOLDEN, 'utf8');
+  assert.equal(registry.getPrompt('chat'), golden);
+});
+
+test('装配结果等于 persona.base + "\\n\\n" + scenario.chat 三段拼起来', () => {
+  const registry = createPromptRegistry({ db: getDb() });
+  const base = registry.readPart('persona.base');
+  const scenario = registry.readPart('scenario.chat');
+  assert.equal(registry.getPrompt('chat'), `${base.body}\n\n${scenario.body}`);
+});
+
+test('内容版本是内容哈希：内容变则版本变，内容不变则版本稳定', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'coco-prompts-'));
+  fs.cpSync(PROMPTS_DIR, tmp, { recursive: true });
+  const registry = createPromptRegistry({ db: getDb(), promptsDir: tmp });
+
+  const v1 = registry.getPromptMeta('chat').baseVersion;
+  const v2 = registry.getPromptMeta('chat').baseVersion;
+  assert.equal(v1, v2, '同一份内容的版本应当稳定');
+  assert.match(v1, /^[0-9a-f]{8}$/, '版本应当是 8 位十六进制内容哈希');
+  assert.equal(v1, versionFor(registry.readPart('persona.base').body));
+
+  fs.appendFileSync(path.join(tmp, 'persona.base.md'), '\n多改一个字');
+  const registry2 = createPromptRegistry({ db: getDb(), promptsDir: tmp });
+  assert.notEqual(registry2.getPromptMeta('chat').baseVersion, v1);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+test('数据库覆盖版本的 getPromptMeta 也返回内容哈希', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  registry.setPromptOverride('scenario.chat', '被覆盖的正文');
+  const meta = registry.getPromptMeta('chat');
+  assert.equal(meta.scenarioVersion, versionFor('被覆盖的正文'));
+  assert.equal(meta.source, 'file+db');
+});
+
+test('listScenarios 只列四个场景，不含 persona.base，并给出装配后的长度', () => {
+  const registry = createPromptRegistry({ db: getDb() });
+  const list = registry.listScenarios();
+  assert.deepEqual(
+    list.map((s) => s.id),
+    ['scenario.chat', 'scenario.cbt_quick', 'scenario.cbt_delivery', 'scenario.analysis']
+  );
+  assert.ok(!list.some((s) => s.id === 'persona.base'), 'persona.base 不是场景');
+  for (const item of list) {
+    assert.ok(item.promptLength > item.partLength, `${item.id} 的 promptLength 应大于 partLength`);
+    assert.equal(
+      item.promptLength,
+      registry.getPrompt(item.id.replace('scenario.', '')).length
+    );
+  }
+});
+
+test('listParts 列出 persona.base 与 persona.v2', () => {
+  const registry = createPromptRegistry({ db: getDb() });
+  const ids = registry.listParts().map((p) => p.id);
+  assert.ok(ids.includes('persona.base'));
+  assert.ok(ids.includes('persona.v2'));
+  assert.ok(ids.includes('scenario.chat'));
+});
+
+test('readPart 能读 persona.v2，未知 id 抛错', () => {
+  const registry = createPromptRegistry({ db: getDb() });
+  const v2 = registry.readPart('persona.v2');
+  assert.ok(v2.body.length > 100);
+  assert.ok(v2.body.includes('转化原则') || v2.body.includes('绝不主动'));
+  assert.throws(() => registry.readPart('不存在的id'), /未知的 prompt 场景/);
+});
+
+test('setPromptOverride 对拼错的 id 抛错，不会静默建行', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  assert.throws(() => registry.setPromptOverride('scenario.chatt', 'x'), /未知的 prompt 场景/);
+  const rows = db.prepare('SELECT COUNT(*) AS n FROM prompt_scenarios').get();
+  assert.equal(rows.n, 0, '拼错的 id 不应该留下任何数据行');
+});
+
+test('覆盖层可回滚：覆盖 → 再覆盖 → 列表可见 → 激活旧版 → 清除回到文件', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  const fileVersion = registry.getPromptMeta('chat').scenarioVersion;
+
+  registry.setPromptOverride('scenario.chat', '版本一');
+  registry.setPromptOverride('scenario.chat', '版本二');
+
+  const versions = registry.listVersions('scenario.chat');
+  assert.equal(versions.length, 2);
+  assert.equal(versions.filter((v) => v.is_active).length, 1);
+  assert.ok(versions.every((v) => typeof v.bodyHash === 'string' && v.bodyHash.length === 8));
+  assert.ok(versions.every((v) => v.body === undefined), '列表接口不应返回正文');
+
+  const old = versions.find((v) => !v.is_active);
+  registry.activateVersion('scenario.chat', old.version);
+  assert.ok(registry.getPrompt('chat').includes('版本一'));
+  assert.equal(registry.listVersions('scenario.chat').filter((v) => v.is_active).length, 1);
+
+  registry.clearOverride('scenario.chat');
+  assert.equal(registry.getPromptMeta('chat').scenarioVersion, fileVersion);
+  assert.ok(!registry.getPrompt('chat').includes('版本一'));
+});
+
+test('activateVersion 指向不存在的版本抛错', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  registry.setPromptOverride('scenario.chat', '版本一');
+  assert.throws(() => registry.activateVersion('scenario.chat', 999), /未知的 prompt 版本/);
+});
+
+test('clearOverride 之后历史行仍在，只是不再激活', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  registry.setPromptOverride('scenario.chat', '版本一');
+  registry.setPromptOverride('scenario.chat', '版本二');
+  registry.clearOverride('scenario.chat');
+  const versions = registry.listVersions('scenario.chat');
+  assert.equal(versions.length, 2, '历史行不应被删除');
+  assert.ok(versions.every((v) => !v.is_active));
+});
+
+test('activatePersona 可以把 persona.v2 变成生效的底座', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  const v2 = fs.readFileSync(PERSONA_V2, 'utf8').replace(/\s+$/, '');
+  const result = registry.activatePersona('persona.v2');
+  assert.equal(result.id, 'persona.base');
+  assert.equal(result.from, 'persona.v2');
+  const prompt = createPromptRegistry({ db }).getPrompt('chat');
+  assert.ok(prompt.includes('【转化原则'), 'chat prompt 应含有 persona.v2 独有的转化原则段');
+  assert.ok(prompt.includes(v2.slice(0, 40)), 'chat prompt 应含有 persona.v2 的开头');
+  assert.equal(registry.readPart('persona.base').source, 'db');
+});
+
+test('activatePersona 对非法来源抛错', () => {
+  const registry = createPromptRegistry({ db: getDb() });
+  assert.throws(() => registry.activatePersona('乱写的id'), /未知的 persona 来源/);
+  assert.throws(() => registry.activatePersona('scenario.chat'), /未知的 persona 来源/);
+});
+
+test('persona.base 本身也可以被数据库覆盖', () => {
+  const db = getDb();
+  const registry = createPromptRegistry({ db });
+  registry.setPromptOverride('persona.base', '替换掉的底座');
+  assert.ok(registry.getPrompt('chat').startsWith('替换掉的底座'));
+});
+
+test('getPrompt 对未知场景抛错', () => {
+  const registry = createPromptRegistry({ db: getDb() });
+  assert.throws(() => registry.getPrompt('不存在的场景'), /未知的 prompt 场景/);
+});
+
+test('可覆盖 id 集合与场景 id 清单符合约定', () => {
+  assert.deepEqual(SCENARIO_IDS, ['chat', 'cbt_quick', 'cbt_delivery', 'analysis']);
+  assert.deepEqual(OVERRIDABLE_IDS, [
+    'persona.base',
+    'scenario.chat',
+    'scenario.cbt_quick',
+    'scenario.cbt_delivery',
+    'scenario.analysis',
+  ]);
+  assert.ok(!OVERRIDABLE_IDS.includes('persona.v2'), 'persona.v2 只能作为激活来源');
+  assert.ok(PART_FILES['persona.v2'], 'persona.v2 应在部分目录里');
 });
 
 test('未覆盖的场景从 prompts/ 目录读文件', () => {
@@ -602,7 +780,6 @@ test('数据库激活版本覆盖文件内容', () => {
   registry.setPromptOverride('scenario.cbt_quick', '这是被覆盖后的版本');
   const registry2 = createPromptRegistry({ db });
   assert.ok(registry2.getPrompt('cbt_quick').includes('这是被覆盖后的版本'));
-  db.prepare('DELETE FROM prompt_scenarios').run();
 });
 
 test('数据库里的版本号递增，旧版本仍在', () => {
@@ -617,53 +794,46 @@ test('数据库里的版本号递增，旧版本仍在', () => {
   assert.deepEqual(rows, [1, 2]);
   const registry2 = createPromptRegistry({ db });
   assert.ok(registry2.getPrompt('cbt_delivery').includes('版本二'));
-  db.prepare('DELETE FROM prompt_scenarios').run();
 });
 
 test('persona.v2 存在但默认不激活', () => {
-  const v2 = fs.readFileSync('prompts/persona.v2.md', 'utf8');
+  const v2 = fs.readFileSync(PERSONA_V2, 'utf8');
   assert.ok(v2.includes('转化原则') || v2.includes('绝不主动'), 'persona.v2 缺少转化原则');
 });
-```
-
-- [ ] **Step 2: 运行测试，确认失败**
-
-Run: `npm test`
-Expected: FAIL —— `ENOENT: no such file or directory, open 'tests/fixtures/legacy-chat-prompt.txt'`。
-
-- [ ] **Step 3: 从生产代码抽取黄金文件（机械操作，不手抄）**
-
-Run:
 ```bash
 node -e "
 const fs=require('fs');
 const s=fs.readFileSync('server.js','utf8');
 const m=s.match(/const SYSTEM_PROMPT = \`([\s\S]*?)\`;/);
 if(!m) throw new Error('SYSTEM_PROMPT not found in server.js');
-const body=m[1].trim();
+const raw=m[1];
 fs.mkdirSync('tests/fixtures',{recursive:true});
-fs.writeFileSync('tests/fixtures/legacy-chat-prompt.txt', body+'\n');
-console.log('golden bytes:', body.length);
+fs.writeFileSync('tests/fixtures/legacy-chat-prompt.txt', raw);
+console.log('golden chars:', raw.length);
 "
 ```
-Expected: 输出 `golden bytes: 5230`。
+Expected: 输出 `golden chars: 5231`。
+
+> 这次抽取是**一次性重新基线**。做完之后这个文件就是新的回归锚点，以后不再重写它 —— 重新基线需要走独立的 `--rebaseline` 开关（见下面的「三条约定」）。
 
 - [ ] **Step 4: 机械拆分成 persona 与 scenario（保证字节级一致）**
+
+拆分的规则：**只去尾部空白，保留开头**。生产 prompt 的前导换行是内容的一部分。
 
 Run:
 ```bash
 node -e "
 const fs=require('fs');
-const g=fs.readFileSync('tests/fixtures/legacy-chat-prompt.txt','utf8').trim();
+const g=fs.readFileSync('tests/fixtures/legacy-chat-prompt.txt','utf8');
 const i=g.indexOf('【故事模式】');
 if(i<0) throw new Error('boundary marker 【故事模式】 not found');
 fs.mkdirSync('prompts',{recursive:true});
-fs.writeFileSync('prompts/persona.base.md', g.slice(0,i).trim()+'\n');
-fs.writeFileSync('prompts/scenario.chat.md', g.slice(i).trim()+'\n');
+fs.writeFileSync('prompts/persona.base.md', g.slice(0,i).replace(/\s+\$/,'')+'\n');
+fs.writeFileSync('prompts/scenario.chat.md', g.slice(i).replace(/\s+\$/,'')+'\n');
 console.log('split at offset', i);
 "
 ```
-Expected: 输出 `split at offset 152` —— persona 150 字节、scenario 5078 字节。
+Expected: persona 部分以换行开头（文件 152 字符）、scenario 部分 5079 字符。拼装后 `persona.base + "\n\n" + scenario.chat` 恰好等于黄金文件的 5231 字符。
 
 - [ ] **Step 5: 撰写新场景的 prompt 文件**
 
@@ -843,6 +1013,7 @@ Expected: 输出 `split at offset 152` —— persona 150 字节、scenario 5078
 ```js
 import fs from 'node:fs';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const PROMPTS_DIR = path.join(
@@ -851,85 +1022,245 @@ const PROMPTS_DIR = path.join(
   'prompts'
 );
 
-// id -> 文件名。未在数据库中被覆盖的场景从这里读取。
-const SCENARIO_FILES = {
+// 部分目录：有哪些「部分」可以管理（读、覆盖、激活）。
+// 与「prompt 怎么拼」是两件事 —— persona.base 是底座，scenario.* 是场景，persona.v2 是备用底座。
+export const PART_FILES = {
+  'persona.base': 'persona.base.md',
+  'persona.v2': 'persona.v2.md',
   'scenario.chat': 'scenario.chat.md',
   'scenario.cbt_quick': 'scenario.cbt_quick.md',
   'scenario.cbt_delivery': 'scenario.cbt_delivery.md',
   'scenario.analysis': 'scenario.analysis.md',
-  'persona.base': 'persona.base.md',
 };
+
+// 可覆盖（可写数据库覆盖版本）的部分 id。persona.v2 只能作为激活来源，不能被覆盖。
+export const OVERRIDABLE_IDS = [
+  'persona.base',
+  'scenario.chat',
+  'scenario.cbt_quick',
+  'scenario.cbt_delivery',
+  'scenario.analysis',
+];
+
+// 场景 id（用户请求体里的 scenario 字段取值域）。供路由做白名单。
+export const SCENARIO_IDS = ['chat', 'cbt_quick', 'cbt_delivery', 'analysis'];
+
+// 内容版本号 = 内容哈希。文件和数据库覆盖层共用同一套编号空间：
+// 回答「这次对话是哪些文本产生的」靠的是内容，不是修订号。
+export function versionFor(body) {
+  return createHash('sha1').update(String(body)).digest('hex').slice(0, 8);
+}
+
+// 只去尾部空白、保留开头。生产 prompt 以一个换行开头，那个换行是内容的一部分，不能被吃掉。
+function stripTrailing(body) {
+  return body.replace(/\s+$/, '');
+}
+
+function assertOverridable(id) {
+  if (!OVERRIDABLE_IDS.includes(id)) {
+    throw new Error(`未知的 prompt 场景：${id}`);
+  }
+}
 
 export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
   function readOverride(id) {
+    if (!db) return null;
     const row = db
       .prepare(
         'SELECT body, version FROM prompt_scenarios WHERE id = ? AND is_active = 1 ORDER BY version DESC LIMIT 1'
       )
       .get(id);
-    return row ? { body: row.body, version: row.version, source: 'db' } : null;
+    if (!row) return null;
+    return {
+      body: row.body,
+      version: versionFor(row.body),
+      revision: row.version,
+      source: 'db',
+    };
   }
 
   function readFile(id) {
-    const file = SCENARIO_FILES[id];
+    const file = PART_FILES[id];
     if (!file) return null;
     const full = path.join(promptsDir, file);
     if (!fs.existsSync(full)) return null;
-    return { body: fs.readFileSync(full, 'utf8').trim(), version: 0, source: 'file' };
+    const body = stripTrailing(fs.readFileSync(full, 'utf8'));
+    return { body, version: versionFor(body), source: 'file' };
   }
 
   function getPart(id) {
-    const override = readOverride(id);
-    if (override) return override;
+    if (!PART_FILES[id]) throw new Error(`未知的 prompt 场景：${id}`);
+    // 覆盖层只对 persona.base 与场景生效；persona.v2 永远读文件。
+    if (OVERRIDABLE_IDS.includes(id)) {
+      const override = readOverride(id);
+      if (override) return override;
+    }
     const fromFile = readFile(id);
     if (fromFile) return fromFile;
     throw new Error(`未知的 prompt 场景：${id}`);
   }
 
   function getPrompt(scenarioId) {
+    if (!SCENARIO_IDS.includes(scenarioId)) {
+      throw new Error(`未知的 prompt 场景：${scenarioId}`);
+    }
     const base = getPart('persona.base');
     const scenario = getPart(`scenario.${scenarioId}`);
     return `${base.body}\n\n${scenario.body}`;
   }
 
   function getPromptMeta(scenarioId) {
+    if (!SCENARIO_IDS.includes(scenarioId)) {
+      throw new Error(`未知的 prompt 场景：${scenarioId}`);
+    }
     const base = getPart('persona.base');
     const scenario = getPart(`scenario.${scenarioId}`);
     return {
       scenarioId,
+      // 内容版本（哈希）—— 回答「这段文本是哪个版本」
       baseVersion: base.version,
       scenarioVersion: scenario.version,
+      // 修订号（数据库里的整数）—— 回答「这是第几次改动」
+      baseRevision: base.revision ?? null,
+      scenarioRevision: scenario.revision ?? null,
       source: `${base.source}+${scenario.source}`,
     };
   }
 
   function setPromptOverride(id, body) {
+    assertOverridable(id);
     const maxRow = db
       .prepare('SELECT MAX(version) AS v FROM prompt_scenarios WHERE id = ?')
       .get(id);
-    const version = (maxRow && maxRow.v ? maxRow.v : 0) + 1;
+    const revision = (maxRow && maxRow.v ? maxRow.v : 0) + 1;
     db.prepare('UPDATE prompt_scenarios SET is_active = 0 WHERE id = ?').run(id);
     db.prepare(
       'INSERT INTO prompt_scenarios (id, version, body, is_active, updated_at) VALUES (?, ?, ?, 1, ?)'
-    ).run(id, version, body, new Date().toISOString());
+    ).run(id, revision, body, new Date().toISOString());
+    return { id, version: revision, bodyHash: versionFor(body) };
+  }
+
+  // 该 id 的所有版本，按整数修订号倒序。不返回正文 —— 列表接口不该灌进大段 prompt。
+  function listVersions(id) {
+    return db
+      .prepare(
+        'SELECT id, version, is_active, updated_at, body FROM prompt_scenarios WHERE id = ? ORDER BY version DESC'
+      )
+      .all(id)
+      .map((row) => ({
+        id: row.id,
+        version: row.version,
+        updated_at: row.updated_at,
+        is_active: row.is_active === 1,
+        bodyHash: versionFor(row.body),
+      }));
+  }
+
+  // 回滚：停用当前激活版本，激活指定版本。
+  function activateVersion(id, version) {
+    assertOverridable(id);
+    const row = db
+      .prepare('SELECT version FROM prompt_scenarios WHERE id = ? AND version = ?')
+      .get(id, version);
+    if (!row) throw new Error(`未知的 prompt 版本：${id}#${version}`);
+    db.prepare('UPDATE prompt_scenarios SET is_active = 0 WHERE id = ?').run(id);
+    db.prepare(
+      'UPDATE prompt_scenarios SET is_active = 1, updated_at = ? WHERE id = ? AND version = ?'
+    ).run(new Date().toISOString(), id, version);
     return { id, version };
   }
 
+  // 回到文件内容：停用全部覆盖版本，历史行保留（不删）。
+  function clearOverride(id) {
+    assertOverridable(id);
+    db.prepare('UPDATE prompt_scenarios SET is_active = 0 WHERE id = ?').run(id);
+    return { id, cleared: true };
+  }
+
+  // 把备用 persona 文件的内容写进 persona.base 的覆盖版本 ——
+  // 「启用 persona.v2」从此是一次数据库写入，不需要重新部署。
+  function activatePersona(sourceId) {
+    // 来源必须是「只读文件、不可被覆盖」的备用底座（今天只有 persona.v2）。
+    // persona.base 自己不能当来源 —— 那等于把当前底座原样再写一遍，是个空操作，
+    // 却会在数据库里留下一条「我改过 prompt」的假记录。
+    if (
+      !PART_FILES[sourceId] ||
+      !sourceId.startsWith('persona.') ||
+      OVERRIDABLE_IDS.includes(sourceId)
+    ) {
+      throw new Error(`未知的 persona 来源：${sourceId}`);
+    }
+    const source = readFile(sourceId);
+    if (!source) throw new Error(`未知的 persona 来源：${sourceId}`);
+    const result = setPromptOverride('persona.base', source.body);
+    return { id: 'persona.base', version: result.version, from: sourceId, bodyHash: result.bodyHash };
+  }
+
   function listScenarios() {
-    return Object.keys(SCENARIO_FILES).map(id => {
+    return SCENARIO_IDS.map((scenarioId) => {
+      const id = `scenario.${scenarioId}`;
       const part = readOverride(id) || readFile(id);
+      const prompt = getPrompt(scenarioId);
       return {
         id,
+        scenario: scenarioId,
         version: part ? part.version : null,
         source: part ? part.source : 'missing',
-        length: part ? part.body.length : 0,
+        partLength: part ? part.body.length : 0,
+        promptLength: prompt.length,
       };
     });
   }
 
-  return { getPrompt, getPromptMeta, setPromptOverride, listScenarios, readPart };
+  // 所有可管理的部分（含 persona.v2 与 persona.base）。
+  function listParts() {
+    return Object.keys(PART_FILES).map((id) => {
+      const part = getPart(id);
+      return {
+        id,
+        version: part.version,
+        source: part.source,
+        length: part.body.length,
+      };
+    });
+  }
+
+  return {
+    getPrompt,
+    getPromptMeta,
+    setPromptOverride,
+    listScenarios,
+    listParts,
+    listVersions,
+    activateVersion,
+    clearOverride,
+    activatePersona,
+    readPart: getPart,
+  };
 }
+
 ```
+
+**Registry 的 API 与语义（实现约定）：**
+
+| 方法 | 语义 |
+| --- | --- |
+| `getPrompt(scenarioId)` | 装配 `persona.base` + `"\n\n"` + `scenario.<id>`。未知场景抛错（静默回落会发错 prompt）。 |
+| `getPromptMeta(scenarioId)` | 返回 `baseVersion` / `scenarioVersion` —— **内容哈希**（见下），另附 `baseRevision` / `scenarioRevision`（数据库整数修订号）。 |
+| `readPart(id)` | 读单个部分。`persona.v2` 可读（只读文件，不接受覆盖）。未知 id 抛错。 |
+| `setPromptOverride(id, body)` | 写入一个新的覆盖版本（旧的停用，旧的行保留）。**校验 id 合法** —— 拼错的场景 id 直接抛错，不静默建一行谁也不读的数据。 |
+| `listVersions(id)` | 该 id 的所有版本，按整数修订号倒序，每项 `{ id, version, updated_at, is_active, bodyHash }`。**不返回正文** —— 列表接口不该灌进大段 prompt。 |
+| `activateVersion(id, version)` | 回滚：停用当前激活版本、激活指定版本。版本不存在则抛错。 |
+| `clearOverride(id)` | 停用全部覆盖版本，**保留历史行**，回到文件内容。 |
+| `activatePersona(sourceId)` | 把 `persona.v2` 的文件内容写进 `persona.base` 的覆盖版本 —— 后台「启用 persona.v2」= 一次数据库写入，不需要重新部署。 |
+| `listScenarios()` | 只列四个**场景**（不含 `persona.base`），每项 `{ id, version, source, partLength, promptLength }`。`promptLength` 是**装配后**整个 prompt 的长度。 |
+| `listParts()` | 所有可管理的**部分**（`persona.base`、`persona.v2`、四个 `scenario.*`），每项 `{ id, version, source, length }`。 |
+
+**版本号 = 内容哈希。** 文件与数据库覆盖层共用同一套编号空间：`versionFor(body)` = `sha1(body)` 的前 8 位十六进制。理由是「这次对话是哪个 prompt 产生的」问的是**内容**，不是修订号 —— 同一段文本无论来自文件还是来自覆盖层，版本号都一样。
+
+数据库表 `prompt_scenarios.version` 那个**整数列保留不动**：它是排序与回滚定位用的**修订号**，与内容哈希是两回事。整数修订号在 `listVersions` 里返回，`getPromptMeta` 返回的是内容哈希。
+
+**覆盖层可回滚。** 覆盖层不是单向棘轮：教练在后台改了一段话术、线上出问题，产品里必须有回退按钮，而不是让人手写 SQL。`listVersions` / `activateVersion` / `clearOverride` 三个方法合起来构成完整的回滚闭环。
 
 - [ ] **Step 8: 删除死代码**
 
@@ -1554,6 +1885,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       structured: structuredOutput ? extractStructured(result.content) : null,
       usage: result.usage || null,
       scenario,
+      // prompt_version 的含义：装配后 prompt 的**内容哈希来源** ——
+      // base 段与 scenario 段各自的内容哈希（Task 4 的 versionFor）。
+      // 回答「这次对话是哪两段文本产生的」，而不是「是第几次改动」。
       promptVersion: meta ? `${meta.baseVersion}.${meta.scenarioVersion}` : null,
     };
   };
@@ -1674,12 +2008,14 @@ test('token_usage 记录了 scenario 与 prompt_version', async () => {
   ).run(id, null, new Date().toISOString());
   db.prepare(
     'INSERT INTO token_usage (conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at, scenario, prompt_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
-  ).run(id, 1, 2, 3, new Date().toISOString(), 'chat', '0.0');
+  ).run(id, 1, 2, 3, new Date().toISOString(), 'chat', 'a1b2c3d4.e5f6a7b8');
   const row = db
     .prepare('SELECT scenario, prompt_version FROM token_usage WHERE conversation_id = ?')
     .get(id);
   assert.equal(row.scenario, 'chat');
-  assert.equal(row.prompt_version, '0.0');
+  // prompt_version = 装配后 prompt 的两段内容哈希（base 段 + scenario 段），
+  // 不是「0.0」这种占位 —— 它必须能区分 chat 与 cbt_quick，也能回溯到具体文本。
+  assert.equal(row.prompt_version, 'a1b2c3d4.e5f6a7b8');
 });
 ```
 
@@ -1838,6 +2174,11 @@ const cbtEngine = createCbtEngine({
 ```js
 app.post('/api/chat', async (req, res) => {
   const { messages = [], conversation_id, scenario = 'chat', client_id = null } = req.body || {};
+  // scenario 是**用户请求体里的字段** —— 必须先做白名单校验再落库。
+  // 未知场景直接 400：否则 getPrompt 抛错会变成 500，而用户消息已经落库了。
+  if (!SCENARIO_IDS.includes(scenario)) {
+    return res.status(400).json({ error: `Unknown scenario: ${scenario}` });
+  }
   const userMsg = messages.filter(m => m.role === 'user').pop();
 
   let convId = conversation_id;
