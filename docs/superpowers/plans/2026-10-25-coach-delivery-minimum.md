@@ -576,18 +576,35 @@ export function createClientStore({ db }) {
   function attachConversations(clientId, conversationIds = []) {
     const client = get(clientId);
     if (!client) throw new Error('客户不存在');
+    if (!Array.isArray(conversationIds)) throw new Error('conversationIds 必须是数组');
     let attached = 0;
     const skipped = [];
     for (const convId of conversationIds) {
+      // 每一项都要类型守卫：请求体里的元素可能是对象，而 better-sqlite3
+      // 绑对象会抛 RangeError（底座 Task 8 修的 /api/chat client_id 就是
+      // 这一类崩溃点 —— 一个 rejection 打死单进程，整站掉线）。
+      if (typeof convId !== 'string' || convId.trim() === '') {
+        throw new Error('conversationIds 里每一项必须是非空字符串');
+      }
       const conv = db.prepare('SELECT id, client_id FROM conversations WHERE id = ?').get(convId);
       if (!conv) {
         skipped.push(convId);
         continue;
       }
-      if (conv.client_id && conv.client_id !== clientId) {
+      // 「已经属于别的客户」只在它指的是**另一个真实客户**时才算。
+      //
+      // 底座的 conversations.client_id 是**客户端自报的标签**（不是凭证），
+      // 老会话里可能是 'a'、'manchi' 这种随手写的字符串，也可能是上一版
+      // 前端自造的 id。拿它跟 clients.id 比，会把「标签不同」误判成
+      // 「改嫁」，教练就没法把老会话挂到客户名下 —— 所以先查它是不是
+      // 一个真实的 client id，是才判改嫁。
+      const owner = conv.client_id
+        ? db.prepare('SELECT id FROM clients WHERE id = ?').get(conv.client_id)
+        : null;
+      if (owner && owner.id !== clientId) {
         throw new Error(`会话 ${convId} 已经属于别的客户，不能改嫁`);
       }
-      if (!conv.client_id) {
+      if (!conv.client_id || conv.client_id !== clientId) {
         db.prepare('UPDATE conversations SET client_id = ? WHERE id = ?').run(clientId, convId);
         attached += 1;
       }
@@ -1398,7 +1415,11 @@ feat(engine): 引擎支持 1v1 转写注入；新增教练分析服务
 >
 > 第 3 条不是形式主义 —— 「进程还活着」这件事必须有一个测试守着，否则下一次有人加一条 async 路由，rejection 又能逃出去。
 >
-> **4. 多步写入要用事务包起来。** `createDraft`（插方案 + 物化练习项）、`attachConversation`（挂会话 + 导入卡点）都不是一步写完的。中途失败会留下「方案落了、练习项没落」「会话挂了、卡点没导」的半截数据 —— 那些行是**查不出来也删不掉**的孤儿。better-sqlite3 的 `db.transaction(fn)` 在这里就是干这个的。
+> **4. 请求体里的东西都要类型守卫，不只是顶层字段。** 底座 Task 8 修的 `client_id` 是顶层字段；**数组里的元素同样会炸** —— `conversationIds: [{evil: 1}]` 绑进 better-sqlite3 一样抛 RangeError。本任务所有新路由都遵守：顶层字段要守卫，**数组的每一项也要守卫**；不守卫的写法是「查不到就跳过」，守卫的写法是「不是字符串就 400」。
+>
+> **5. 多步写入要用事务包起来。** `createDraft`（插方案 + 物化练习项）、`attachConversation`（挂会话 + 导入卡点）都不是一步写完的。中途失败会留下「方案落了、练习项没落」「会话挂了、卡点没导」的半截数据 —— 那些行是**查不出来也删不掉**的孤儿。better-sqlite3 的 `db.transaction(fn)` 在这里就是干这个的。
+
+> **关于 `client_id` 的两种含义（别混）：** 底座的 `conversations.client_id` 是**客户端自报的标签**（不是凭证，见 `server.js` 里的注释）；交付线的 `clients.id` 是**我们自己发的客户 id**。交付线把 `clients.id` 写进 `conversations.client_id`，是因为 `/c/:id/plan` 这个链接本来就把客户 id 带在 URL 里，前端调 `/api/chat` 时原样传上来。底座现在给 `client_id` 加了「必须是字符串、长度 ≤ 128」的守卫 —— 我们写进去的是 UUID（36 字符），天然合规；**但如果哪条新路由要往 `conversations.client_id` 写用户随手输入的字符串，同样要加上长度上限**，否则 12 月上线后这条路由会开始 400。
 
 **API 清单：**
 
