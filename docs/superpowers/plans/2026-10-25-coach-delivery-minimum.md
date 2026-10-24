@@ -2135,11 +2135,20 @@ analysisService.getLatestStuckPoint = deliveryData.getLatestStuckPoint;
 // 交付模块的后台路由。
 //
 // requireAdmin 来自 server/auth.js（计划 1 Task 10 的产物）：
-//   export function createRequireAdmin({ db, adminPassword }) { ... }
+//   export function createRequireAdmin({ db }) { ... }   // 注意：只要 db
 //
 // **必须复用 server.js 里已有的那一个 requireAdmin 实例**，
 // 不要在这里再调一次 createRequireAdmin —— 那会造出第二个中间件，
 // 两个中间件各自去 admin_sessions 表查会话，行为一样但状态分散在两处。
+//
+// ⚠️ **交付模块绝不能从 `server.js` import 任何东西** ——
+// `server.js` 会 import `server/delivery/*`，反向 import 就是循环依赖
+// （跟 `asyncRoute` 内联在 server.js 那次是同一个坑）。
+// 依赖方向只能是单向的：
+//   server.js → delivery/*.js → auth.js / db.js
+// （`auth.js` 与 `db.js` 都不 import `server.js`，所以无环。）
+// 所以这里的做法是**依赖注入**：中间件在 server.js 里造好，**当参数传进去**，
+// 交付模块自己不造、也不 import。
 //
 // 鉴权头是 `X-Admin-Token`（不是 `Authorization: Bearer`）：
 // admin 是网页后台，令牌在 DB 里；内部服务间鉴权才用 Bearer 固定密钥。
@@ -2165,10 +2174,24 @@ import { createRequireAdmin } from './server/auth.js';
 并在 app 初始化之后、`app.use(createAdminDeliveryRouter(...))` 之前加一行：
 
 ```js
-const requireAdmin = createRequireAdmin({ db, adminPassword });
+const requireAdmin = createRequireAdmin({ db });
 ```
 
-`db` 与 `adminPassword` 用 `server.js` 里**已有的**变量名（`adminPassword` 如果也搬进了 `server/auth.js`，就从那里 import）。搬完跑一次 `npm test` —— `tests/api.conversations.test.js` 依赖 admin 鉴权，搬错了会红。
+**签名只有 `db`，没有 `adminPassword`** —— 密码校验在 `POST /api/admin/login` 里，中间件只管 **session token 的有效性**。所以交付线的后台路由**不用管密码这件事**，也不要因为"看着少一个参数"就去传 `adminPassword`（传了也被忽略，但会让人以为密码是这条链的一部分）。
+
+搬完跑一次 `npm test` —— `tests/api.conversations.test.js` 依赖 admin 鉴权，搬错了会红。
+
+> **12 月的内部契约（`POST /api/internal/clients` 等）用另一个工厂**：
+>
+> ```js
+> // export function createRequireInternal({ serviceToken }) { ... }
+> // serviceToken 可以不传 —— 不传时在**构造那一刻**读 process.env.INTERNAL_SERVICE_TOKEN
+> // （读一次、闭包捕获，不是每次请求读；传了就用你传的）。
+> ```
+>
+> 头是 `Authorization: Bearer <token>`，定长比较（`crypto.timingSafeEqual`）。**没配 `INTERNAL_SERVICE_TOKEN` 时返回 503，不是 401** —— 配置缺失 ≠ 鉴权失败，混起来排查会跑偏。
+>
+> **将来改进项（本轮没做，但别照抄）**：admin 的 session token 现在是**明文存**在 `admin_sessions` 表里的 —— 也就是「数据库被读 = 所有后台 session 立刻可用」。规格要求「行为逐字节不变」，所以底座这轮没改。**交付线如果要加新的鉴权面，别照抄这个明文模式** —— 直接存哈希、查 `WHERE token_hash = ?`。
 
 - [ ] **Step 6: 运行测试，确认通过**
 
