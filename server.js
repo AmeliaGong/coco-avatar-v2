@@ -2,7 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import path from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { realpathSync } from 'fs';
+import { fileURLToPath } from 'url';
 import { getDb } from './db.js';
 
 const SYSTEM_PROMPT = `
@@ -245,15 +246,26 @@ const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
 const MINIMAX_API_URL = process.env.MINIMAX_API_URL || 'https://api.minimax.chat/v1/text/chatcompletion_v2';
 
-// 只有当本文件是进程入口时才启动监听器。
-// 这样测试可以 import app 而不会占用端口。
-const isEntryPoint =
-  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// 判定本文件是否作为进程入口运行。
+// 两边都取 realpath 再比较：import.meta.url 默认是模块的真实路径，
+// 而 process.argv[1] 是「敲进来的那个路径」（可能是软链）；在
+// --preserve-symlinks-main 下则正好相反。只比较 realpath 两种情况都对，
+// 只比原始路径会在软链启动时静默地不监听、也不报错。
+const isEntryPoint = (() => {
+  if (!process.argv[1]) return false;
+  const real = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  return real(fileURLToPath(import.meta.url)) === real(process.argv[1]);
+})();
 
-// 缺少 API key 时直接退出 —— 但只在真正的启动路径上。
-// 放在 getDb() 之前，保持与改造前完全一致的顺序：缺 key 时不建库、不改 schema。
-// 若留在模块顶层，任何 import 本文件的测试进程都会被 process.exit(1) 杀掉。
-if (isEntryPoint && !MINIMAX_API_KEY) {
+// 缺少 API key 时直接退出。放在 getDb() 之前，与改造前的顺序完全一致：
+// 缺 key 时不建库、不改 schema。
+if (!MINIMAX_API_KEY) {
   console.error('Error: MINIMAX_API_KEY environment variable is not set');
   process.exit(1);
 }
@@ -689,6 +701,7 @@ app.get('*', (req, res) => {
 
 // 只有当本文件是进程入口时才启动监听器。
 // 这样测试可以 import app 而不会占用端口。
+// （判定逻辑见文件上部的 isEntryPoint）
 if (isEntryPoint) {
   app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
