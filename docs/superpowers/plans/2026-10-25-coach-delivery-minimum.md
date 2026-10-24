@@ -71,6 +71,16 @@
   ⚠️ 绝不在 `/Users/cocogong/coco-startup/coco-avatar` 目录下执行 —— 那是另一个同名 app 的 Next.js 项目，部署会覆盖线上 Vite 版本。
 - **密钥纪律**：任何密钥、token、密码都不得出现在命令行字面量里，不得打印到输出里。
 - **后台鉴权头是 `X-Admin-Token`**，不是 `Authorization: Bearer`。admin 是网页后台，令牌在 `admin_sessions` 表里；`Authorization: Bearer` 留给内部服务间固定密钥（计划 1 Task 10 的 `requireInternal`）。交付模块的后台路由属于前者，**不要混用**。
+- **两套鉴权是故意分开的，不要合并**（计划 1 Task 10 的定案）：
+
+  | | admin（网页后台） | internal（服务间） |
+  |---|---|---|
+  | 头部 | `X-Admin-Token` | `Authorization: Bearer <token>` |
+  | 令牌 | 随机 session token，**存 DB**，24h 过期 | 固定**服务间密钥**，**不落库**，只在环境变量 |
+  | 比对 | 查 DB | `crypto.timingSafeEqual` 定长比较 |
+  | 缺失/错误 | 401 | 401（**没配 token 时是 503** —— 配置缺失 ≠ 鉴权失败） |
+
+  **交付线的后台路由挂 `requireAdmin`**（`server/auth.js` 的 `createRequireAdmin({db})`），**12 月的契约 3 / 游民纪元 BFF 挂 `requireInternal`**。前端 `adminHeaders()` 已经写的是 `X-Admin-Token`，**别改**。
 - **测试基线会漂**：计划 1 的 Task 9/10 会继续加测试，基线数字不是固定的 213。跑测试时看 `fail 0`，不要对绝对数字。
 - **写 commit message**：用 Write 工具写到 `/tmp/msg.txt`，再 `git commit -F /tmp/msg.txt`。heredoc 会把中文弄坏。
 
