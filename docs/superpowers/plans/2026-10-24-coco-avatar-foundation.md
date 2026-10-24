@@ -2280,14 +2280,16 @@ Expected: 第一条返回一个带 UUID 的 JSON；第二条输出 `401`。
 先取机器 ID：
 
 ```bash
-MACHINE_ID=$(flyctl machines list -a coco-avatar-icy-sun-5917 --json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);console.log(m[0].id)})")
+MACHINE_ID=$(https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  flyctl machines list -a coco-avatar-icy-sun-5917 --json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>{const m=JSON.parse(s);console.log(m[0].id)})")
 echo "machine: $MACHINE_ID"
 ```
 
 再备份（`machine exec` 的整条命令必须作为一个带引号的字符串参数）：
 
 ```bash
-flyctl machine exec "$MACHINE_ID" "cp /data/coco.db /data/coco.db.bak.pre-foundation && ls -la /data/"
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  flyctl machine exec "$MACHINE_ID" "cp /data/coco.db /data/coco.db.bak.pre-foundation && ls -la /data/"
 ```
 Expected: 输出 `coco.db.bak.pre-foundation` 及其大小。
 
@@ -2302,7 +2304,8 @@ umask 077 && openssl rand -hex 32 > .internal-token && echo "已生成到 .inter
 同步到 fly secret（值通过命令替换传入，不会作为字面量出现在命令里）：
 
 ```bash
-flyctl secrets set INTERNAL_SERVICE_TOKEN="$(cat .internal-token)" -a coco-avatar-icy-sun-5917
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  flyctl secrets set INTERNAL_SERVICE_TOKEN="$(cat .internal-token)" -a coco-avatar-icy-sun-5917
 ```
 Expected: 输出 `fly secrets set` 成功信息。
 
@@ -2311,9 +2314,13 @@ Expected: 输出 `fly secrets set` 成功信息。
 ⚠️ 这一步会重启线上服务。部署前确认 §全局约定 里的 app 名与路径。
 
 ```bash
-flyctl deploy --app coco-avatar-icy-sun-5917 --config /Users/cocogong/coco-startup/coco-avatar-main/fly.toml
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  flyctl deploy --app coco-avatar-icy-sun-5917 --config /Users/cocogong/coco-startup/coco-avatar-main/fly.toml
 ```
-Expected: 约 4 分钟后输出 `✔ Machine <机器ID> update succeeded`。DNS 校验可能因本地网络（Clash 屏蔽 8.8.8.8）失败，**这不代表部署失败**。
+Expected: 约 4 分钟后输出 `✔ Machine <机器ID> update succeeded`。
+
+⚠️ **必须带代理前缀。** 2026-10-24 实测：shell 直连 `fly.dev` 会 12s 超时（`curl` 返回 000），`api.github.com` 和 `registry.npmjs.org` 却正常 —— 是 Clash 路由问题，不是凭据问题。Clash Verge 混合端口是 **7897**（7890 是关的）。
+⚠️ DNS 校验可能因本地网络（Clash 屏蔽 8.8.8.8）失败，**这不代表部署失败**。以 `✔ Machine <id> update succeeded` 为准。
 
 - [ ] **Step 7: 线上验证**
 
@@ -2325,7 +2332,8 @@ Expected: `401`（说明路由已上线且鉴权生效）。
 再验证迁移没有破坏现有数据：
 
 ```bash
-flyctl machine exec "$MACHINE_ID" "node -e \"const D=require('/app/node_modules/better-sqlite3');const db=new D('/data/coco.db',{readonly:true});console.log('conversations:',db.prepare('SELECT COUNT(*) c FROM conversations').get().c);console.log('messages:',db.prepare('SELECT COUNT(*) c FROM messages').get().c);console.log('conversation columns:',db.prepare('PRAGMA table_info(conversations)').all().map(r=>r.name).join(','));console.log('prompt_scenarios:',db.prepare('SELECT COUNT(*) c FROM prompt_scenarios').get().c);\""
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  flyctl machine exec "$MACHINE_ID" "node -e \"const D=require('/app/node_modules/better-sqlite3');const db=new D('/data/coco.db',{readonly:true});console.log('conversations:',db.prepare('SELECT COUNT(*) c FROM conversations').get().c);console.log('messages:',db.prepare('SELECT COUNT(*) c FROM messages').get().c);console.log('conversation columns:',db.prepare('PRAGMA table_info(conversations)').all().map(r=>r.name).join(','));console.log('prompt_scenarios:',db.prepare('SELECT COUNT(*) c FROM prompt_scenarios').get().c);\""
 ```
 Expected:
 - `conversations:` 约 89（部署前的数量，若期间有新增会更大）
