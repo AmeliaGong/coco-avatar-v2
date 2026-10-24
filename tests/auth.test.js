@@ -14,6 +14,10 @@ import { getDb } from '../db.js';
 import { createServer } from './helpers/testServer.js';
 import { resetDb } from './helpers/testDb.js';
 
+// Node 里**没有**全局的 AsyncFunction（那是浏览器的），从 async 函数的原型
+// 上取它的构造器。
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+
 // 共享 app（server.js 里的那个）：用来测真实的挂载方式。
 let server;
 let base;
@@ -84,11 +88,16 @@ function callMiddleware(middleware, req) {
 }
 
 // 临时改环境变量并还原。
-function withoutEnv(key, fn) {
+//
+// **必须是 async**：fn() 返回 Promise 时，finally 会在异步体完成**之前**
+// 执行（同步的 finally 不会等 await）。那就等于「env 提前还原」——
+// 现在恰好没出问题（构造在第一个 await 之前同步求值），但把构造挪到
+// await 之后这条测试就会假失败或假通过，也就是「测试在骗人」。
+async function withoutEnv(key, fn) {
   const saved = process.env[key];
   delete process.env[key];
   try {
-    return fn();
+    return await fn();
   } finally {
     if (saved === undefined) delete process.env[key];
     else process.env[key] = saved;
@@ -265,33 +274,54 @@ test('requireAdmin：过期的 session → 401，且那条记录被删掉', asyn
 // 四、类型/长度守卫：畸形输入不能把服务打挂
 // ----------------------------------------------------------------
 
-// 一个一碰就炸的假 db：用来断言「被拒绝的请求根本没走到数据库」。
-function explodingDb() {
+// 一个「不该被碰到」的假 db。
+//
+// 注意：工厂会在构造时 prepare 一次 SQL（闭包捕获），所以 prepare 本身
+// 不能抛 —— 抛了的话错误会发生在**构造时**而不是请求时。
+// 真正要断言的是：被拒绝的请求**根本没执行**任何 get()/run()。
+function forbiddenDb() {
+  const calls = { get: 0, run: 0 };
   return {
+    calls,
     prepare() {
-      throw new Error('被拒绝的请求不应该查库');
+      return {
+        get() {
+          calls.get++;
+          throw new Error('被拒绝的请求不应该查库');
+        },
+        run() {
+          calls.run++;
+          throw new Error('被拒绝的请求不应该写库');
+        },
+      };
     },
   };
 }
 
 test('requireAdmin：x-admin-token 不是字符串 → 401，不崩', async () => {
-  const mw = createRequireAdmin({ db: explodingDb() });
+  const db = forbiddenDb();
+  const mw = createRequireAdmin({ db });
   for (const bad of [{}, ['a'], 123, null]) {
     const result = await callMiddleware(mw, { headers: { 'x-admin-token': bad } });
     assert.equal(result.status, 401, `token=${JSON.stringify(bad)} 应该 401`);
     assert.deepEqual(result.body, { error: 'Unauthorized' });
     assert.equal(result.nextCalled, false, '拒绝时不能调 next()');
   }
+  assert.equal(db.calls.get, 0, '被拒绝的请求不应该查库');
+  assert.equal(db.calls.run, 0, '被拒绝的请求不应该写库');
 });
 
 test('requireAdmin：x-admin-token 超长 → 401', async () => {
-  const mw = createRequireAdmin({ db: explodingDb() });
+  const db = forbiddenDb();
+  const mw = createRequireAdmin({ db });
   const result = await callMiddleware(mw, {
     headers: { 'x-admin-token': 'x'.repeat(1000) },
   });
   assert.equal(result.status, 401);
   assert.deepEqual(result.body, { error: 'Unauthorized' });
   assert.equal(result.nextCalled, false, '拒绝时不能调 next()');
+  assert.equal(db.calls.get, 0, '被拒绝的请求不应该查库');
+  assert.equal(db.calls.run, 0, '被拒绝的请求不应该写库');
 });
 
 test('requireAdmin：拒绝时不调 next()（否则会 headers already sent）', async () => {
@@ -299,4 +329,181 @@ test('requireAdmin：拒绝时不调 next()（否则会 headers already sent）'
   const result = await callMiddleware(mw, { headers: {} });
   assert.equal(result.status, 401);
   assert.equal(result.nextCalled, false);
+});
+
+// ----------------------------------------------------------------
+// 五、expires_at 是坏值时必须 fail-closed（不能放行）
+//
+// 背景：`new Date('garbage')` 是 Invalid Date，而 `Invalid Date < new Date()`
+// 恒为 false —— 不加守卫的话，一条 expires_at 损坏的记录会被**永久放行**，
+// 而且永远不会被清理（启动/登录清理用的都是 expires_at < ? 的字符串比较）。
+// ----------------------------------------------------------------
+
+test('requireAdmin：expires_at 是坏值 → 401，且那条 session 被删掉', async () => {
+  const db = getDb();
+  const badValues = ['garbage', '', 'not-a-date', '2026-13-45T99:99:99Z'];
+  for (const bad of badValues) {
+    const token = `bad-expires-${bad || 'empty'}`;
+    db.prepare(
+      'INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?, ?, ?)'
+    ).run(token, new Date().toISOString(), bad);
+
+    const res = await fetch(`${base}/api/admin/conversations`, {
+      headers: { 'X-Admin-Token': token },
+    });
+    assert.equal(res.status, 401, `expires_at=${JSON.stringify(bad)} 应该 401`);
+    const body = await res.json();
+    assert.deepEqual(body, { error: 'Unauthorized' });
+
+    // 坏值也要走删除分支 —— 否则它就是一条永久凭据。
+    const row = db
+      .prepare('SELECT * FROM admin_sessions WHERE token = ?')
+      .get(token);
+    assert.equal(row, undefined, `expires_at=${JSON.stringify(bad)} 的 session 应该被删掉`);
+  }
+});
+
+test('requireAdmin：expires_at 是 null / undefined → 401，且那条 session 被删掉', async () => {
+  // expires_at 列是 NOT NULL，插不进 null —— 所以这一层用假 db 直接构造
+  // 「库里那条记录的 expires_at 读出来是 null / undefined」的场景。
+  for (const bad of [null, undefined]) {
+    const calls = { run: 0 };
+    const db = {
+      prepare() {
+        return {
+          get: () => ({ token: 'x', created_at: 'x', expires_at: bad }),
+          run: () => {
+            calls.run++;
+          },
+        };
+      },
+    };
+    const mw = createRequireAdmin({ db });
+    const result = await callMiddleware(mw, {
+      headers: { 'x-admin-token': 'some-token' },
+    });
+    assert.equal(result.status, 401, `expires_at=${bad} 应该 401`);
+    assert.deepEqual(result.body, { error: 'Unauthorized' });
+    assert.equal(result.nextCalled, false);
+    assert.equal(calls.run, 1, `expires_at=${bad} 的 session 应该被删掉`);
+  }
+});
+
+test('requireAdmin：expires_at 是合法的未来时间 → 200（别把正常的也毙掉）', async () => {
+  const db = getDb();
+  const token = 'valid-future-session';
+  db.prepare(
+    'INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?, ?, ?)'
+  ).run(token, new Date().toISOString(), new Date(Date.now() + 3600_000).toISOString());
+
+  const res = await fetch(`${base}/api/admin/conversations`, {
+    headers: { 'X-Admin-Token': token },
+  });
+  assert.equal(res.status, 200);
+
+  // 还没过期就不能删。
+  const row = db.prepare('SELECT * FROM admin_sessions WHERE token = ?').get(token);
+  assert.ok(row, '没过期的 session 不应该被删掉');
+});
+
+// ----------------------------------------------------------------
+// 六、Bearer 前缀校验必须**真的**被测试覆盖
+//
+// 关键构造：serviceToken = 'c123'，而 'Basic c123'.slice(7) === 'c123'。
+// 所以一旦前缀判断被删掉，这些头就会被当成合法凭据放行（200）。
+// ----------------------------------------------------------------
+
+test('Bearer 前缀校验：切出来的 token 恰好等于配置值时也必须 401', async () => {
+  const mw = createRequireInternal({ serviceToken: 'c123' });
+  const headers = [
+    'Basic c123', // slice(7) === 'c123' —— 删掉前缀判断就会 200
+    'bearer c123',
+    'BEARER c123',
+    'BeArEr c123',
+    'Bearer',
+    'Bearer  c123', // 两个空格 → slice(7) === ' c123' → 长度不等 → 401
+    'c123',
+  ];
+  await withTempApp(mw, async (url) => {
+    for (const header of headers) {
+      const res = await fetch(url, { headers: { Authorization: header } });
+      assert.equal(res.status, 401, `Authorization: ${header} 应该 401`);
+    }
+  });
+});
+
+// ----------------------------------------------------------------
+// 七、「中间件必须同步」这个不变量
+//
+// Express 4 **不捕获** async handler 抛出的 rejection → 未捕获 rejection
+// → Node 默认 unhandledRejection = throw → **进程退出** → fly.io 单进程全站崩。
+// 这就是 Task 8 抓过的同一类 bug。
+// ----------------------------------------------------------------
+
+test('两个中间件都不能是 async 函数', () => {
+  const admin = createRequireAdmin({ db: forbiddenDb() });
+  const internal = createRequireInternal({ serviceToken: 'x' });
+  assert.ok(
+    !(admin instanceof AsyncFunction),
+    'requireAdmin 不能是 async：Express 4 不捕获 async 抛错 → 进程退出'
+  );
+  assert.ok(
+    !(internal instanceof AsyncFunction),
+    'requireInternal 不能是 async：Express 4 不捕获 async 抛错 → 进程退出'
+  );
+});
+
+test('db 抛错 → 500（Express 捕获得到），进程存活', async () => {
+  // get() 抛错 = 请求处理期间 db 出故障（表不存在 / 文件损坏 / SQLITE_BUSY）。
+  const db = {
+    prepare() {
+      return {
+        get() {
+          throw new Error('模拟 db 故障');
+        },
+        run() {
+          throw new Error('模拟 db 故障');
+        },
+      };
+    },
+  };
+  const mw = createRequireAdmin({ db });
+
+  let errorHandlerCalled = false;
+  const app = express();
+  app.get('/probe', mw, (req, res) => {
+    res.json({ ok: true });
+  });
+  // 必须自己挂 error handler：否则 Express 默认错误处理器在测试环境
+  // 会把堆栈吐到响应里。
+  app.use((err, req, res, next) => {
+    errorHandlerCalled = true;
+    res.status(500).json({ error: 'Internal server error' });
+  });
+
+  const listener = app.listen(0);
+  await new Promise((resolve, reject) => {
+    listener.once('listening', resolve);
+    listener.once('error', reject);
+  });
+  try {
+    const { port } = listener.address();
+    const res = await fetch(`http://127.0.0.1:${port}/probe`, {
+      headers: { 'X-Admin-Token': 'some-token' },
+    });
+    assert.equal(res.status, 500);
+    assert.equal(errorHandlerCalled, true, '错误处理中间件应该被调用');
+    // 能走到这里就说明进程没死（async 版本会在这里整个进程退出）。
+  } finally {
+    await new Promise((resolve) => listener.close(resolve));
+  }
+});
+
+test('db.prepare 抛错 → 工厂同步抛错（不是未捕获 rejection）', () => {
+  const db = {
+    prepare() {
+      throw new Error('模拟表不存在');
+    },
+  };
+  assert.throws(() => createRequireAdmin({ db }), /模拟表不存在/);
 });

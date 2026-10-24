@@ -57,9 +57,10 @@ const db = getDb();
 // 鉴权中间件。db 必须**注入进去**（server/auth.js 不 import db.js）。
 // getDb() 是懒初始化的单例，上面已经调用过，所以这里 db 已就绪。
 //
-// ADMIN_PASSWORD 不参与中间件：密码校验在 POST /api/admin/login 里，
-// 中间件只管会话 token 的有效性。这里只是把它作为一个预留选项传过去。
-const requireAdmin = createRequireAdmin({ db, adminPassword: ADMIN_PASSWORD });
+// 注意：**不传 adminPassword**。密码校验在 POST /api/admin/login 里，
+// 中间件只管会话 token 的有效性 —— 传一个没人用的值会让人以为密码是
+// 这条鉴权链的一部分。工厂函数的签名仍接受它（将来可能用）。
+const requireAdmin = createRequireAdmin({ db });
 // 服务间鉴权。serviceToken 在**构造时**从环境变量读一次 —— 所以
 // INTERNAL_SERVICE_TOKEN 必须在模块加载前就设好（server/auth.js 里有说明）。
 const requireInternal = createRequireInternal();
@@ -523,6 +524,11 @@ app.post('/api/admin/login', (req, res) => {
 // 内部服务鉴权自检端点。计划 2 会在这里挂真正的业务接口。
 //
 // 必须挂在 express.static 之前（否则 dist 里有同名文件时会被静态中间件截走）。
+//
+// 服务端没配 INTERNAL_SERVICE_TOKEN 时这里返回 **503** +
+// { error: 'INTERNAL_SERVICE_TOKEN not configured' }。这是**配置信号**，
+// 不是攻击信号：它只说明「服务在跑但没配内部密钥」，
+// 排查时应该去查环境变量，而不是去查 token。泄露的只是配置状态，不是秘密。
 app.get('/api/internal/ping', requireInternal, (req, res) => {
   res.json({ ok: true });
 });
