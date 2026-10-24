@@ -831,3 +831,133 @@ test('注入段超上限时，卡点段完整保留，被截断的是知识库�
   assert.ok(prompt.includes('已截断'));
   assert.ok(!prompt.includes('条目29'));
 });
+
+// ---------------------------------------------------------------------------
+// validators：契约校验参与「挑哪一份候选」
+// ---------------------------------------------------------------------------
+
+// 一个最简单的契约校验器：title 必须是非空字符串，且不能是占位串。
+function titleValidator(value) {
+  const title = value && typeof value === 'object' ? value.title : undefined;
+  if (typeof title !== 'string' || !title.trim()) {
+    return { ok: false, errors: ['title: 必填'], value: null };
+  }
+  if (title === '卡点标题') {
+    return { ok: false, errors: ['title: 不能照抄示例值'], value: null };
+  }
+  return { ok: true, errors: [], value: { title } };
+}
+
+function engineWith(content, validators) {
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => ({ content, usage: { total_tokens: 1 } }),
+    schemas: { stuck_point: { title: '卡点标题' } },
+  });
+  return engine;
+}
+
+test('给了 validators 时，取第一个通过契约校验的候选', async () => {
+  const content = [
+    '我先复述一遍格式：',
+    '{"__structured__": {"title": "卡点标题"}}',
+    '你真正的卡点是：',
+    '{"__structured__": {"title": "我怕被抛弃"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+    validators: { stuck_point: titleValidator },
+  });
+  assert.deepEqual(result.structured, { title: '我怕被抛弃' });
+  assert.equal(result.structuredValidated, true);
+});
+
+test('全部候选都校验不过时：退回最后一个合法块，并标记 structuredValidated=false', async () => {
+  // 引擎选的是「退回 + 标记」，不是抛错 —— 抛错会把这一轮的正文一起丢掉，
+  // 而模型明明交付了有用的正文。标记是给调用方的信号：这份没过契约，
+  // 不能当真数据落库。
+  const content = [
+    '好的，我按这个格式来。',
+    '{"__structured__": {"title": "卡点标题"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+    validators: { stuck_point: titleValidator },
+  });
+  // 正文还在
+  assert.ok(result.reply.includes('好的，我按这个格式来。'));
+  // 但结构化那份被标记成「没过校验」
+  assert.equal(result.structuredValidated, false);
+  assert.deepEqual(result.structured, { title: '卡点标题' });
+});
+
+test('没给 validators 时行为与从前完全一致：取最后一个合法块', async () => {
+  const content = [
+    '正文。',
+    '{"__structured__": {"title": "第一份"}}',
+    '{"__structured__": {"title": "最后一份"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+  });
+  assert.deepEqual(result.structured, { title: '最后一份' });
+  // 没做契约校验 → null（不是 false）
+  assert.equal(result.structuredValidated, null);
+});
+
+test('校验器自己抛错时，那一份候选算没过（不把整轮带崩）', async () => {
+  const content = [
+    '正文。',
+    '{"__structured__": {"title": "会炸的那份"}}',
+    '{"__structured__": {"title": "好使的那份"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+    validators: {
+      stuck_point: (value) => {
+        if (value.title === '会炸的那份') throw new Error('boom');
+        return titleValidator(value);
+      },
+    },
+  });
+  assert.deepEqual(result.structured, { title: '好使的那份' });
+  assert.equal(result.structuredValidated, true);
+});
+
+test('empty_reply 时错误对象上带着 structured、structuredValidated 与 promptVersion', async () => {
+  const content = '{"__structured__": {"title": "只有结构化块"}}';
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    getPromptMeta: () => ({ baseVersion: 'aaaaaaaa', scenarioVersion: 'bbbbbbbb' }),
+    callModel: async () => ({ content, usage: { total_tokens: 3 } }),
+    schemas: { stuck_point: { title: '卡点标题' } },
+  });
+  await assert.rejects(
+    () => engine({
+      scenario: 'cbt_quick',
+      history: [],
+      structuredOutput: 'stuck_point',
+      validators: { stuck_point: titleValidator },
+    }),
+    (err) => {
+      assert.equal(err.code, 'empty_reply');
+      assert.deepEqual(err.structured, { title: '只有结构化块' });
+      assert.equal(err.structuredValidated, true);
+      assert.equal(err.usage.total_tokens, 3);
+      assert.equal(err.promptVersion, 'aaaaaaaa.bbbbbbbb');
+      return true;
+    }
+  );
+});

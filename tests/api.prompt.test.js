@@ -34,8 +34,39 @@ test('线上 prompt 与黄金快照仍然一致（防止迁移过程手抖）', 
   assert.equal(registry.getPrompt('chat'), golden);
 });
 
-test('对话接口在没有可用模型密钥时返回 500 而不是崩溃', async () => {
+test('模型网关不可用时返回 502 而不是崩溃', async () => {
   resetDb();
+  // 用假 fetch 制造一个确定的网关故障：断言不再依赖「打到一个打不通的
+  // 地址会得到什么」，而是「网关 500 → 路由 502」。
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: false,
+    status: 500,
+    async json() {
+      return {};
+    },
+    async text() {
+      return 'gateway down';
+    },
+  });
+  try {
+    const res = await fetch(`${base}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: [{ role: 'user', content: '你好' }] }),
+    });
+    assert.equal(res.status, 502);
+    const body = await res.json();
+    assert.ok(body.error, '错误响应里没有 error 字段');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('网关地址根本打不通时返回 5xx 而不是崩溃', async () => {
+  resetDb();
+  // 这条不装假 fetch：走真实的 fetch，打到 testEnv 设的不可达地址
+  // （127.0.0.1:9，fetch 会直接抛「bad port」）。网络层炸了也不能让
+  // 请求挂死 —— 必须有个 5xx 出来。
   const res = await fetch(`${base}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },

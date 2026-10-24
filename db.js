@@ -28,7 +28,10 @@ function initSchema(db) {
       title TEXT,
       created_at TEXT NOT NULL,
       expires_at TEXT,
-      status TEXT DEFAULT 'active'
+      status TEXT DEFAULT 'active',
+      client_id TEXT,
+      scenario TEXT DEFAULT 'chat',
+      link_kind TEXT DEFAULT 'test'
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -36,7 +39,8 @@ function initSchema(db) {
       conversation_id TEXT NOT NULL REFERENCES conversations(id),
       role TEXT NOT NULL,
       content TEXT NOT NULL,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      structured_json TEXT
     );
 
     CREATE TABLE IF NOT EXISTS token_usage (
@@ -45,7 +49,9 @@ function initSchema(db) {
       prompt_tokens INTEGER,
       completion_tokens INTEGER,
       total_tokens INTEGER,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      scenario TEXT,
+      prompt_version TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_messages_conversation
@@ -90,4 +96,30 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_prompt_scenarios_active
       ON prompt_scenarios(id, is_active);
   `);
+
+  // 建表语句只对**新建**的库生效；线上卷里的旧表不会因为
+  // CREATE TABLE IF NOT EXISTS 而长出新列 —— 靠这里补。
+  migrateSchema(db);
+}
+
+// CREATE TABLE IF NOT EXISTS 对已存在的表不会改结构，
+// 所以线上卷里的旧表需要靠这里补列。
+//
+// 新库走 initSchema 的建表语句，老库走这里 —— 两条路都要对。
+// 每列都先查一遍再补：重复执行是安全的（启动时每次都会跑）。
+export function migrateSchema(db) {
+  const additions = [
+    ['conversations', 'client_id', 'TEXT'],
+    ['conversations', 'scenario', "TEXT DEFAULT 'chat'"],
+    ['conversations', 'link_kind', "TEXT DEFAULT 'test'"],
+    ['messages', 'structured_json', 'TEXT'],
+    ['token_usage', 'scenario', 'TEXT'],
+    ['token_usage', 'prompt_version', 'TEXT'],
+  ];
+  for (const [table, column, type] of additions) {
+    const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+    if (!cols.some(c => c.name === column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
+  }
 }

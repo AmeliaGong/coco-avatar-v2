@@ -23,10 +23,40 @@
 //                 模型复述格式的那份也会被剥掉，否则它会被存进 messages 表
 //                 并在下一轮回灌给模型。
 //   - structured：本轮请求的结构化输出。没请求结构化输出时恒为 null。
+//   - structuredValidated：这一份 structured **是否通过了契约校验**。
+//                 - true  ：过了（validators 校验通过的那份）。
+//                 - false ：**没过** —— 结构上是个合法的块，但没有通过
+//                           契约校验（多半是模型复述格式时抄的占位骨架）。
+//                           调用方**绝不能**把它当成真数据落库。
+//                 - null  ：本轮没有做契约校验（没给 validators，或本轮
+//                           没请求结构化输出）。
 //   - promptVersion：标识的是 **persona 底座段 + 场景段** 这两段文本的
 //                 内容哈希（不是修订号），**不含**本轮注入的上下文与
 //                 结构化指令 —— 同一串 promptVersion 可能对应两种不同的
 //                 装配结果，这是已知且有意的取舍。
+//
+// 第五个注入点（可选）：
+//   - validators           { [结构化输出类型]: (payload) => ({ok, errors, value}) }
+//                 契约层的校验函数（contracts/stuckPoint.js 的 parseStuckPoint、
+//                 contracts/plan.js 的 parsePlanPayload 正好是这个签名）。
+//                 给了它，引擎会用它逐个校验模型给出的候选块。
+//
+// 为什么需要它：模型很常见的行为是**先复述一遍格式**（把 schema 的占位值
+// 原样抄一遍），再给出真正的块。只看最后一个块的话，取到的既可能是真卡点、
+// 也可能是那份复述 —— 取决于复述在前面还是后面。有了契约校验，引擎可以
+// 逐个试，**取第一个通过校验的候选**，占位骨架会被契约层（它的占位符检查）
+// 拒掉。
+//
+// **全部候选都校验不过时，本引擎选的是「退回最后一个合法块，并标记
+// structuredValidated=false」**，而不是抛错。理由：
+//   1. 抛错会把这一轮**正文也一起丢掉** —— 模型明明交付了有用的正文，
+//      用户却什么也拿不到；契约校验不过只说明「结构化那份不可信」，
+//      不说明「这一轮失败」。
+//   2. 标记比抛错更安全：structured 里那份没过的块（多半含占位符）**带着
+//      false 标记**返回，调用方一眼能看出它没过校验，不会把它当真卡点存进
+//      库里。直接把它当成正常结果返回（不带标记）才是危险的做法。
+// 代价：调用方必须看 structuredValidated 这个标记 —— 只看 structured 的
+// 字段语义就变了。引擎在模块头把这一点写明，路由层也据此落库。
 //
 // 错误语义：
 //   - 引擎自己抛的错都是 CbtEngineError，带一个 code（清单见类上的注释），
@@ -35,10 +65,16 @@
 //     的是 promptRegistry 的错（未知场景），callModel 抛的是网关的错。
 //     它们原样往外冒，不要包成 CbtEngineError。
 //   - code='empty_reply'（剥掉结构化块后正文为空）的错误对象上带着
-//     structured 与 usage —— 这一轮的卡点/方案与 token 消耗都还在，调用方
-//     应据此落库与记账，而不是把整轮丢掉。
+//     structured、structuredValidated、usage 与 promptVersion —— 这一轮的
+//     卡点/方案与 token 消耗都还在，调用方应据此落库与记账，而不是把
+//     整轮丢掉。
 
-import { buildStructuredInstruction, extractStructured, stripAllStructured } from './structuredOutput.js';
+import {
+  buildStructuredInstruction,
+  extractStructured,
+  extractStructuredCandidates,
+  stripAllStructured,
+} from './structuredOutput.js';
 import { toText } from '../contracts/shared.js';
 
 // 卡点字段（title / belief / 每一条证据）的长度上限。
@@ -78,14 +114,18 @@ const MAX_CONTEXT_CHARS = 4000;
 // 抛的是 promptRegistry 的错（未知场景），callModel 抛的是网关的错。那些错
 // 原样往外冒，不要包成 CbtEngineError。
 export class CbtEngineError extends Error {
-  constructor(message, { code = 'engine_error', structured = null, usage = null, content = '' } = {}) {
+  constructor(message, { code = 'engine_error', structured = null, usage = null, content = '', promptVersion = null, structuredValidated = null } = {}) {
     super(message);
     this.name = 'CbtEngineError';
     this.code = code;
     // 本轮模型交付的结构化内容（没请求结构化输出时为 null）
     this.structured = structured;
+    // 这一份 structured 有没有通过契约校验（true / false / null）
+    this.structuredValidated = structuredValidated;
     // 本轮的 token 用量
     this.usage = usage;
+    // 本轮的 prompt 内容哈希（baseVersion.scenarioVersion）
+    this.promptVersion = promptVersion;
     // 模型的原始输出，排障用
     this.content = content;
   }
@@ -119,7 +159,25 @@ function resolveSchemaEntry(entry, type) {
     );
   }
   const notes = Object.prototype.hasOwnProperty.call(entry, 'notes') ? entry.notes : null;
+  // notes 的类型必须在这里钉死。
+  //
+  // 原来不管它，让 buildStructuredInstruction 去报错 —— 那抛的是**裸
+  // Error**，没有 code。调用方（路由）靠 code 分流 400/500/502，裸 Error
+  // 会掉进「未知异常 → 500」，把一个配置错报成服务器错。
+  // 模块头的承诺是「引擎自己抛的每一个错都是 CbtEngineError」——
+  // 这里是那个承诺的漏网之处。
+  if (notes !== undefined && notes !== null && !isPlainObject(notes)) {
+    throw new CbtEngineError(
+      `结构化输出「${type}」的 fieldNotes 无效：必须是普通对象（字段语义表），收到 ${typeof notes === 'string' ? '字符串' : typeof notes}`,
+      { code: 'invalid_schema' }
+    );
+  }
   return { schema, notes };
+}
+
+// 是不是一个「普通对象」。数组不算 —— 字段语义表是 { 字段名: 说明 }。
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 // 净化要注入 prompt 的文本。
@@ -235,11 +293,59 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       .map(m => ({ role: m.role, content: m.content }));
   }
 
+  // 挑出这一轮的结构化输出。
+  //
+  // validators 给了 → 用契约校验逐个候选过一遍，取**第一个通过**的。
+  // 候选**从后往前**遍历：指令要求结构化块在回复末尾，模型复述格式的
+  // 那份通常在前面 —— 后面那份更可能是真正的交付物。这与「没给 validators
+  // 时取最后一个合法块」的默认行为方向一致。
+  //
+  // validators 没给 → 行为与今天**完全一致**（取最后一个站得住脚的块）。
+  // 加一个新参数不该改变默认行为。
+  function selectStructured(raw, structuredOutput, validators) {
+    const hasValidator =
+      validators &&
+      typeof validators === 'object' &&
+      Object.prototype.hasOwnProperty.call(validators, structuredOutput) &&
+      typeof validators[structuredOutput] === 'function';
+    if (!hasValidator) {
+      return { value: extractStructured(raw), validated: null };
+    }
+
+    const validator = validators[structuredOutput];
+    const candidates = extractStructuredCandidates(raw);
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      const candidate = candidates[i];
+      let result = null;
+      try {
+        result = validator(candidate.value);
+      } catch {
+        // 校验器自己抛错 = 这一份没通过。不能让一份坏候选把整轮带崩。
+        result = null;
+      }
+      if (result && result.ok) {
+        return {
+          // 契约层的 parse* 返回归一化后的值；自定义校验器可能只回 ok，
+          // 那种情况用原值。
+          value: result.value === undefined ? candidate.value : result.value,
+          validated: true,
+        };
+      }
+    }
+
+    // 全部候选都没通过契约校验：退回「最后一个站得住脚的块」，并**标记**
+    // structuredValidated=false —— 调用方据此不把它当真数据落库。
+    // 为什么不是抛错：见模块头的说明（抛错会把这一轮的正文一起丢掉）。
+    const fallback = candidates.length ? candidates[candidates.length - 1].value : null;
+    return { value: fallback, validated: false };
+  }
+
   return async function runCbt({
     scenario,
     history = [],
     clientContext = null,
     structuredOutput = null,
+    validators = null,
   }) {
     // structuredOutput 将来直接来自请求体，类型必须先钉死：
     // 非字符串的数组会被 hasOwnProperty 强制转成字符串，0 / '' 会被静默
@@ -321,6 +427,7 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
 
     // 剥掉**所有**结构化块（含模型复述格式的那份），正文里不该残留 marker。
     const reply = stripAllStructured(raw).trim();
+    const promptVersion = meta ? `${meta.baseVersion}.${meta.scenarioVersion}` : null;
     if (!reply) {
       // 剥完正文为空。这不等于「模型什么都没交」—— 契约 1/契约 2 的目标
       // 产出恰恰就是「模型只给 JSON、没给正文」，那正是卡点/方案本身。
@@ -329,21 +436,31 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       //
       // 文案也要分两种情况：本轮请求了结构化输出却没拿到正文，和本轮根本没
       // 请求结构化输出 —— 后者说一句「只输出了结构化块」会让人一头雾水。
-      const structured = structuredOutput ? extractStructured(raw) : null;
+      const selection = structuredOutput
+        ? selectStructured(raw, structuredOutput, validators)
+        : { value: null, validated: null };
       const message = structuredOutput
         ? '剥掉结构化块后正文为空（模型只交付了结构化内容，正文可能在 JSON 里）'
         : '剥掉结构化块后正文为空（本轮没有请求结构化输出）';
       throw new CbtEngineError(message, {
         code: 'empty_reply',
-        structured,
+        structured: selection.value,
+        structuredValidated: selection.validated,
         usage,
         content: raw,
+        promptVersion,
       });
     }
 
+    const selection = structuredOutput
+      ? selectStructured(raw, structuredOutput, validators)
+      : { value: null, validated: null };
+
     return {
       reply,
-      structured: structuredOutput ? extractStructured(raw) : null,
+      structured: selection.value,
+      // 这一份 structured 有没有通过契约校验。见模块头的说明。
+      structuredValidated: selection.validated,
       usage,
       scenario,
       // prompt_version 的含义：**persona 底座段 + 场景段**这两段文本的
@@ -353,7 +470,7 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       // prompt 还包含这两部分，同一串 promptVersion 可能对应两种不同的
       // 装配结果。这是已知的取舍：字段名与语义都不能改（下游要写进
       // token_usage.prompt_version），只在这里说清楚它到底标识什么。
-      promptVersion: meta ? `${meta.baseVersion}.${meta.scenarioVersion}` : null,
+      promptVersion,
     };
   };
 }

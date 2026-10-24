@@ -5,7 +5,11 @@ import path from 'path';
 import { realpathSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { getDb } from './db.js';
-import { createPromptRegistry } from './server/promptRegistry.js';
+import { createPromptRegistry, SCENARIO_IDS } from './server/promptRegistry.js';
+import { createModelClient, ModelError } from './server/engine/modelClient.js';
+import { createCbtEngine } from './server/engine/cbtEngine.js';
+import { STUCK_POINT_SCHEMA, STUCK_POINT_FIELD_NOTES, parseStuckPoint } from './server/contracts/stuckPoint.js';
+import { PLAN_SCHEMA, PLAN_FIELD_NOTES, parsePlanPayload } from './server/contracts/plan.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -46,6 +50,38 @@ const db = getDb();
 // Prompt Registry：文件是兜底真相源，数据库里的激活版本优先。
 // 这样真人教练可以随时调整话术而不需要重新部署。
 const promptRegistry = createPromptRegistry({ db });
+
+// 模型客户端。
+//
+// fetchImpl 是**测试缝**：globalThis.__cocoFetchImpl 存在时走它，否则走
+// 全局 fetch。生产环境不存在这个全局变量 —— 生产代码不依赖它存在，
+// 它只在测试里被装上（装完必须卸掉）。
+const modelClient = createModelClient({
+  apiKey: MINIMAX_API_KEY,
+  baseUrl: MINIMAX_API_URL,
+  fetchImpl: (url, init) =>
+    typeof globalThis.__cocoFetchImpl === 'function'
+      ? globalThis.__cocoFetchImpl(url, init)
+      : fetch(url, init),
+});
+
+// CBT 交付引擎：拼 prompt → 调模型 → 拆结构化块，都收在引擎里。
+// 路由只负责「取数据 → 调引擎 → 写数据 → 吐 SSE」。
+//
+// 注意：createCbtEngine 返回的**就是 runCbt 本体**（不是一个带方法的对象），
+// 所以下面直接 `await cbtEngine({...})` 调用。
+const cbtEngine = createCbtEngine({
+  getPrompt: promptRegistry.getPrompt,
+  getPromptMeta: promptRegistry.getPromptMeta,
+  callModel: modelClient,
+  // 形状给模型看，语义（哪个必填、枚举、worth_practicing 的 false
+  // 是什么意思）必须一起给 —— 只给形状的话模型不知道 worth_practicing
+  // 还有个有意义的 false 状态，会一律输出 true。
+  schemas: {
+    stuck_point: { schema: STUCK_POINT_SCHEMA, notes: STUCK_POINT_FIELD_NOTES },
+    plan: { schema: PLAN_SCHEMA, notes: PLAN_FIELD_NOTES },
+  },
+});
 
 // Clean up expired admin sessions on startup
 db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(new Date().toISOString());
@@ -115,115 +151,252 @@ app.get('/api/conversations/:id', (req, res) => {
   res.json({ ...conv, messages });
 });
 
-// Chat endpoint with persistence and token tracking
-app.post('/api/chat', async (req, res) => {
-  const { messages, conversation_id, scenario = 'chat' } = req.body;
-  let convId = conversation_id;
+// --- /api/chat 的薄路由 ---
+//
+// 路由只做四件事：取数据 → 调引擎 → 写数据 → 吐 SSE。
+// 「拼 prompt / 调模型 / 拆结构化块」的语义全在 server/engine/cbtEngine.js 里；
+// 「这张卡点合不合法」的语义全在 server/contracts/ 里。
+//
+// 两条硬约束：
+//   1. **校验在落库之前**。scenario / structured_output 非法时直接 400，
+//      不留一条没人回复的 user 消息在库里。
+//   2. **落库在吐流之前**。响应已经发出去、进程随后崩溃 → 消息和 token
+//      账永久丢失，而用户已经看到回复了。反过来（先落库再写流），
+//      任何时刻 messages 表与 token_usage 表都和用户看到的内容一致。
 
-  // Auto-create conversation if not provided or if it doesn't exist in DB
-  if (!convId) {
-    convId = generateId();
+// 请求体里 structured_output 的取值域。与引擎 schemas 的键一一对应。
+const STRUCTURED_OUTPUT_TYPES = ['stuck_point', 'plan'];
+
+// 引擎错误码 → HTTP 状态码。
+//   400 客户端错（请求本身不对）    500 我们的配置错    502 模型侧错
+const ENGINE_ERROR_STATUS = {
+  invalid_structured_output: 400,
+  unknown_structured_output: 400,
+  invalid_history: 400,
+  invalid_config: 500,
+  invalid_schema: 500,
+  empty_content: 502,
+  invalid_content_type: 502,
+  empty_reply: 502,
+};
+
+// 从结构化内容里取一个能当标题的字段，给「模型只给了结构化块、没有正文」
+// 的那种轮次拼一句兜底正文。
+function structuredTitle(type, structured) {
+  if (!structured || typeof structured !== 'object') return null;
+  if (type === 'plan') {
+    const t =
+      structured.vision && typeof structured.vision.title === 'string'
+        ? structured.vision.title.trim()
+        : '';
+    return t || null;
   }
-  // Check if conversation exists; if not, create it first (disable FK check to avoid
-  // constraint error on the INSERT, then re-enable immediately after)
-  const existing = db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId);
-  if (!existing) {
-    db.pragma('foreign_keys = OFF');
+  const t = typeof structured.title === 'string' ? structured.title.trim() : '';
+  return t || null;
+}
+
+// 兜底正文。取不到标题就用一句固定文案 —— 宁可短，不可假。
+function fallbackReplyText(type, structured, validated) {
+  // 没通过契约校验的那份（多半是模型复述格式时抄的占位骨架）不能拿来
+  // 当正文 —— 那等于把占位符展示给用户。
+  const title = validated === false ? null : structuredTitle(type, structured);
+  if (title) return `这一轮我先交付了结构化内容：${title}`;
+  return '这一轮我只交付了结构化内容，正文是空的。';
+}
+
+// 落库：助手消息（带结构化输出）+ token 账。
+function persistTurn({ convId, scenario, turn }) {
+  // 没通过契约校验的结构化输出**绝不落库** —— 那多半是模型复述格式时
+  // 抄的占位骨架，存进库就是一条假卡点。
+  const structuredJson =
+    turn.structuredValidated === false ||
+    turn.structured === null ||
+    turn.structured === undefined
+      ? null
+      : JSON.stringify(turn.structured);
+
+  db.prepare(
+    'INSERT INTO messages (conversation_id, role, content, created_at, structured_json) VALUES (?, ?, ?, ?, ?)'
+  ).run(convId, 'assistant', turn.text, now(), structuredJson);
+
+  // token 账：**任何情况下都要记**。这一轮已经付过钱了，
+  // 「没拿到正文」不是不记账的理由。
+  if (turn.usage) {
+    const promptTokens = turn.usage.prompt_tokens || 0;
+    const completionTokens = turn.usage.completion_tokens || 0;
     db.prepare(
-      'INSERT INTO conversations (id, title, created_at, status) VALUES (?, ?, ?, ?)'
-    ).run(convId, null, now(), 'active');
-    db.pragma('foreign_keys = ON');
-  } else if (isExpired(existing.expires_at)) {
+      'INSERT INTO token_usage (conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at, scenario, prompt_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(
+      convId,
+      promptTokens,
+      completionTokens,
+      turn.usage.total_tokens || promptTokens + completionTokens,
+      now(),
+      scenario,
+      turn.promptVersion || null
+    );
+  }
+}
+
+// 伪 SSE：前端按 `data: ` 行读，结尾是 `data: [DONE]`。
+function streamReply(res, convId, text) {
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Conversation-Id', convId);
+  const chunkSize = 50;
+  for (let i = 0; i < text.length; i += chunkSize) {
+    const chunk = text.slice(i, i + chunkSize);
+    res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
+  }
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+// 引擎的错误 → HTTP 状态码。
+function respondWithEngineError(res, error) {
+  console.error('Error in chat endpoint:', error);
+  // 网关错（ModelError）→ 502：不是我们的问题，也别报成 500。
+  if (error instanceof ModelError || (error && error.name === 'ModelError')) {
+    return res.status(502).json({ error: 'AI Gateway error' });
+  }
+  const code = error && typeof error.code === 'string' ? error.code : null;
+  const status = (code && ENGINE_ERROR_STATUS[code]) || 500;
+  if (status === 400) {
+    // 客户端错：把原因说清楚（这是请求本身的问题，不是服务器炸了）。
+    return res.status(400).json({ error: error.message || 'Bad request' });
+  }
+  return res
+    .status(status)
+    .json({ error: status === 502 ? 'AI Gateway error' : 'Internal server error' });
+}
+
+app.post('/api/chat', async (req, res) => {
+  const body = req.body || {};
+  const {
+    messages: rawMessages,
+    conversation_id,
+    scenario = 'chat',
+    client_id = null,
+    structured_output = null,
+  } = body;
+
+  // --- 校验（全部在落库之前） ---
+  // messages 不是数组时直接 400 —— 让 messages.filter 去撞 TypeError
+  // 只会变成一个没人看得懂的 500。
+  if (rawMessages !== undefined && rawMessages !== null && !Array.isArray(rawMessages)) {
+    return res.status(400).json({ error: 'messages 必须是数组' });
+  }
+  const messages = Array.isArray(rawMessages) ? rawMessages : [];
+
+  if (!SCENARIO_IDS.includes(scenario)) {
+    return res.status(400).json({ error: `Unknown scenario: ${scenario}` });
+  }
+
+  let structuredType = null;
+  if (structured_output !== undefined && structured_output !== null) {
+    if (
+      typeof structured_output !== 'string' ||
+      !STRUCTURED_OUTPUT_TYPES.includes(structured_output)
+    ) {
+      return res.status(400).json({ error: `Unknown structured_output: ${structured_output}` });
+    }
+    structuredType = structured_output;
+  }
+
+  // --- 会话 ---
+  let convId = conversation_id;
+  const existing = convId
+    ? db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId)
+    : null;
+  if (existing && isExpired(existing.expires_at)) {
+    if (existing.status !== 'expired') {
+      db.prepare('UPDATE conversations SET status = ? WHERE id = ?').run('expired', existing.id);
+    }
     return res.status(410).json({ error: 'Conversation expired', expired: true });
   }
-
-  // Save user message
-  const userMsg = messages.filter(m => m.role === 'user').pop();
-  if (userMsg) {
+  if (!existing) {
+    // 会话不存在就建一个（外键检查临时关掉，插完立刻打开）。
+    convId = convId || generateId();
+    db.pragma('foreign_keys = OFF');
     db.prepare(
-      'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
-    ).run(convId, 'user', userMsg.content, now());
+      'INSERT INTO conversations (id, title, created_at, status, scenario, client_id) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(convId, null, now(), 'active', scenario, client_id);
+    db.pragma('foreign_keys = ON');
   }
 
+  // --- 用户消息 ---
+  const userMsg = messages.filter(m => m && m.role === 'user').pop();
+  // content 不是非空字符串的消息不进库 —— 引擎本来也会把它从上下文里
+  // 剔掉，存进去只会留下一条模型压根没看见的消息。
+  const userContent =
+    userMsg && typeof userMsg.content === 'string' && userMsg.content.trim() !== ''
+      ? userMsg.content
+      : null;
+  if (userContent !== null) {
+    db.prepare(
+      'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+    ).run(convId, 'user', userContent, now());
+  }
+
+  // --- 调引擎 ---
+  let turn;
   try {
-    const response = await fetch(MINIMAX_API_URL, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${MINIMAX_API_KEY}`,
+    const result = await cbtEngine({
+      scenario,
+      history: messages,
+      structuredOutput: structuredType,
+      // 契约层的校验函数：签名正好是 (payload) => ({ok, errors, value})。
+      // 模型复述格式时抄的占位串会被 parseStuckPoint 拒掉 —— 这正是
+      // 「落库的是真卡点、不是占位骨架」的实现方式。
+      validators: {
+        stuck_point: parseStuckPoint,
+        plan: parsePlanPayload,
       },
-      body: JSON.stringify({
-        model: 'MiniMax-M2.7',
-        messages: [
-          { role: 'system', content: promptRegistry.getPrompt(scenario) },
-          ...messages.filter(m => m.role !== 'system'),
-        ],
-        max_tokens: 2000,
-      }),
     });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('AI Gateway error:', errorText);
-      res.status(response.status).json({ error: 'AI Gateway error' });
-      return;
+    turn = {
+      text: result.reply,
+      structured: result.structured,
+      structuredValidated: result.structuredValidated,
+      usage: result.usage,
+      promptVersion: result.promptVersion,
+    };
+  } catch (error) {
+    // empty_reply 不是失败：模型只交付了结构化块（那正是契约 1/契约 2 的
+    // 目标产出），正文为空。这一轮的卡点与 token 消耗都还在 —— 落库、
+    // 记账，然后回 200 + 一句兜底正文。
+    if (error && error.code === 'empty_reply') {
+      turn = {
+        text: fallbackReplyText(structuredType, error.structured, error.structuredValidated),
+        structured: error.structured,
+        structuredValidated: error.structuredValidated,
+        usage: error.usage,
+        promptVersion: error.promptVersion,
+      };
+    } else {
+      return respondWithEngineError(res, error);
     }
+  }
 
-    // MiniMax returns a JSON response (not SSE streaming)
-    const data = await response.json();
-
-    // Set headers — include conversation_id so frontend knows it
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Conversation-Id', convId);
-
-    // Extract content from MiniMax response format
-    const fullContent = data.choices?.[0]?.message?.content || '';
-    const usage = data.usage || null;
-
-    // Send the response as a simulated SSE stream for frontend compatibility
-    if (fullContent) {
-      // Stream chunks to simulate SSE for frontend compatibility
-      const chunkSize = 50;
-      for (let i = 0; i < fullContent.length; i += chunkSize) {
-        const chunk = fullContent.slice(i, i + chunkSize);
-        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: chunk } }] })}\n\n`);
-      }
-    }
-    res.write('data: [DONE]\n\n');
-    res.end();
-
-    // Save assistant message
-    if (fullContent) {
-      db.prepare(
-        'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
-      ).run(convId, 'assistant', fullContent, now());
-    }
-
-    // Save token usage
-    if (usage) {
-      db.prepare(
-        'INSERT INTO token_usage (conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at) VALUES (?, ?, ?, ?, ?)'
-      ).run(
-        convId,
-        usage.prompt_tokens || 0,
-        usage.completion_tokens || 0,
-        usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
-        now()
-      );
-    }
+  // --- 落库（先落库，再吐流） ---
+  try {
+    persistTurn({ convId, scenario, turn });
 
     // Auto-set title from first user message if not set
     const conv = db.prepare('SELECT title FROM conversations WHERE id = ?').get(convId);
-    if (conv && !conv.title && userMsg) {
-      const title = userMsg.content.substring(0, 50) + (userMsg.content.length > 50 ? '...' : '');
+    if (conv && !conv.title && userContent) {
+      const title =
+        userContent.substring(0, 50) + (userContent.length > 50 ? '...' : '');
       db.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, convId);
     }
-  } catch (error) {
-    console.error('Error in chat endpoint:', error);
-    res.status(500).json({ error: 'Internal server error' });
+  } catch (err) {
+    // 落库失败就**不要**把回复发出去 —— 发出去的内容用户看到了，
+    // 库里却没有，账也丢了。
+    console.error('Error persisting chat turn:', err);
+    return res.status(500).json({ error: 'Internal server error' });
   }
+
+  streamReply(res, convId, turn.text);
 });
 
 // --- Admin API ---

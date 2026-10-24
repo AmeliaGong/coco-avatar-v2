@@ -210,6 +210,50 @@ export function extractStructured(text) {
   return value === undefined || value === null ? null : value;
 }
 
+// 挑出「顶层」的那些块：被别的块包住的块随外块一起消失。
+//
+// findAllStructuredSpans 与 stripAllStructured 共用这一段 —— 两处各写
+// 一遍的话，剥正文与取答案迟早会漂。
+function selectTopLevelSpans(spans) {
+  const kept = [];
+  for (const span of spans) {
+    const contained = kept.some(k => span.start >= k.start && span.end <= k.end);
+    if (!contained) kept.push(span);
+  }
+  kept.sort((a, b) => a.start - b.start);
+  return kept;
+}
+
+// 找出**所有**站得住脚的结构化块，并取出它们的值。
+//
+// 为什么需要「全部」：模型很常见的行为是**先复述一遍格式**（把 schema 的
+// 占位值原样抄一遍），再给出真正的块。只看最后一个的话，取到的既可能是
+// 真卡点、也可能是那份复述 —— 取决于模型复述在前面还是后面。调用方
+// （引擎）需要逐个过契约校验，才能挑出**真正的那张卡**。
+//
+// 顺序：**文档顺序**（按出现位置从前往后）。调用方想「优先后面那份」时
+// 自己倒着遍历 —— 顺序写在这里，判据不写在这里。
+//
+// 判据与 spanAt 完全一致（这里用的就是 findAllStructuredSpans → spanAt），
+// 不另写一份 —— 复制两份判据必然漂移。
+export function extractStructuredCandidates(text) {
+  const spans = selectTopLevelSpans(findAllStructuredSpans(text));
+  const candidates = [];
+  for (const span of spans) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text.slice(span.start, span.end + 1));
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object') continue;
+    const value = parsed[STRUCTURED_MARKER];
+    if (value === undefined || value === null) continue;
+    candidates.push({ value, span });
+  }
+  return candidates;
+}
+
 // 模型偶尔用 ```json 围栏包裹结构化块（指令明说不要，但模型常犯），
 // 剥掉块之后会残留空围栏，这里顺带清掉紧邻的围栏残留。
 function removeTrailingFence(text) {
@@ -249,7 +293,11 @@ function findMarkerFragmentRanges(text, validRanges) {
     if (!/^[ \t]*$/.test(text.slice(start + 1, markerIdx))) continue;
     // 已经是被认出来的块，就不算残骸
     if (validRanges.some(([s, e]) => start >= s && start < e)) continue;
-    // 残骸的结束位置：marker 所在行的行尾
+    // 残骸的结束位置：marker 所在行的行尾。
+    //
+    // 必须是**行尾**，不能是文本末尾 —— 残骸只坏在那一行，后面那几行
+    // 是模型正经写的正文。把 end 改成 text.length 会把残骸之后的全部
+    // 正文整段吃掉（这条边界由 tests/api.chat.test.js 钉住）。
     const nl = text.indexOf('\n', markerIdx);
     const end = nl < 0 ? text.length : nl;
     ranges.push([start, end]);
@@ -272,12 +320,7 @@ export function stripAllStructured(text) {
 
   // 同一段文本里 marker 嵌套时会把外块与内块都认出来；
   // 被包住的块随外块一起消失，不要重复处理。
-  const kept = [];
-  for (const span of spans) {
-    const contained = kept.some(k => span.start >= k.start && span.end <= k.end);
-    if (!contained) kept.push(span);
-  }
-  kept.sort((a, b) => a.start - b.start);
+  const kept = selectTopLevelSpans(spans);
 
   const validRanges = kept.map(span => [span.start, span.end + 1]);
   const fragmentRanges = findMarkerFragmentRanges(text, validRanges);
