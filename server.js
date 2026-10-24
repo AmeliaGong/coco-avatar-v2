@@ -2,7 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import { getDb } from './db.js';
 
 const SYSTEM_PROMPT = `
@@ -245,7 +245,15 @@ const MINIMAX_API_KEY = process.env.MINIMAX_API_KEY;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin';
 const MINIMAX_API_URL = process.env.MINIMAX_API_URL || 'https://api.minimax.chat/v1/text/chatcompletion_v2';
 
-if (!MINIMAX_API_KEY) {
+// 只有当本文件是进程入口时才启动监听器。
+// 这样测试可以 import app 而不会占用端口。
+const isEntryPoint =
+  process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+
+// 缺少 API key 时直接退出 —— 但只在真正的启动路径上。
+// 放在 getDb() 之前，保持与改造前完全一致的顺序：缺 key 时不建库、不改 schema。
+// 若留在模块顶层，任何 import 本文件的测试进程都会被 process.exit(1) 杀掉。
+if (isEntryPoint && !MINIMAX_API_KEY) {
   console.error('Error: MINIMAX_API_KEY environment variable is not set');
   process.exit(1);
 }
@@ -679,6 +687,12 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+// 只有当本文件是进程入口时才启动监听器。
+// 这样测试可以 import app 而不会占用端口。
+if (isEntryPoint) {
+  app.listen(PORT, () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+}
+
+export { app };
