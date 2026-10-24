@@ -1,0 +1,5 @@
+# 黄金文件存的是生产 prompt 的**原始字节**（5231 字符 / 14005 字节，以一个
+# 换行开头，没有结尾换行）。Git 默认会按 core.autocrlf / text 规则做换行
+# 转换 —— 一次 checkout 就能把那个前导换行变成 CRLF，字节断言当场失败，
+# 而失败信息看起来像「prompt 被人改了」。这里明确把它标成二进制。
+tests/fixtures/legacy-chat-prompt.txt -text

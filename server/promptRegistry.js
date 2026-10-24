@@ -45,11 +45,20 @@ function stripTrailing(body) {
 
 function assertOverridable(id) {
   if (!OVERRIDABLE_IDS.includes(id)) {
-    throw new Error(`未知的 prompt 场景：${id}`);
+    // 这里说的是「可覆盖的片段」，不是「场景」——
+    // persona.base 是个片段（不是场景），用「场景」这个词会误导。
+    throw new Error(`未知的 prompt 片段：${id}`);
   }
 }
 
 export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
+  if (!db) {
+    // 覆盖层的读写都要 db。与其让调用方在某个写方法里撞上
+    // "Cannot read properties of undefined (reading 'prepare')"，
+    // 不如在构造时就说明白。
+    throw new Error('createPromptRegistry 需要 db：prompt 的覆盖层存在数据库里');
+  }
+
   function readOverride(id) {
     if (!db) return null;
     const row = db
@@ -76,7 +85,7 @@ export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
   }
 
   function getPart(id) {
-    if (!PART_FILES[id]) throw new Error(`未知的 prompt 场景：${id}`);
+    if (!PART_FILES[id]) throw new Error(`未知的 prompt 片段：${id}`);
     // 覆盖层只对 persona.base 与场景生效；persona.v2 永远读文件。
     if (OVERRIDABLE_IDS.includes(id)) {
       const override = readOverride(id);
@@ -84,7 +93,7 @@ export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
     }
     const fromFile = readFile(id);
     if (fromFile) return fromFile;
-    throw new Error(`未知的 prompt 场景：${id}`);
+    throw new Error(`未知的 prompt 片段：${id}`);
   }
 
   function getPrompt(scenarioId) {
@@ -124,7 +133,7 @@ export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
     db.prepare(
       'INSERT INTO prompt_scenarios (id, version, body, is_active, updated_at) VALUES (?, ?, ?, 1, ?)'
     ).run(id, revision, body, new Date().toISOString());
-    return { id, version: revision, bodyHash: versionFor(body) };
+    return { id, revision, bodyHash: versionFor(body) };
   }
 
   // 该 id 的所有版本，按整数修订号倒序。不返回正文 —— 列表接口不该灌进大段 prompt。
@@ -136,7 +145,7 @@ export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
       .all(id)
       .map((row) => ({
         id: row.id,
-        version: row.version,
+        revision: row.version,
         updated_at: row.updated_at,
         is_active: row.is_active === 1,
         bodyHash: versionFor(row.body),
@@ -144,17 +153,17 @@ export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
   }
 
   // 回滚：停用当前激活版本，激活指定版本。
-  function activateVersion(id, version) {
+  function activateVersion(id, revision) {
     assertOverridable(id);
     const row = db
       .prepare('SELECT version FROM prompt_scenarios WHERE id = ? AND version = ?')
-      .get(id, version);
-    if (!row) throw new Error(`未知的 prompt 版本：${id}#${version}`);
+      .get(id, revision);
+    if (!row) throw new Error(`未知的 prompt 版本：${id}#${revision}`);
     db.prepare('UPDATE prompt_scenarios SET is_active = 0 WHERE id = ?').run(id);
     db.prepare(
       'UPDATE prompt_scenarios SET is_active = 1, updated_at = ? WHERE id = ? AND version = ?'
-    ).run(new Date().toISOString(), id, version);
-    return { id, version };
+    ).run(new Date().toISOString(), id, revision);
+    return { id, revision };
   }
 
   // 回到文件内容：停用全部覆盖版本，历史行保留（不删）。
@@ -180,7 +189,7 @@ export function createPromptRegistry({ db, promptsDir = PROMPTS_DIR } = {}) {
     const source = readFile(sourceId);
     if (!source) throw new Error(`未知的 persona 来源：${sourceId}`);
     const result = setPromptOverride('persona.base', source.body);
-    return { id: 'persona.base', version: result.version, from: sourceId, bodyHash: result.bodyHash };
+    return { id: 'persona.base', revision: result.revision, from: sourceId, bodyHash: result.bodyHash };
   }
 
   function listScenarios() {

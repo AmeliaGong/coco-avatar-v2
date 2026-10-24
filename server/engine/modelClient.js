@@ -101,6 +101,16 @@ export function createModelClient({
       );
     }
 
+    // 没有任何内容就是一次失败的调用 —— 让用户收到一个空白的对话气泡，
+    // 而日志里什么都不留。空内容不存在「误伤正常调用」的风险，
+    // 所以这条不需要 status_code 那种保守守卫。
+    if (!content) {
+      throw new ModelError(
+        `AI 网关没有返回任何内容（HTTP ${res.status}）`,
+        res.status
+      );
+    }
+
     const usage = data?.usage || null;
     return {
       content,

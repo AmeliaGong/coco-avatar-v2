@@ -259,6 +259,24 @@ test('200 但业务错误码非零且没有内容时抛 ModelError', async () =>
   );
 });
 
+test('200 但完全没有内容时抛 ModelError（不留下空白气泡）', async () => {
+  // 一次「成功」但什么都没返回的调用。以前这里会安静地返回空字符串，
+  // 用户收到一个空白气泡，日志里什么都不留。
+  const fakeFetch = async () => ({
+    ok: true,
+    status: 200,
+    json: async () => ({ choices: [{ message: { content: '' } }] }),
+  });
+  const client = createModelClient({ fetchImpl: fakeFetch, apiKey: 'k' });
+  await assert.rejects(
+    () => client({ systemPrompt: 'S', messages: [] }),
+    (err) =>
+      err instanceof ModelError &&
+      err.status === 200 &&
+      err.message.includes('没有返回任何内容')
+  );
+});
+
 test('200 且业务错误码非零但有内容时不误伤，正常返回', async () => {
   const fakeFetch = async () => ({
     ok: true,

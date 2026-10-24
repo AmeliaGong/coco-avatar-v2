@@ -712,6 +712,22 @@ test('stuck_point：belief / emotion / micro_action 是数字时报错', () => {
   }
 });
 
+test('stuck_point：belief 是数组但混进了非字符串时报错', () => {
+  // 数组整体合法，但数组里有数字/对象就不能拍平成一句话。
+  // 之前这条行为没有任何断言钉住，改坏了也看不出来。
+  for (const key of ['belief', 'emotion', 'micro_action']) {
+    const ok = validateStuckPoint({ title: '卡点', [key]: ['我不够好', 1] });
+    assert.equal(ok.ok, false, `${key} 数组里混进数字时应该报错`);
+    assert.ok(
+      ok.errors.some(e => e.includes(key)),
+      `错误信息里应含 ${key}，实际: ${ok.errors.join('; ')}`
+    );
+  }
+  // 纯字符串数组放行。
+  const good = validateStuckPoint({ title: '卡点', belief: ['我不够好', '我怕被抛弃'] });
+  assert.equal(good.ok, true, `纯字符串数组应当通过，实际: ${good.errors.join('; ')}`);
+});
+
 // ---------- 共享归一化规则 ----------
 
 test('shared：toText 对布尔返回空串（布尔不是散文）', () => {

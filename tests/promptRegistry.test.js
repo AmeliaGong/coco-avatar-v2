@@ -98,13 +98,13 @@ test('readPart 能读 persona.v2，未知 id 抛错', () => {
   const v2 = registry.readPart('persona.v2');
   assert.ok(v2.body.length > 100);
   assert.ok(v2.body.includes('转化原则') || v2.body.includes('绝不主动'));
-  assert.throws(() => registry.readPart('不存在的id'), /未知的 prompt 场景/);
+  assert.throws(() => registry.readPart('不存在的id'), /未知的 prompt 片段/);
 });
 
 test('setPromptOverride 对拼错的 id 抛错，不会静默建行', () => {
   const db = getDb();
   const registry = createPromptRegistry({ db });
-  assert.throws(() => registry.setPromptOverride('scenario.chatt', 'x'), /未知的 prompt 场景/);
+  assert.throws(() => registry.setPromptOverride('scenario.chatt', 'x'), /未知的 prompt 片段/);
   const rows = db.prepare('SELECT COUNT(*) AS n FROM prompt_scenarios').get();
   assert.equal(rows.n, 0, '拼错的 id 不应该留下任何数据行');
 });
@@ -124,7 +124,7 @@ test('覆盖层可回滚：覆盖 → 再覆盖 → 列表可见 → 激活旧�
   assert.ok(versions.every((v) => v.body === undefined), '列表接口不应返回正文');
 
   const old = versions.find((v) => !v.is_active);
-  registry.activateVersion('scenario.chat', old.version);
+  registry.activateVersion('scenario.chat', old.revision);
   assert.ok(registry.getPrompt('chat').includes('版本一'));
   assert.equal(registry.listVersions('scenario.chat').filter((v) => v.is_active).length, 1);
 
