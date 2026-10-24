@@ -44,17 +44,25 @@
 // 为什么需要它：模型很常见的行为是**先复述一遍格式**（把 schema 的占位值
 // 原样抄一遍），再给出真正的块。只看最后一个块的话，取到的既可能是真卡点、
 // 也可能是那份复述 —— 取决于复述在前面还是后面。有了契约校验，引擎可以
-// 逐个试，**取第一个通过校验的候选**，占位骨架会被契约层（它的占位符检查）
-// 拒掉。
+// 逐个试，占位骨架会被契约层（它的占位符检查）拒掉。
 //
-// **全部候选都校验不过时，本引擎选的是「退回最后一个合法块，并标记
-// structuredValidated=false」**，而不是抛错。理由：
+// **候选顺序与「取哪个」**（顺序是单一来源，引擎与
+// extractStructuredCandidates 的注释必须对得上）：
+//   - 候选列表按出现位置**从后往前**排（**最新的在前**）。
+//   - 有 validator 时**正着遍历**这份列表，取**第一个通过校验的** ——
+//     即**最新**的那份合法卡点。
+//   - **没有 validator 时行为与从前完全一致**（extractStructured：取最后
+//     一个合法块）。两者方向一致，都偏向靠后出现的交付物。
+//   - 全部候选都不过校验时，回退到**最新的**那个合法块，并标记
+//     structuredValidated=false。回退用的那份是**语法合法**的、**契约没过**
+//     的（多半是模型复述格式时抄的占位骨架），所以路由**不落库**。
+//
+// 为什么回退而不是抛错：
 //   1. 抛错会把这一轮**正文也一起丢掉** —— 模型明明交付了有用的正文，
 //      用户却什么也拿不到；契约校验不过只说明「结构化那份不可信」，
 //      不说明「这一轮失败」。
-//   2. 标记比抛错更安全：structured 里那份没过的块（多半含占位符）**带着
-//      false 标记**返回，调用方一眼能看出它没过校验，不会把它当真卡点存进
-//      库里。直接把它当成正常结果返回（不带标记）才是危险的做法。
+//   2. 标记比抛错更安全：那份没过的块（多半含占位符）**带着 false 标记**
+//      返回，调用方一眼能看出它没过校验，不会把它当真卡点存进库里。
 // 代价：调用方必须看 structuredValidated 这个标记 —— 只看 structured 的
 // 字段语义就变了。引擎在模块头把这一点写明，路由层也据此落库。
 //
@@ -296,9 +304,12 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
   // 挑出这一轮的结构化输出。
   //
   // validators 给了 → 用契约校验逐个候选过一遍，取**第一个通过**的。
-  // 候选**从后往前**遍历：指令要求结构化块在回复末尾，模型复述格式的
-  // 那份通常在前面 —— 后面那份更可能是真正的交付物。这与「没给 validators
-  // 时取最后一个合法块」的默认行为方向一致。
+  //
+  // 候选列表的顺序是「从后往前」（最新的在前，见
+  // extractStructuredCandidates 的说明）—— 所以**正着遍历**取第一个通过的，
+  // 拿到的就是**最新**的那份通过校验的卡点。这与「没给 validators 时取
+  // 最后一个合法块」（extractStructured 的语义）方向一致：两者都偏向
+  // 靠后出现的交付物。
   //
   // validators 没给 → 行为与今天**完全一致**（取最后一个站得住脚的块）。
   // 加一个新参数不该改变默认行为。
@@ -313,8 +324,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     }
 
     const validator = validators[structuredOutput];
+    // 从后往前（最新的在前）—— 正着遍历，「第一个通过的」= 最新的。
     const candidates = extractStructuredCandidates(raw);
-    for (let i = candidates.length - 1; i >= 0; i--) {
+    for (let i = 0; i < candidates.length; i++) {
       const candidate = candidates[i];
       let result = null;
       try {
@@ -333,10 +345,15 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       }
     }
 
-    // 全部候选都没通过契约校验：退回「最后一个站得住脚的块」，并**标记**
+    // 全部候选都没通过契约校验：退回**最新的**那个合法块，并**标记**
     // structuredValidated=false —— 调用方据此不把它当真数据落库。
+    //
+    // 为什么是 candidates[0] 而不是 candidates[candidates.length - 1]：
+    // 列表是「从后往前」排的（最新的在前），所以最新的是 **下标 0**。
+    // 取末位会拿到**最旧**的那一份 —— 回退方向就反了。
+    //
     // 为什么不是抛错：见模块头的说明（抛错会把这一轮的正文一起丢掉）。
-    const fallback = candidates.length ? candidates[candidates.length - 1].value : null;
+    const fallback = candidates.length ? candidates[0].value : null;
     return { value: fallback, validated: false };
   }
 

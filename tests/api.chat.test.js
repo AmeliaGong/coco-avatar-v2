@@ -204,6 +204,51 @@ test('messages 不是数组 → 400（不能因为 messages.filter 抛错变成 
   assert.equal(countMessages(), 0);
 });
 
+test('messages 不传 → 400，且不留下孤儿会话、不白调一次模型', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({});
+    assert.equal(res.status, 400);
+    // 模型调用是花钱的：请求本身不合法就不该走到那一步
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    // 也不能留下一个没人说话的孤儿会话
+    assert.equal(rows('SELECT * FROM conversations').length, 0);
+    assert.equal(countMessages(), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('messages 传 null → 400，同样不留会话、不调模型', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({ messages: null });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0);
+    assert.equal(countMessages(), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('messages 传空数组 → 允许（它确实是数组）', { timeout: 15000 }, async () => {
+  installFetch('你好。');
+  const { res } = await postChat({ messages: [] });
+  assert.equal(res.status, 200);
+  // 没有用户消息，但会话与助手消息都该在
+  assert.equal(countMessages('user'), 0);
+  assert.equal(countMessages('assistant'), 1);
+});
+
 // ---------------------------------------------------------------------------
 // 过期会话
 // ---------------------------------------------------------------------------

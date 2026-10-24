@@ -231,8 +231,12 @@ function selectTopLevelSpans(spans) {
 // 真卡点、也可能是那份复述 —— 取决于模型复述在前面还是后面。调用方
 // （引擎）需要逐个过契约校验，才能挑出**真正的那张卡**。
 //
-// 顺序：**文档顺序**（按出现位置从前往后）。调用方想「优先后面那份」时
-// 自己倒着遍历 —— 顺序写在这里，判据不写在这里。
+// 顺序：**从后往前**（按出现位置，最新的在前）。
+//
+// 为什么是这个方向：结构化块的指令要求它出现在回复的**末尾**，所以
+// 「最后出现的那份」才是模型真正的交付物（extractStructured 取的也是
+// 最后一个合法块）。调用方拿到这份列表后**正着遍历**，取第一个满足自己
+// 条件的那个 —— 「第一个」即**最新**的那份。
 //
 // 判据与 spanAt 完全一致（这里用的就是 findAllStructuredSpans → spanAt），
 // 不另写一份 —— 复制两份判据必然漂移。
@@ -251,6 +255,8 @@ export function extractStructuredCandidates(text) {
     if (value === undefined || value === null) continue;
     candidates.push({ value, span });
   }
+  // 最新的在前（selectTopLevelSpans 给的是从前往后）。
+  candidates.sort((a, b) => b.span.start - a.span.start);
   return candidates;
 }
 

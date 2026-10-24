@@ -169,6 +169,10 @@ const STRUCTURED_OUTPUT_TYPES = ['stuck_point', 'plan'];
 
 // 引擎错误码 → HTTP 状态码。
 //   400 客户端错（请求本身不对）    500 我们的配置错    502 模型侧错
+//
+// 注意：'empty_reply' **不在这张表里** —— 它不是失败，走的是特判分支
+// （模型只交付了结构化块 → 回 200，照常落库记账）。把它列进表里会误导
+// 读者以为 empty_reply 映射到 502。
 const ENGINE_ERROR_STATUS = {
   invalid_structured_output: 400,
   unknown_structured_output: 400,
@@ -177,7 +181,6 @@ const ENGINE_ERROR_STATUS = {
   invalid_schema: 500,
   empty_content: 502,
   invalid_content_type: 502,
-  empty_reply: 502,
 };
 
 // 从结构化内容里取一个能当标题的字段，给「模型只给了结构化块、没有正文」
@@ -266,6 +269,8 @@ function respondWithEngineError(res, error) {
     // 客户端错：把原因说清楚（这是请求本身的问题，不是服务器炸了）。
     return res.status(400).json({ error: error.message || 'Bad request' });
   }
+  // 500 / 502：**不带** error.message —— 那是内部细节（堆栈、SQL、路径），
+  // 对客户端没有意义。排障看服务端日志（上面已经 console.error 了）。
   return res
     .status(status)
     .json({ error: status === 502 ? 'AI Gateway error' : 'Internal server error' });
@@ -282,12 +287,20 @@ app.post('/api/chat', async (req, res) => {
   } = body;
 
   // --- 校验（全部在落库之前） ---
-  // messages 不是数组时直接 400 —— 让 messages.filter 去撞 TypeError
-  // 只会变成一个没人看得懂的 500。
-  if (rawMessages !== undefined && rawMessages !== null && !Array.isArray(rawMessages)) {
+  // messages 必须是数组。
+  //
+  // 「不传」与「传 null」同样不是数组 —— 一样 400。放它们过去的话，
+  // 请求会继续建会话、调模型（**模型调用是花钱的**）、写 assistant 消息，
+  // 最后回 200；请求方却压根没说要聊什么。
+  //
+  // 空数组 [] 是合法的 —— 它确实是数组，也是改动前的行为。
+  //
+  // 让 messages.filter 去撞 TypeError 只会变成一个没人看得懂的 500
+  // （而且 Express 4 不接 async handler 的异常 → 请求直接挂死）。
+  if (!Array.isArray(rawMessages)) {
     return res.status(400).json({ error: 'messages 必须是数组' });
   }
-  const messages = Array.isArray(rawMessages) ? rawMessages : [];
+  const messages = rawMessages;
 
   if (!SCENARIO_IDS.includes(scenario)) {
     return res.status(400).json({ error: `Unknown scenario: ${scenario}` });

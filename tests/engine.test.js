@@ -837,12 +837,13 @@ test('注入段超上限时，卡点段完整保留，被截断的是知识库�
 // ---------------------------------------------------------------------------
 
 // 一个最简单的契约校验器：title 必须是非空字符串，且不能是占位串。
+// 「占位」与「卡点标题」都当成抄示例值 —— 校验不过。
 function titleValidator(value) {
   const title = value && typeof value === 'object' ? value.title : undefined;
   if (typeof title !== 'string' || !title.trim()) {
     return { ok: false, errors: ['title: 必填'], value: null };
   }
-  if (title === '卡点标题') {
+  if (title === '卡点标题' || title.includes('占位')) {
     return { ok: false, errors: ['title: 不能照抄示例值'], value: null };
   }
   return { ok: true, errors: [], value: { title } };
@@ -873,6 +874,67 @@ test('给了 validators 时，取第一个通过契约校验的候选', async ()
   });
   assert.deepEqual(result.structured, { title: '我怕被抛弃' });
   assert.equal(result.structuredValidated, true);
+});
+
+// ---------------------------------------------------------------------------
+// 候选顺序：列表「从后往前」，遍历「正着」→ 取到的就是最新那份
+// ---------------------------------------------------------------------------
+
+test('两个候选都通过校验时，取的是最新的那个', async () => {
+  // 这条必须在「正着遍历」与「倒着遍历」两种实现下给出**不同**结果，
+  // 否则它对顺序没有约束力（倒着走会取到「较早的那份」）。
+  const content = [
+    '正文。',
+    '{"__structured__": {"title": "较早的那份"}}',
+    '{"__structured__": {"title": "最新的那份"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+    validators: { stuck_point: titleValidator },
+  });
+  assert.deepEqual(result.structured, { title: '最新的那份' });
+  assert.equal(result.structuredValidated, true);
+});
+
+test('最新的那个校验不过时，跳过它，取那个通过校验的（哪怕更旧）', async () => {
+  // 钉住「校验不过的候选要被跳过」：最新的那份是占位骨架（校验不过），
+  // 引擎必须退回去拿更旧但合法的真卡点。
+  const content = [
+    '正文。',
+    '{"__structured__": {"title": "真正的卡点"}}',
+    '{"__structured__": {"title": "卡点标题"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+    validators: { stuck_point: titleValidator },
+  });
+  assert.deepEqual(result.structured, { title: '真正的卡点' });
+  assert.equal(result.structuredValidated, true);
+});
+
+test('全部候选都校验不过时，回退到最新的那个合法块（不是最旧的）', async () => {
+  // 回退方向必须钉住：候选列表是「从后往前」排的，最新的在下标 0。
+  // 回退取下标 0（最新）；取末位会拿到最旧的那一份 —— 方向就反了。
+  const content = [
+    '正文。',
+    '{"__structured__": {"title": "卡点标题"}}',
+    '{"__structured__": {"title": "更旧的那份占位"}}',
+  ].join('\n');
+  const engine = engineWith(content);
+  const result = await engine({
+    scenario: 'cbt_quick',
+    history: [],
+    structuredOutput: 'stuck_point',
+    validators: { stuck_point: titleValidator },
+  });
+  assert.equal(result.structuredValidated, false);
+  assert.deepEqual(result.structured, { title: '更旧的那份占位' });
 });
 
 test('全部候选都校验不过时：退回最后一个合法块，并标记 structuredValidated=false', async () => {
