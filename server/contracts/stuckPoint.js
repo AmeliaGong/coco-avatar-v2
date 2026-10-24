@@ -21,13 +21,30 @@ export const STUCK_POINT_SCHEMA = {
   micro_action: '今天可以做的一件最小的事',
 };
 
+// schema 里那些「描述性」的值 —— 它们是给模型看的说明，不是示例数据。
+// 模型偶尔会原样抄回来；抄回来的卡点看着合法（是字符串、不为空），
+// 但内容是假的。这里显式列出来，validate 时直接拦住。
+export const STUCK_POINT_PLACEHOLDERS = [
+  '卡点的一句话概括，不超过 30 字',
+  '限制性信念全文',
+  '一条与该信念相反的事实',
+  '此刻的主要情绪',
+  '今天可以做的一件最小的事',
+];
+
+const STUCK_POINT_PLACEHOLDER_SET = new Set(STUCK_POINT_PLACEHOLDERS);
+
+function isStuckPointPlaceholder(text) {
+  return STUCK_POINT_PLACEHOLDER_SET.has(typeof text === 'string' ? text.trim() : '');
+}
+
 // 字段语义。随 prompt 一起交给模型，让它知道哪个必填、哪个可选。
 export const STUCK_POINT_FIELD_NOTES = {
   title: '必填。一句话概括这个卡点，不超过 30 字，不要写症状，写那个限制性的说法本身。',
-  belief: '选填。限制性信念的全文原文。',
+  belief: '选填。限制性信念的全文原文。可以是一个字符串，也可以是数组（多项时用顿号连接）。',
   evidence_against: '选填。数组，每条是与该信念相反的事实。没有就留空数组，不要编造。',
-  emotion: '选填。此刻最主要的那一个情绪。',
-  micro_action: '选填。今天就能做完的一件最小的事。',
+  emotion: '选填。此刻最主要的那一个情绪。可以是一个字符串，也可以是数组（多项时用顿号连接）。',
+  micro_action: '选填。今天就能做完的一件最小的事。可以是一个字符串，也可以是数组（多项时用顿号连接）。',
 };
 
 export function validateStuckPoint(value) {
@@ -58,6 +75,37 @@ export function validateStuckPoint(value) {
     if (typeof v === 'string') continue;
     if (Array.isArray(v) && v.every((item) => typeof item === 'string')) continue;
     errors.push(`${key}: 必须是字符串或字符串数组`);
+  }
+  // 照抄示例值的防线：模型把提示里的占位串原样输出来时，字段看着
+  // 合法（是非空字符串），内容却是假的。这里必须拦住，否则库里会
+  // 安静地存进一条「卡点的一句话概括，不超过 30 字」。
+  if (typeof value.title === 'string' && isStuckPointPlaceholder(value.title)) {
+    errors.push('title: 不能照抄示例值（模型把提示里的示例原样输出了）');
+  }
+  for (const key of ['belief', 'emotion', 'micro_action']) {
+    const v = value[key];
+    if (typeof v === 'string') {
+      if (isStuckPointPlaceholder(v)) {
+        errors.push(`${key}: 不能照抄示例值（模型把提示里的示例原样输出了）`);
+      }
+    } else if (Array.isArray(v)) {
+      v.forEach((item, i) => {
+        if (isStuckPointPlaceholder(item)) {
+          errors.push(`${key}[${i}]: 不能照抄示例值（模型把提示里的示例原样输出了）`);
+        }
+      });
+    }
+  }
+  if (typeof value.evidence_against === 'string') {
+    if (isStuckPointPlaceholder(value.evidence_against)) {
+      errors.push('evidence_against: 不能照抄示例值（模型把提示里的示例原样输出了）');
+    }
+  } else if (Array.isArray(value.evidence_against)) {
+    value.evidence_against.forEach((item, i) => {
+      if (isStuckPointPlaceholder(item)) {
+        errors.push(`evidence_against[${i}]: 不能照抄示例值（模型把提示里的示例原样输出了）`);
+      }
+    });
   }
   return { ok: errors.length === 0, errors };
 }

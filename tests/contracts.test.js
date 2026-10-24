@@ -5,6 +5,8 @@ import {
   normalizeStuckPoint,
   parseStuckPoint,
   STUCK_POINT_FIELD_NOTES,
+  STUCK_POINT_SCHEMA,
+  STUCK_POINT_PLACEHOLDERS,
 } from '../server/contracts/stuckPoint.js';
 import {
   validatePlanPayload,
@@ -12,12 +14,33 @@ import {
   parsePlanPayload,
   PLAN_HORIZONS,
   PLAN_FIELD_NOTES,
+  PLAN_SCHEMA,
+  PLAN_PLACEHOLDERS,
 } from '../server/contracts/plan.js';
 import { toText, toNumber } from '../server/contracts/shared.js';
 
 const validDiagnosis = { core_belief: 'a', pattern: 'b', root_cause: 'c' };
 const validVision = { title: 't', narrative: 'n', horizon: '1_year' };
 const validPractice = { day: 1, title: '这一步', action: '今晚 22:00 关掉手机' };
+
+// 递归收集对象/数组里的全部字符串叶子，路径用点号连接（数组用 [i]）。
+// 用来断言「占位值清单」与 schema 的示例值不漂移。
+function collectStringLeaves(node, path = '', out = []) {
+  if (typeof node === 'string') {
+    out.push({ path, value: node });
+    return out;
+  }
+  if (Array.isArray(node)) {
+    node.forEach((item, i) => collectStringLeaves(item, `${path}[${i}]`, out));
+    return out;
+  }
+  if (node && typeof node === 'object') {
+    for (const [key, val] of Object.entries(node)) {
+      collectStringLeaves(val, path ? `${path}.${key}` : key, out);
+    }
+  }
+  return out;
+}
 
 // ---------- stuck_point ----------
 
@@ -84,6 +107,161 @@ test('stuck_point：normalize 对非对象输入返回空结构而不是抛错',
 test('stuck_point：字段说明覆盖必填项，且随 prompt 一起可用', () => {
   assert.ok(STUCK_POINT_FIELD_NOTES.title.includes('必填'));
   assert.ok(STUCK_POINT_FIELD_NOTES.evidence_against.includes('数组'));
+});
+
+// ---------- 照抄示例值必须被拦住 ----------
+
+test('stuck_point：title 照抄 schema 示例值时报错', () => {
+  const ok = validateStuckPoint({ title: STUCK_POINT_SCHEMA.title });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('title')),
+    `错误信息里应含 title，实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('stuck_point：belief 照抄 schema 示例值时报错', () => {
+  const ok = validateStuckPoint({ title: '卡点', belief: STUCK_POINT_SCHEMA.belief });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('belief')),
+    `错误信息里应含 belief，实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('stuck_point：evidence_against 里有一项照抄 schema 示例值时报错', () => {
+  const ok = validateStuckPoint({
+    title: '卡点',
+    evidence_against: ['上周请假一天，年底考核并没有变差', STUCK_POINT_SCHEMA.evidence_against[0]],
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('evidence_against')),
+    `错误信息里应含 evidence_against，实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('stuck_point：emotion / micro_action 照抄 schema 示例值时报错', () => {
+  for (const key of ['emotion', 'micro_action']) {
+    const ok = validateStuckPoint({ title: '卡点', [key]: STUCK_POINT_SCHEMA[key] });
+    assert.equal(ok.ok, false, `${key} 照抄示例值时应该报错`);
+    assert.ok(
+      ok.errors.some(e => e.includes(key)),
+      `错误信息里应含 ${key}，实际: ${ok.errors.join('; ')}`,
+    );
+  }
+});
+
+test('stuck_point：占位值清单与 schema 的示例值不漂移', () => {
+  const leaves = collectStringLeaves(STUCK_POINT_SCHEMA).map(l => l.value);
+  for (const leaf of leaves) {
+    assert.ok(
+      STUCK_POINT_PLACEHOLDERS.includes(leaf),
+      `schema 里的示例值不在占位值清单中: ${leaf}`,
+    );
+  }
+  assert.deepEqual(
+    [...STUCK_POINT_PLACEHOLDERS].sort(),
+    [...new Set(leaves)].sort(),
+    '占位值清单里有多余的项，或漏掉了 schema 里的示例值',
+  );
+});
+
+test('plan：diagnosis.core_belief 照抄 schema 示例值时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: { ...validDiagnosis, core_belief: PLAN_SCHEMA.diagnosis.core_belief },
+    vision: validVision,
+    practices: [],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('diagnosis.core_belief')),
+    `错误信息里应含 diagnosis.core_belief，实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('plan：vision.narrative 照抄 schema 示例值时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: { ...validVision, narrative: PLAN_SCHEMA.vision.narrative },
+    practices: [],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('vision.narrative')),
+    `错误信息里应含 vision.narrative，实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('plan：practices[0].action 照抄 schema 示例值时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [{ day: 1, title: '这一步', action: PLAN_SCHEMA.practices[0].action }],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(
+    ok.errors.some(e => e.includes('practices[0].action')),
+    `错误信息里应含 practices[0].action，实际: ${ok.errors.join('; ')}`,
+  );
+});
+
+test('plan：vision.horizon 为 1_year 不报错（合法枚举值不能被误杀）', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: { title: 't', narrative: 'n', horizon: '1_year' },
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+  assert.deepEqual(ok.errors, []);
+});
+
+test('plan：占位值清单与 schema 的示例值不漂移（horizon 是合法枚举，跳过）', () => {
+  const leaves = collectStringLeaves(PLAN_SCHEMA)
+    .filter(l => l.path !== 'vision.horizon')
+    .map(l => l.value);
+  for (const leaf of leaves) {
+    assert.ok(
+      PLAN_PLACEHOLDERS.includes(leaf),
+      `schema 里的示例值不在占位值清单中: ${leaf}`,
+    );
+  }
+  assert.deepEqual(
+    [...PLAN_PLACEHOLDERS].sort(),
+    [...new Set(leaves)].sort(),
+    '占位值清单里有多余的项，或漏掉了 schema 里的示例值',
+  );
+});
+
+test('正常内容不因占位值检查而被误伤', () => {
+  const sp = validateStuckPoint({
+    title: '我不能停下来，因为一旦停下来就会被抛弃',
+    belief: '停下来就会被抛弃',
+    evidence_against: ['上周请假一天，年底考核并没有变差'],
+    emotion: '焦虑',
+    micro_action: '今天记录一次「我可以慢下来」的时刻',
+  });
+  assert.equal(sp.ok, true, `不该报错: ${sp.errors.join('; ')}`);
+  const pl = validatePlanPayload({
+    diagnosis: { core_belief: '我不够好', pattern: '反复讨好', root_cause: '早年的否定' },
+    vision: { title: '有自己的节奏', narrative: '你不再用忙碌换安全。', horizon: 'life' },
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(pl.ok, true, `不该报错: ${pl.errors.join('; ')}`);
+});
+
+test('stuck_point：belief / emotion / micro_action 的字段说明写明可以给数组', () => {
+  for (const key of ['belief', 'emotion', 'micro_action']) {
+    assert.ok(
+      STUCK_POINT_FIELD_NOTES[key].includes('数组'),
+      `${key} 的字段说明没写明可以给数组: ${STUCK_POINT_FIELD_NOTES[key]}`,
+    );
+  }
 });
 
 // ---------- plan ----------

@@ -42,6 +42,30 @@ export const PLAN_SCHEMA = {
   worth_practicing: true,
 };
 
+// schema 里那些「描述性」的值 —— 它们是给模型看的说明，不是示例数据。
+// 模型偶尔会原样抄回来；抄回来的方案看着合法（是字符串、不为空），
+// 但内容是假的。这里显式列出来，validate 时直接拦住。
+// 注意：vision.horizon 的示例值 '1_year' 是合法枚举值，不是占位值 ——
+// 所以既不在清单里，也不接受占位值检查。
+export const PLAN_PLACEHOLDERS = [
+  '核心限制性信念',
+  '反复出现的行为模式',
+  '更深一层的成因',
+  '未来愿景的一句话标题',
+  '2-3 段叙事，用 Coco 的口吻写给客户看',
+  '这一步叫什么',
+  '这一步在验证什么假设',
+  '具体可执行的动作',
+  '回填证据时的引导问句',
+  '做到什么算完成',
+];
+
+const PLAN_PLACEHOLDER_SET = new Set(PLAN_PLACEHOLDERS);
+
+function isPlanPlaceholder(text) {
+  return PLAN_PLACEHOLDER_SET.has(typeof text === 'string' ? text.trim() : '');
+}
+
 // 字段语义。随 prompt 一起交给模型 —— 少了这一段，模型根本不知道
 // worth_practicing 还有个有意义的 false 状态，会一律输出 true，
 // 「不是每个卡点都值得做练习」这个开关就永远不触发。
@@ -94,6 +118,25 @@ export function validatePlanPayload(value) {
       errors.push(`vision.horizon: 必须是 ${PLAN_HORIZONS.join(' / ')} 之一`);
     }
   }
+  // 照抄示例值的防线：模型把提示里的占位串原样输出来时，字段看着
+  // 合法（是非空字符串），内容却是假的。这里必须拦住。
+  // vision.horizon 不查 —— '1_year' 是合法枚举值，不是占位值。
+  if (isPlainObject(value.diagnosis)) {
+    for (const key of ['core_belief', 'pattern', 'root_cause']) {
+      const v = value.diagnosis[key];
+      if (isPlanPlaceholder(v)) {
+        errors.push(`diagnosis.${key}: 不能照抄示例值（模型把提示里的示例原样输出了）`);
+      }
+    }
+  }
+  if (isPlainObject(value.vision)) {
+    for (const key of ['title', 'narrative']) {
+      const v = value.vision[key];
+      if (isPlanPlaceholder(v)) {
+        errors.push(`vision.${key}: 不能照抄示例值（模型把提示里的示例原样输出了）`);
+      }
+    }
+  }
   // worth_practicing 必填：它决定 practices 该不该存在。先判定它，
   // 再据此决定 practices 的规则。
   let worthPracticing;
@@ -126,6 +169,14 @@ export function validatePlanPayload(value) {
           const day = toNumber(p.day);
           if (day === null || !Number.isInteger(day)) {
             errors.push(`practices[${i}].day: 必须是整数`);
+          }
+        }
+        // 照抄示例值的防线：practices 里每一段描述性的字段都要查。
+        for (const key of ['title', 'intent', 'action', 'evidence_prompt', 'success_criteria']) {
+          if (isPlanPlaceholder(p[key])) {
+            errors.push(
+              `practices[${i}].${key}: 不能照抄示例值（模型把提示里的示例原样输出了）`,
+            );
           }
         }
       });
