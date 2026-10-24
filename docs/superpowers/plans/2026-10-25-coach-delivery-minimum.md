@@ -47,7 +47,8 @@
 - **生产依赖只加一个**：`mammoth`（docx → 纯文本，增补 D.3）。不要顺手加别的包 —— multipart 用 `express.raw` 收字节，不需要 multer。
 - **契约 2 的两处扩展（C.1 / D.1）已经做完了** —— commit `28132c0`（2026-10-25）。**这一步被单独提前做了**，因为它不依赖交付模块的表，只碰 `server/contracts/plan.js` + `prompts/scenario.analysis.md` + `tests/contracts.test.js`，而计划 1 剩下的 Task 9/10 不碰这三个文件 —— 提前做零冲突，且把 11-30 的定稿期限从「赌 Tide 的部署」变成「已经办完」。
   - **生产上零影响**：前端现在从不发 `structured_output`，`plan` 这个 schema 根本不会被注入到任何一次对话里；`prompts/scenario.chat.md` 一字未动，字节级断言仍绿。
-  - **部署时的确认项**：prompt registry 是「DB 里的激活版本优先于文件」。如果生产库里 `scenario.analysis` 有激活的覆盖版本，文件改动**不会自动生效** —— 部署后用后台的 prompt 列表确认一下；没有覆盖版本就不用管。
+  - **部署后立即生效，不需要手动激活**：生产库里**没有** `scenario.analysis` 的 DB 激活覆盖版本 —— `prompt_scenarios` 这张表本身就是底座 Task 4 才加的，还没部署，线上连这张表都还不存在。Task 11 部署后 `initSchema` 建出的是**空表**，`migrateSchema` 只补列、不回填行，`readOverride()` 查不到激活行就返回 `null`，`getPart()` 回落读文件。
+  - ⚠️ **一个从底座部署那天起生效的坑**：部署之后，「文件是真相源、DB 是覆盖层」这套机制就上线了 —— 将来**任何人**在 admin 里对某个 prompt 片段调一次 `setPromptOverride`，DB 就会开始压过文件，**改文件不再生效**（直到有人调 `clearOverride`）。所以：改线上 prompt 的正确路径是**后台改**；只改文件就以为线上变了，是会静默失效的。admin 的 prompt 编辑功能上线时，这一条要写进说明。
 - **部署命令**（固定）：
   ```bash
   https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
@@ -1376,6 +1377,20 @@ feat(engine): 引擎支持 1v1 转写注入；新增教练分析服务
 - Modify: `server.js`（挂载路由）
 - Test: `tests/api.delivery-admin.test.js`
 
+> **先读这一段：async 路由的 rejection 必须有人接。**
+>
+> Express 4 **不接** async handler 返回的 promise rejection。一个没被接住的 rejection → Node 的 `unhandledRejection` → **进程直接退出**。fly.io 上是单进程，进程退出 = 整站掉线，而且能被反复触发成 crash-loop。
+>
+> 这不是假设：底座 Task 8 的代码质量评审就抓到一个同类的 Critical —— `/api/chat` 的 `client_id` 没做类型校验就绑进 SQL，传一个对象进去，better-sqlite3 抛 `RangeError`，一路逃到进程层。**它正在被修（Tide 那边），修完会给出 `server.js` 里一个可复用的写法 —— 直接照着用，不要自己另发明一套。**
+>
+> **本任务的所有新路由都是 async 的**，所以每一条都要满足：
+>
+> 1. handler 里所有可能抛的地方（数据库读写、JSON 解析、`await` 的下游）都要 try 住，**错误要变成 4xx/5xx 的 JSON 响应**，不能让它逃出去；
+> 2. handler 用底座给的那个可复用的 async 包装形式（或者等价的 `.catch(next)` + 一个 error middleware）；
+> 3. **有一条测试钉住它**：制造一个数据库错误（比如把一个必然失败的 SQL 塞进去），断言响应是 5xx 的 JSON，**且进程还活着**（后续的请求仍然能通）。
+>
+> 第 3 条不是形式主义 —— 「进程还活着」这件事必须有一个测试守着，否则下一次有人加一条 async 路由，rejection 又能逃出去。
+
 **API 清单：**
 
 | 方法 | 路径 | 作用 |
@@ -1559,6 +1574,26 @@ test('客户档案里不含教练私有备注以外的越权字段', async () =>
   })).json();
   const detail = await (await admin(`/api/admin/clients/${id}`)).json();
   assert.equal(detail.client.notes, '教练私有备注');
+});
+
+// **进程不许被一个数据库错误打死。** Express 4 不接 async handler 的
+// rejection —— 一个逃出去的 rejection 就是一次 unhandledRejection =
+// 进程退出 = 整站掉线（fly.io 单进程，还能被反复触发成 crash-loop）。
+//
+// 这个测试守两件事：响应是 5xx 的 JSON（不是连接被重置），以及
+// **进程还活着**（后面那条请求仍然通）。
+test('数据库出错时返回 5xx JSON，进程不死', async () => {
+  // 塞一个必然失败的 client_id：better-sqlite3 只接受 string/number/bigint/buffer/null。
+  const res = await admin('/api/admin/clients', {
+    method: 'POST',
+    body: JSON.stringify({ display_name: { 不是: '字符串' } }),
+  });
+  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.ok(body.error, '要有一个 error 字段');
+  // 进程还活着吗？再发一个正常请求。
+  const alive = await admin('/api/admin/clients');
+  assert.equal(alive.status, 200, '进程被打死了 —— async handler 的 rejection 逃出去了');
 });
 ```
 
@@ -8143,6 +8178,7 @@ feat(user): 14 天 Circle 的用户端呈现 —— 信念系统摘要与逐日�
 | 端到端：完成第一轮 → 上传 → 分析 → 拍板 → 生成卡片 | 增补 D.4 |
 | 用户端 14 张卡与信念系统摘要 | 增补 D.5 |
 | Coco 拍板前的一次自检（重复情景 / 靶子越界 / 空动作） | 增补 D.4 Step 2 |
+| async 路由的 rejection 不能打死进程（fly 单进程 = 整站掉线） | Task 5（底座 Task 8 的同类 Critical 由 Tide 修） |
 | §5.1 `sessions_1v1` 表 | Task 1 |
 | §5.1 `plans` 表 | Task 1 |
 | §5.1 `practices` 表 | Task 1 |
