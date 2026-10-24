@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import Database from 'better-sqlite3';
 import { migrateSchema, getDb } from '../db.js';
+import { resetDb } from './helpers/testDb.js';
 
 function columnNames(db, table) {
   return db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name).sort();
@@ -161,6 +162,35 @@ test('表还不存在时，migrateSchema 的报错要说明「先建表」', () 
     } catch {
       /* 清理失败不影响断言 */
     }
+  }
+});
+
+test('resetDb 中途抛错时，外键仍然被恢复成 ON', () => {
+  // resetDb 里那对 pragma 必须成对（try/finally）：中间任何一条 DELETE
+  // 抛错，外键就永久停在 OFF —— 同进程后面的测试全都跑在一个「外键没开」
+  // 的库上，而且没人看得出为什么。
+  const db = getDb();
+  // 先造一行消息 —— 触发器是逐行触发的，表空着就不会触发。
+  db.prepare(
+    'INSERT INTO conversations (id, title, created_at, status) VALUES (?, ?, ?, ?)'
+  ).run('c-reset', null, new Date().toISOString(), 'active');
+  db.prepare(
+    'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+  ).run('c-reset', 'user', '你好', new Date().toISOString());
+  db.exec(`
+    CREATE TRIGGER block_messages_delete
+    BEFORE DELETE ON messages
+    BEGIN
+      SELECT RAISE(ABORT, 'delete blocked by test');
+    END;
+  `);
+  try {
+    assert.throws(() => resetDb(), /delete blocked by test/);
+    // 关键断言：抛错之后外键仍然是开着的
+    assert.equal(db.pragma('foreign_keys', { simple: true }), 1);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS block_messages_delete');
+    resetDb();
   }
 });
 

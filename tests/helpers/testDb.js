@@ -22,21 +22,29 @@ if (process.env.DB_PATH !== DB_PATH) {
 
 export function resetDb() {
   const db = getDb();
+  // 关外键是为了清表时不被子表的外键约束卡住。
+  //
+  // **必须 try/finally**：中间任何一条 DELETE 抛错，外键就会永久停在
+  // OFF —— 同进程后面的测试就都跑在一个「外键没开」的库上了
+  // （包括「外键仍然是开着的」那条断言），而且没人看得出为什么。
   db.pragma('foreign_keys = OFF');
-  // 运行时从 sqlite_master 读取表清单，避免后续任务新增表时漏清。
-  const tables = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    .all()
-    .map((r) => r.name);
-  for (const t of tables) {
-    db.prepare(`DELETE FROM ${t}`).run();
+  try {
+    // 运行时从 sqlite_master 读取表清单，避免后续任务新增表时漏清。
+    const tables = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+      .all()
+      .map((r) => r.name);
+    for (const t of tables) {
+      db.prepare(`DELETE FROM ${t}`).run();
+    }
+    // sqlite_sequence 被上面的 NOT LIKE 过滤掉了，单独清空，让 AUTOINCREMENT id 重新从 1 开始。
+    const hasSeq = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
+      .all();
+    if (hasSeq.length > 0) {
+      db.prepare('DELETE FROM sqlite_sequence').run();
+    }
+  } finally {
+    db.pragma('foreign_keys = ON');
   }
-  // sqlite_sequence 被上面的 NOT LIKE 过滤掉了，单独清空，让 AUTOINCREMENT id 重新从 1 开始。
-  const hasSeq = db
-    .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'")
-    .all();
-  if (hasSeq.length > 0) {
-    db.prepare('DELETE FROM sqlite_sequence').run();
-  }
-  db.pragma('foreign_keys = ON');
 }

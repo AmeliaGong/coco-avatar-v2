@@ -12,12 +12,13 @@
 import './helpers/testEnv.js';
 import { test, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { createServer } from './helpers/testServer.js';
 import { resetDb } from './helpers/testDb.js';
 import { getDb } from '../db.js';
 import { createCbtEngine, CbtEngineError } from '../server/engine/cbtEngine.js';
 import { STUCK_POINT_SCHEMA } from '../server/contracts/stuckPoint.js';
-import { STRUCTURED_OUTPUT_TYPE_NAMES } from '../server/structuredTypes.js';
+import { STRUCTURED_OUTPUT_TYPE_NAMES, structuredJsonToPersist } from '../server/structuredTypes.js';
 
 let base;
 let server;
@@ -787,6 +788,145 @@ test('处理完请求后，外键检查仍然是开着的', { timeout: 15000 }, 
   assert.equal(res.status, 200);
   // 路由里不该有「临时关掉外键检查」的 pragma —— 就算有，也必须成对恢复。
   assert.equal(getDb().pragma('foreign_keys', { simple: true }), 1);
+});
+
+test('conversation_id 超过长度上限 → 400（不建会话、不调模型）', { timeout: 15000 }, async () => {
+  // conversation_id 会**直接当 conversations.id 主键**写进去，还会原样进
+  // X-Conversation-Id 响应头 —— 太长会把响应头撑爆（客户端连 500 都收
+  // 不到），而那时库里已经落了行、模型的钱也已经付过了。
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      conversation_id: 'x'.repeat(50000),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0);
+    assert.equal(countMessages(), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('网关返回非字符串的 content → 502（invalid_content_type 是可达的）', { timeout: 15000 }, async () => {
+  // modelClient 不做类型强制：`content || ''` 只挡假值，真值非字符串
+  // （这里是一个对象）会原样穿过 → 引擎抛 invalid_content_type → 502。
+  // 这条测试顺带钉住 errorStatus.js 里那句注释（「这条是可达的」）。
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [{ message: { content: { text: 'hi' } } }],
+        usage: { total_tokens: 3 },
+      };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  // 抓一下服务端记下来的那个错误，确认走的是 invalid_content_type
+  // （而不是「空内容」那条 —— 两者都映射到 502，光看状态码分不出来）。
+  const logged = [];
+  const originalError = console.error;
+  console.error = (...args) => {
+    logged.push(args);
+  };
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    assert.equal(res.status, 502);
+    assert.deepEqual(JSON.parse(text), { error: 'AI Gateway error' });
+    assert.equal(countMessages('assistant'), 0);
+
+    const engineError = logged
+      .flat()
+      .find((a) => a && typeof a === 'object' && typeof a.code === 'string');
+    assert.ok(engineError, '没有记录到带 code 的引擎错误');
+    assert.equal(engineError.code, 'invalid_content_type');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('没做契约校验的结构化内容（validated === null）不落库', { timeout: 15000 }, async () => {
+  // 造一个**不传 validators** 的引擎（将来的 BFF 就是这么调它的）：
+  // 这时 structuredValidated 是 null（压根没校验），不是 true。
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => ({
+      content: `这是你的卡点。\n{"__structured__": ${JSON.stringify(REAL_CARD)}}`,
+      usage: { total_tokens: 1 },
+    }),
+    schemas: { stuck_point: { schema: STUCK_POINT_SCHEMA, notes: {} } },
+  });
+  const result = await engine({
+    scenario: 'chat',
+    history: [],
+    structuredOutput: 'stuck_point',
+  });
+
+  assert.equal(result.structuredValidated, null, '前提：这条路径确实没做契约校验');
+  assert.ok(result.structured, '前提：这一轮确实拿到了结构化内容');
+  // 路由用的落库判定：没校验过的不落库
+  assert.equal(structuredJsonToPersist(result.structured, result.structuredValidated), null);
+  // 校验过的照落
+  assert.equal(structuredJsonToPersist(REAL_CARD, true), JSON.stringify(REAL_CARD));
+  // 校验没过的也不落（既有行为，不许被改坏）
+  assert.equal(structuredJsonToPersist(REAL_CARD, false), null);
+});
+
+test('路由落库用的是 structuredJsonToPersist（不是自己那套「只挡 false」的判定）', () => {
+  // 上面那条测的是判据本身；这条钉住**路由确实用它** —— 否则改回
+  // 「structuredValidated === false 才不落」的话，判据测得再对也没用。
+  const source = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  assert.ok(
+    source.includes('structuredJsonToPersist(turn.structured, turn.structuredValidated)'),
+    'server.js 的 persistTurn 没有用 structuredJsonToPersist'
+  );
+  assert.ok(
+    !/structuredValidated\s*===\s*false/.test(source),
+    'server.js 里还有自己那套「只挡 false」的判定'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Express 错误处理中间件：body 解析失败不泄露堆栈
+// ---------------------------------------------------------------------------
+
+test('请求体不是合法 JSON → 400 + 简短 JSON（不给堆栈）', { timeout: 15000 }, async () => {
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"messages": [',
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 400);
+  assert.deepEqual(JSON.parse(text), { error: 'Invalid request body' });
+  assert.ok(!text.includes('at '), `响应体里出现了堆栈：${text}`);
+  assert.ok(!text.includes('node_modules'), `响应体里出现了内部路径：${text}`);
+});
+
+test('请求体超过 100KB → 400 + 简短 JSON（不给堆栈）', { timeout: 15000 }, async () => {
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(200000) }] }),
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 400);
+  assert.deepEqual(JSON.parse(text), { error: 'Invalid request body' });
+  assert.ok(!text.includes('at '), `响应体里出现了堆栈：${text}`);
 });
 
 // ---------------------------------------------------------------------------

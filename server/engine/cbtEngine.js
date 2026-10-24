@@ -314,11 +314,17 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
   // 候选列表的顺序是「从后往前」（最新的在前，见
   // extractStructuredCandidates 的说明）—— 所以**正着遍历**取第一个通过的，
   // 拿到的就是**最新**的那份通过校验的卡点。这与「没给 validators 时取
-  // 最后一个合法块」（extractStructured 的语义）方向一致：两者都偏向
+  // 最新的带值块」（extractStructured 的语义）方向一致：两者都偏向
   // 靠后出现的交付物。
   //
-  // validators 没给 → 行为与今天**完全一致**（取最后一个站得住脚的块）。
-  // 加一个新参数不该改变默认行为。
+  // validators 没给 → 取**最新的那个带值**的合法块（extractStructured）。
+  // 「带值」= marker 的值不是 null/undefined（取值规则见 structuredOutput.js
+  // 的 valueAtSpan，两条路径共用同一份）。注意这**不是**「与从前完全
+  // 一致」：最后一个块的 marker 值为 null 时，现在会往前找那份有值的块
+  // （以前直接给 null）—— 两条路径必须同规则，否则同一段模型输出在
+  // 有 / 没有 validator 的调用方手里会挑出不同的东西。
+  // validated 在这条路径上是 null（压根没做契约校验）—— 调用方要把它
+  // 当成「**没校验过**」，不是「校验通过」。
   function selectStructured(raw, structuredOutput, validators) {
     const hasValidator =
       validators &&

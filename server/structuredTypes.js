@@ -58,3 +58,21 @@ export const STRUCTURED_SCHEMAS = Object.fromEntries(
 export const STRUCTURED_VALIDATORS = Object.fromEntries(
   Object.entries(STRUCTURED_OUTPUT_TYPES).map(([type, def]) => [type, def.parse])
 );
+
+// 这一轮的结构化内容**能不能落库**。
+//
+// 只有 structuredValidated === true（**通过了契约校验**）才算可信。
+//   - false：校验没过（多半是模型复述格式时抄的占位骨架）—— 不落。
+//   - null ：压根没做契约校验（调用方没给 validators）—— 同样不落。
+//
+// 为什么 null 也要挡：structuredValidated === null 的路径是给将来的 BFF
+// （直接调引擎、不传 validators）留的口子。那里没有任何东西告诉调用方
+// 「这一份可信」—— 把「没校验过」当成「校验通过」，等于往库里塞一条
+// 没人担保的卡点。所以「没校验过」与「校验没过」同等对待：都不落。
+//
+// 落库的是**校验过的那一份**，不是一个占位骨架。
+export function structuredJsonToPersist(structured, structuredValidated) {
+  if (structuredValidated !== true) return null;
+  if (structured === null || structured === undefined) return null;
+  return JSON.stringify(structured);
+}

@@ -12,6 +12,7 @@ import {
   STRUCTURED_OUTPUT_TYPE_NAMES,
   STRUCTURED_SCHEMAS,
   STRUCTURED_VALIDATORS,
+  structuredJsonToPersist,
 } from './server/structuredTypes.js';
 import { statusForEngineError, errorBodyForStatus } from './server/errorStatus.js';
 import { asyncRoute } from './server/asyncRoute.js';
@@ -217,12 +218,11 @@ function fallbackReplyText(type, structured, validated, requested) {
 function persistTurn({ convId, scenario, turn }) {
   // 没通过契约校验的结构化输出**绝不落库** —— 那多半是模型复述格式时
   // 抄的占位骨架，存进库就是一条假卡点。
-  const structuredJson =
-    turn.structuredValidated === false ||
-    turn.structured === null ||
-    turn.structured === undefined
-      ? null
-      : JSON.stringify(turn.structured);
+  //
+  // 「压根没校验过」（structuredValidated === null）与「校验没过」（false）
+  // 同等对待：只有 true 才落。判据在 server/structuredTypes.js 的
+  // structuredJsonToPersist 里（将来直接调引擎的 BFF 也用同一份）。
+  const structuredJson = structuredJsonToPersist(turn.structured, turn.structuredValidated);
 
   db.prepare(
     'INSERT INTO messages (conversation_id, role, content, created_at, structured_json) VALUES (?, ?, ?, ?, ?)'
@@ -273,6 +273,21 @@ function respondWithEngineError(res, error) {
 // （见下面的「会话归属」说明），但它会原样进库、还会进后台列表 ——
 // 不设上限的话，一个几百 KB 的字符串就能塞进一行。
 const MAX_CLIENT_ID_LENGTH = 128;
+
+// conversation_id 的长度上限。
+//
+// 我们的会话 id 是 crypto.randomUUID()（36 个字符），128 绰绰有余。
+//
+// 不设上限的后果比 client_id 严重得多：
+//   - 它会**直接当 conversations.id 主键**写进去（新会话那条路），
+//     每条 messages.conversation_id 还要再存一份；
+//   - 它还会原样进 `X-Conversation-Id` 响应头 —— 几万个字符会把响应头
+//     撑爆（Node 默认 16KB 上限），客户端拿到的是「连接被掐」
+//     （UND_ERR_HEADERS_OVERFLOW），**不是** 500；
+//   - 而那时库里已经落了行、模型的钱也已经付过了。
+//
+// 所以上限必须在**任何写库 / 调模型之前**生效。
+const MAX_CONVERSATION_ID_LENGTH = 128;
 
 // --- client_id 与「会话归属」---
 //
@@ -361,13 +376,21 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     }
   }
 
-  // conversation_id：同理，只接受非空字符串。
+  // conversation_id：同理，只接受非空字符串、且有长度上限。
   //
   // 之前同样是可以直接传对象进来的崩溃点。空串也没意义（查不到会话，
   // 最后会新建一个）—— 当成非法请求说清楚，比默默新建一个会话好。
+  //
+  // 长度上限的理由见 MAX_CONVERSATION_ID_LENGTH 的注释：它会直接当主键
+  // 写进库，还会进响应头 —— 太长会把响应头撑爆，客户端连 500 都收不到。
   if (conversation_id !== null && conversation_id !== undefined) {
     if (typeof conversation_id !== 'string' || conversation_id.trim() === '') {
       return res.status(400).json({ error: 'conversation_id 必须是非空字符串' });
+    }
+    if (conversation_id.length > MAX_CONVERSATION_ID_LENGTH) {
+      return res
+        .status(400)
+        .json({ error: `conversation_id 超过 ${MAX_CONVERSATION_ID_LENGTH} 字符上限` });
     }
   }
 
@@ -727,6 +750,36 @@ app.use(express.static(path.join(__dirname, 'dist')));
 // Serve index.html for all other routes (SPA support)
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+// --- Express 的错误处理中间件 ---
+//
+// 必须放在**所有路由之后**：Express 只把错误交给它后面的错误中间件。
+//
+// 为什么需要它：express.json() 解析请求体失败时（body 不是合法 JSON、
+// 或者 body 超过 100KB）会抛错，交给 Express 的默认错误处理器 —— 而默认
+// 处理器在非 production 环境下会把**堆栈**回给客户端。那是内部细节
+// （路径、依赖版本、源码片段），和「500 不泄露内部细节」的目标不一致。
+//
+// 一律不给堆栈（生产也不给）：排障看服务端日志。
+//
+// 注意 headersSent：响应已经开始写了就不能再设状态码/写 body，否则会抛
+// "Cannot set headers after they are sent"，把一次错误变成二次崩溃。
+app.use((err, req, res, next) => {
+  console.error('Unhandled error in request pipeline:', err);
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  // body-parser 的两类错误：请求体不是合法 JSON（entity.parse.failed）、
+  // 请求体太大（entity.too.large）。都是**请求本身**的问题 → 400。
+  const isBodyError =
+    err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large');
+  if (isBodyError) {
+    res.status(400).json({ error: 'Invalid request body' });
+    return;
+  }
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // 只有当本文件是进程入口时才启动监听器。
