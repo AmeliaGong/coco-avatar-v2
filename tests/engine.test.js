@@ -849,7 +849,7 @@ function titleValidator(value) {
   return { ok: true, errors: [], value: { title } };
 }
 
-function engineWith(content, validators) {
+function engineWith(content) {
   const engine = createCbtEngine({
     getPrompt: () => 'SYSTEM',
     callModel: async () => ({ content, usage: { total_tokens: 1 } }),

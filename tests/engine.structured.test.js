@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   buildStructuredInstruction,
   extractStructured,
+  extractStructuredCandidates,
   stripStructured,
   stripAllStructured,
   findAllStructuredSpans,
@@ -466,4 +467,32 @@ test('正文里提到 marker 的那句不能被当成残骸吃掉', () => {
   assert.ok(stripped.includes('这种块。'));
   // 真正的那个块被剥掉了（正文里随口提一句 marker 当然留着）
   assert.ok(!stripped.includes('"a": 1'));
+});
+
+// ---------------------------------------------------------------------------
+// 取值规则只有一份：valueAtSpan
+// ---------------------------------------------------------------------------
+
+test('最后一个块的 marker 值是 null 时，「取全部」与「取一个」给同一个答案', () => {
+  // 「最后一个块的 marker 是 null」这种输入下，两条路径必须一致：
+  //   - extractStructuredCandidates 跳过这个没有值的块，往前找；
+  //   - extractStructured 也必须给出同一份答案。
+  // 以前它们会分叉（一个给 null、一个给更早的那份）—— 有 validator 与
+  // 没有 validator 的两条路就会挑出不同的卡点。
+  const text = [
+    '{"__structured__": {"title": "我不能停下来"}}',
+    '{"__structured__": null}',
+  ].join('\n');
+
+  assert.deepEqual(extractStructured(text), { title: '我不能停下来' });
+  assert.deepEqual(
+    extractStructuredCandidates(text).map(c => c.value),
+    [{ title: '我不能停下来' }]
+  );
+});
+
+test('只有一个块、且它的值是 null 时，两条路径都给 null', () => {
+  const text = '{"__structured__": null}';
+  assert.equal(extractStructured(text), null);
+  assert.deepEqual(extractStructuredCandidates(text), []);
 });

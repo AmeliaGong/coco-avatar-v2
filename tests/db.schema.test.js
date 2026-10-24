@@ -140,3 +140,46 @@ test('新库（建表语句那条路）的列与老库补列后完全一致', ()
   assert.deepEqual(columnNames(db, 'messages'), EXPECTED_MESSAGE_COLUMNS.slice().sort());
   assert.deepEqual(columnNames(db, 'token_usage'), EXPECTED_TOKEN_USAGE_COLUMNS.slice().sort());
 });
+
+test('表还不存在时，migrateSchema 的报错要说明「先建表」', () => {
+  // 干巴巴一句 "no such table: conversations" 看不出该怎么办。
+  const file = path.join(os.tmpdir(), `coco-empty-${randomUUID()}.db`);
+  const db = new Database(file);
+  try {
+    assert.throws(
+      () => migrateSchema(db),
+      (err) => {
+        assert.match(err.message, /conversations/);
+        assert.match(err.message, /先跑 initSchema/);
+        return true;
+      }
+    );
+  } finally {
+    db.close();
+    try {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch {
+      /* 清理失败不影响断言 */
+    }
+  }
+});
+
+test('外键检查是开着的：给不存在的会话插消息会被拒绝', () => {
+  // 路由里曾经有一对「临时关掉外键检查」的 pragma。现在没有了 ——
+  // 外键必须一直开着，而且要能证明它确实开着。
+  const db = getDb();
+  assert.equal(db.pragma('foreign_keys', { simple: true }), 1);
+  try {
+    assert.throws(
+      () => {
+        db.prepare(
+          'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+        ).run('no-such-conversation', 'user', '你好', new Date().toISOString());
+      },
+      /FOREIGN KEY/
+    );
+  } finally {
+    // 万一外键没开（实现坏了），把插进去的脏行清掉，别污染后面的测试。
+    db.prepare('DELETE FROM messages WHERE conversation_id = ?').run('no-such-conversation');
+  }
+});
