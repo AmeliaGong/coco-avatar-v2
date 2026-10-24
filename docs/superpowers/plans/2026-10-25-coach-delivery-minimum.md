@@ -45,7 +45,9 @@
 - **测试命令**：`npm test`
 - **零新依赖（测试）**：测试只用 Node 内置 `node:test` / `node:assert`。
 - **生产依赖只加一个**：`mammoth`（docx → 纯文本，增补 D.3）。不要顺手加别的包 —— multipart 用 `express.raw` 收字节，不需要 multer。
-- **契约 2 的两处扩展（C.1 / D.1）必须同一次改完、同一次提交、算同一个版本号** —— 同一个文件、同一份 prompt。分两次改会出现只有一半的版本。**Coco 2026-10-25 已点头。**
+- **契约 2 的两处扩展（C.1 / D.1）已经做完了** —— commit `28132c0`（2026-10-25）。**这一步被单独提前做了**，因为它不依赖交付模块的表，只碰 `server/contracts/plan.js` + `prompts/scenario.analysis.md` + `tests/contracts.test.js`，而计划 1 剩下的 Task 9/10 不碰这三个文件 —— 提前做零冲突，且把 11-30 的定稿期限从「赌 Tide 的部署」变成「已经办完」。
+  - **生产上零影响**：前端现在从不发 `structured_output`，`plan` 这个 schema 根本不会被注入到任何一次对话里；`prompts/scenario.chat.md` 一字未动，字节级断言仍绿。
+  - **部署时的确认项**：prompt registry 是「DB 里的激活版本优先于文件」。如果生产库里 `scenario.analysis` 有激活的覆盖版本，文件改动**不会自动生效** —— 部署后用后台的 prompt 列表确认一下；没有覆盖版本就不用管。
 - **部署命令**（固定）：
   ```bash
   https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
@@ -5723,77 +5725,27 @@ feat(admin): 交付项目、统一时间线与二次分析的接口与界面
 > 分成两次提交会出现一个「只有 `belief_system`、没有 `circle` / `scenario` / `target_belief`」的 prompt 版本 —— 那个版本既不完整、也白占一个版本号。
 > 实际执行时：**先把 D.1 的 Step 1–3 做完（测试 + 契约三字段 + prompt 第 8 条），再回到这一节做完 Step 1–4，两边一起 commit。**
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `tests/contracts.test.js` 里加：
 
-```js
-test('契约 2：belief_system 选填，不给也合法', () => {
-  const r = parsePlanPayload(BASE_PAYLOAD);
-  assert.equal(r.ok, true);
-  assert.equal(r.value.diagnosis.belief_system, null);
-});
 
-test('契约 2：belief_system 给出核心新信念与外周信念', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    diagnosis: {
-      ...BASE_PAYLOAD.diagnosis,
-      belief_system: {
-        core_new: '新的核心信念',
-        peripheral: [
-          { name: '外周信念甲', statement: '它到底是什么', new_voice: '它的新声音' },
-        ],
-        deferred: ['本期不碰的议题'],
-      },
-    },
-  });
-  assert.equal(r.ok, true);
-  const bs = r.value.diagnosis.belief_system;
-  assert.equal(bs.core_new, '新的核心信念');
-  assert.equal(bs.peripheral.length, 1);
-  assert.equal(bs.peripheral[0].name, '外周信念甲');
-  assert.deepEqual(bs.deferred, ['本期不碰的议题']);
-});
+> **本节已于 2026-10-25 实施并提交（commit `28132c0`）。** 实施时的测试在
+> `tests/contracts.test.js` 的「契约 2 扩展（一）：diagnosis.belief_system」小节 ——
+> 那里是唯一的代码真相源，本节只留设计与校验规则。执行时跳过 Step 1–2。
 
-test('契约 2：外周信念必须有名字和内容', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    diagnosis: {
-      ...BASE_PAYLOAD.diagnosis,
-      belief_system: { peripheral: [{ name: '', statement: 'x' }] },
-    },
-  });
-  assert.equal(r.ok, false);
-  assert.ok(r.errors.some(e => e.includes('name')));
-});
 
-test('契约 2：belief_system 必须是对象', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    diagnosis: { ...BASE_PAYLOAD.diagnosis, belief_system: '不是对象' },
-  });
-  assert.equal(r.ok, false);
-});
 
-test('契约 2：模型照抄示例值要被拦住', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    diagnosis: {
-      ...BASE_PAYLOAD.diagnosis,
-      belief_system: { core_new: '核心新信念' },
-    },
-  });
-  assert.equal(r.ok, false);
-});
-```
-
-- [ ] **Step 2: 运行测试，确认失败**
+- [x] **Step 2: 运行测试，确认失败**
 
 Run: `node --test tests/contracts.test.js`
 Expected: FAIL —— `belief_system` 不被识别。
 
-- [ ] **Step 3: 改 `server/contracts/plan.js`**
+- [x] **Step 3: 改 `server/contracts/plan.js`**
+
+> 下面的代码是**设计稿**。实际实现以 commit `28132c0` 为准（实现里多抽了三个
+> 纯函数 `validateBeliefSystem` / `optionalText` / `normalizeBeliefSystem`）。
+
 
 **3a. `PLAN_SCHEMA` 加 `belief_system`（值级示例）：**
 
@@ -5932,7 +5884,7 @@ export const PLAN_SCHEMA = {
 
 在 `diagnosis` 的归一化结果里加上 `belief_system`。
 
-- [ ] **Step 4: 改 `prompts/scenario.analysis.md`**
+- [x] **Step 4: 改 `prompts/scenario.analysis.md`**
 
 **注意：改 prompt 会改内容哈希 → registry 自动产生新版本，旧的还能回滚。** `prompts/scenario.chat.md` **不动** —— `tests/fixtures/legacy-chat-prompt.txt` 的字节级断言不受影响。
 
@@ -5952,7 +5904,7 @@ export const PLAN_SCHEMA = {
 转写是按说话人分段的：`【来访者】` 段是素材，`【教练】` 段是干预。
 ```
 
-- [ ] **Step 5: 运行测试，确认通过**
+- [x] **Step 5: 运行测试，确认通过**
 
 Run: `node --test tests/contracts.test.js`
 Expected: PASS。
@@ -5960,7 +5912,7 @@ Expected: PASS。
 Run: `npm test`
 Expected: 全部通过。**特别注意 prompt registry 的字节级断言必须还是绿的** —— 如果红了，说明动到了 chat 场景的 prompt，回退 Step 4。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add server/contracts/plan.js prompts/scenario.analysis.md tests/contracts.test.js
@@ -6737,68 +6689,27 @@ fix(delivery): 练习项分级匹配 —— 14 张同名卡不再丢证据
 
 > **这一节和增补 C.1 改的是同一个文件（`server/contracts/plan.js`）和同一个 prompt（`prompts/scenario.analysis.md`）—— 必须一起改、一起提交、一起算版本号。** 分两次改会让 prompt registry 出现两个只有一半的版本。
 
-- [ ] **Step 1: 写失败的测试**
+- [x] **Step 1: 写失败的测试**
 
 在 `tests/contracts.test.js` 里加：
 
-```js
-test('练习项可以带圈 / 情景 / 靶子', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    diagnosis: {
-      ...BASE_PAYLOAD.diagnosis,
-      belief_system: {
-        core_new: '新的核心信念',
-        peripheral: [{ name: '外周信念甲', statement: '它到底是什么', new_voice: '它的新声音' }],
-        deferred: ['本期不碰的议题'],
-      },
-    },
-    practices: [{ day: 1, title: '三问圈', action: 'a', circle: '三问圈', scenario: '开会前', target_belief: '外周信念甲' }],
-  });
-  assert.equal(r.ok, true, r.errors && r.errors.join('; '));
-});
 
-test('靶子必须命中外周信念名单', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    diagnosis: {
-      ...BASE_PAYLOAD.diagnosis,
-      belief_system: {
-        core_new: '新的核心信念',
-        peripheral: [{ name: '外周信念甲', statement: '它到底是什么', new_voice: '它的新声音' }],
-        deferred: [],
-      },
-    },
-    practices: [{ day: 1, title: '三问圈', action: 'a', target_belief: '不存在的外周信念' }],
-  });
-  assert.equal(r.ok, false);
-  assert.ok(r.errors.some(e => e.includes('target_belief')));
-});
+> **本节已于 2026-10-25 实施并提交（commit `28132c0`），与 C.1 同一次改动。**
+> 实施时的测试在 `tests/contracts.test.js` 的「契约 2 扩展（二）：practices[].circle / scenario / target_belief」
+> 小节 —— 那里是唯一的代码真相源。执行时跳过 Step 1–2。
 
-test('没有 belief_system 时，靶子可以自由写', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    practices: [{ day: 1, title: '三问圈', action: 'a', target_belief: '随便什么' }],
-  });
-  assert.equal(r.ok, true, r.errors && r.errors.join('; '));
-});
 
-test('圈 / 情景 / 靶子照抄示例值要被拦下', () => {
-  const r = parsePlanPayload({
-    ...BASE_PAYLOAD,
-    practices: [{ day: 1, title: '这一步叫什么', action: 'a', circle: '这一步用哪个圈' }],
-  });
-  assert.equal(r.ok, false);
-  assert.ok(r.errors.some(e => e.includes('circle')));
-});
-```
 
-- [ ] **Step 2: 运行测试，确认失败**
+- [x] **Step 2: 运行测试，确认失败**
 
 Run: `node --test tests/contracts.test.js`
 Expected: FAIL —— `circle` 之类现在既不校验也不拦占位值。
 
-- [ ] **Step 3: 改 `server/contracts/plan.js`**
+- [x] **Step 3: 改 `server/contracts/plan.js`**
+
+> 下面的代码是**设计稿**。实际实现以 commit `28132c0` 为准（实现里多抽了三个
+> 纯函数 `validateBeliefSystem` / `optionalText` / `normalizeBeliefSystem`）。
+
 
 **（a）`PLAN_SCHEMA` 的 `practices[]` 加三个字段：**
 
@@ -6911,7 +6822,7 @@ export const PLAN_PLACEHOLDERS = [
 Run: `node --test tests/contracts.test.js`
 Expected: PASS。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add server/contracts/plan.js prompts/scenario.analysis.md tests/contracts.test.js
@@ -8222,9 +8133,9 @@ feat(user): 14 天 Circle 的用户端呈现 —— 信念系统摘要与逐日�
 | 练习两种形态（序列推进 / 每日重复） | 增补 B.4 |
 | 二次分析（1v1 + 平台对话 → 再诊断） | 增补 B.5 / B.7 |
 | 统一时间线 | 增补 B.6 / B.7 |
-| 信念系统（核心新信念 / 外周信念 / 本期不主攻的议题） | 增补 C.1（**动契约 2 —— Coco 2026-10-25 已点头**） |
+| 信念系统（核心新信念 / 外周信念 / 本期不主攻的议题） | 增补 C.1（**动契约 2 —— Coco 2026-10-25 已点头；已实施，commit 28132c0**） |
 | 1v1 转写的说话人分离（素材 vs 干预） | 增补 C.2 / C.3 / C.4 |
-| 练习项带「圈 / 情景 / 靶子」 | 增补 D.1（**动契约 2，与 C.1 同一次改动**） |
+| 练习项带「圈 / 情景 / 靶子」 | 增补 D.1（**动契约 2，与 C.1 同一次改动；已实施，commit 28132c0**） |
 | 教练手法库（表 / store / 引擎通道 / 后台管理） | 增补 D.2 |
 | 1v1 文件上传（txt / md / docx） | 增补 D.3 |
 | 14 天 Circle 的形态（14 张各带情景的卡，不是 1 行重复） | 增补 D.0.1（**修正 B.4 的注释**） |
