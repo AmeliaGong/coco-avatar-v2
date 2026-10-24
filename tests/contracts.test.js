@@ -745,3 +745,178 @@ test('shared：toNumber 不接受十六进制与科学计数法字符串', () =>
   assert.equal(toNumber('1e3'), null);
   assert.equal(toNumber('3'), 3);
 });
+
+// ---------- 契约 2 扩展（一）：diagnosis.belief_system ----------
+
+const validBeliefSystem = {
+  core_new: '新的核心信念',
+  peripheral: [{ name: '外周信念甲', statement: '它到底是什么', new_voice: '它的新声音' }],
+  deferred: ['本期不碰的议题'],
+};
+
+test('plan：belief_system 选填，不给也合法，normalize 归一成 null', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+  const n = normalizePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(n.diagnosis.belief_system, null);
+});
+
+test('plan：belief_system 完整结构通过校验，normalize 保留', () => {
+  const ok = validatePlanPayload({
+    diagnosis: { ...validDiagnosis, belief_system: validBeliefSystem },
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+  const n = normalizePlanPayload({
+    diagnosis: { ...validDiagnosis, belief_system: validBeliefSystem },
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(n.diagnosis.belief_system.core_new, '新的核心信念');
+  assert.equal(n.diagnosis.belief_system.peripheral[0].name, '外周信念甲');
+  assert.deepEqual(n.diagnosis.belief_system.deferred, ['本期不碰的议题']);
+});
+
+test('plan：belief_system 不是对象时报错', () => {
+  const ok = validatePlanPayload({
+    diagnosis: { ...validDiagnosis, belief_system: '不是对象' },
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('belief_system')));
+});
+
+test('plan：外周信念缺 name 报错（没有名字就没法当靶子）', () => {
+  const ok = validatePlanPayload({
+    diagnosis: {
+      ...validDiagnosis,
+      belief_system: { ...validBeliefSystem, peripheral: [{ statement: '它到底是什么' }] },
+    },
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('peripheral')));
+});
+
+test('plan：deferred 必须是数组', () => {
+  const ok = validatePlanPayload({
+    diagnosis: {
+      ...validDiagnosis,
+      belief_system: { ...validBeliefSystem, deferred: '本期不碰的议题' },
+    },
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('deferred')));
+});
+
+test('plan：belief_system 里的占位值被拦下', () => {
+  const ok = validatePlanPayload({
+    diagnosis: {
+      ...validDiagnosis,
+      belief_system: {
+        core_new: '核心新信念',
+        peripheral: [{ name: '外周信念的名字', statement: '它到底是什么', new_voice: '它的新声音' }],
+        deferred: ['本期不主攻的议题'],
+      },
+    },
+    vision: validVision,
+    practices: [validPractice],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('占位') || e.includes('示例值')));
+});
+
+// ---------- 契约 2 扩展（二）：practices[].circle / scenario / target_belief ----------
+
+test('plan：练习项可以带圈 / 情景 / 靶子', () => {
+  const ok = validatePlanPayload({
+    diagnosis: { ...validDiagnosis, belief_system: validBeliefSystem },
+    vision: validVision,
+    practices: [
+      { day: 1, title: '三问圈', action: 'a', circle: '三问圈', scenario: '开会前', target_belief: '外周信念甲' },
+    ],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+  const n = normalizePlanPayload({
+    diagnosis: { ...validDiagnosis, belief_system: validBeliefSystem },
+    vision: validVision,
+    practices: [
+      { day: 1, title: '三问圈', action: 'a', circle: '三问圈', scenario: '开会前', target_belief: '外周信念甲' },
+    ],
+    worth_practicing: true,
+  });
+  assert.equal(n.practices[0].circle, '三问圈');
+  assert.equal(n.practices[0].scenario, '开会前');
+  assert.equal(n.practices[0].target_belief, '外周信念甲');
+});
+
+test('plan：靶子必须命中外周信念名单', () => {
+  const ok = validatePlanPayload({
+    diagnosis: { ...validDiagnosis, belief_system: validBeliefSystem },
+    vision: validVision,
+    practices: [
+      { day: 1, title: '三问圈', action: 'a', target_belief: '不存在的外周信念' },
+    ],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('target_belief')));
+});
+
+test('plan：没有 belief_system 时靶子可以自由写', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [
+      { day: 1, title: '三问圈', action: 'a', target_belief: '随便什么' },
+    ],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, true, `不该报错: ${ok.errors.join('; ')}`);
+});
+
+test('plan：圈 / 情景 / 靶子照抄示例值要被拦下', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [
+      { day: 1, title: '这一步叫什么', action: 'a', circle: '这一步用哪个圈' },
+    ],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('circle')));
+});
+
+test('plan：圈给了空串要报错（给了就必须填）', () => {
+  const ok = validatePlanPayload({
+    diagnosis: validDiagnosis,
+    vision: validVision,
+    practices: [{ day: 1, title: '三问圈', action: 'a', circle: '  ' }],
+    worth_practicing: true,
+  });
+  assert.equal(ok.ok, false);
+  assert.ok(ok.errors.some(e => e.includes('circle')));
+});
