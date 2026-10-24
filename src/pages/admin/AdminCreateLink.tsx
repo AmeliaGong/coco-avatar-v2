@@ -26,7 +26,7 @@ export function AdminCreateLink() {
     }
   };
 
-  const linkUrl = result ? `${window.location.origin}/c/${result.id}` : '';
+  const linkUrl = result ? `https://coco-avatar-icy-sun-5917.fly.dev/c/${result.id}` : '';
 
   const handleCopy = () => {
     navigator.clipboard.writeText(linkUrl);
@@ -58,6 +58,7 @@ export function AdminCreateLink() {
             className="w-full px-3 py-2 border border-warm-grey/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-sage/40"
           >
             <option value="7">7 天</option>
+            <option value="15">15 天</option>
             <option value="30">30 天</option>
             <option value="90">90 天</option>
             <option value="never">永久有效</option>

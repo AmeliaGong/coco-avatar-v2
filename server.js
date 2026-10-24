@@ -519,7 +519,7 @@ app.post('/api/admin/conversations', requireAdmin, (req, res) => {
 
   if (expires_in_days && expires_in_days > 0) {
     const d = new Date();
-    d.setDate(d.getDate() + parseInt(expires_in_days));
+    d.setUTCDate(d.getUTCDate() + parseInt(expires_in_days));
     expiresAt = d.toISOString();
   }
 
@@ -528,6 +528,61 @@ app.post('/api/admin/conversations', requireAdmin, (req, res) => {
   ).run(id, title || null, createdAt, expiresAt, 'active');
 
   res.json({ id, title, created_at: createdAt, expires_at: expiresAt, status: 'active' });
+});
+
+// Admin: update an existing conversation link (title / expiry)
+app.patch('/api/admin/conversations/:id', requireAdmin, (req, res) => {
+  const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(req.params.id);
+  if (!conv) return res.status(404).json({ error: 'Not found' });
+
+  const { title, expires_at, expires_in_days, never } = req.body || {};
+  const updates = [];
+  const params = [];
+
+  if (typeof title === 'string') {
+    updates.push('title = ?');
+    params.push(title.trim() || null);
+  }
+
+  let newExpiresAt = conv.expires_at;
+  if (never === true) {
+    newExpiresAt = null;
+  } else if (typeof expires_at === 'string' && expires_at) {
+    const d = new Date(expires_at);
+    if (isNaN(d.getTime())) {
+      return res.status(400).json({ error: 'Invalid expires_at' });
+    }
+    newExpiresAt = d.toISOString();
+  } else if (expires_in_days !== undefined && expires_in_days !== null) {
+    const days = parseInt(expires_in_days, 10);
+    if (isNaN(days) || days < 0) {
+      return res.status(400).json({ error: 'Invalid expires_in_days' });
+    }
+    if (days === 0) {
+      newExpiresAt = null;
+    } else {
+      // N days counted from the link's creation time
+      const d = new Date(conv.created_at);
+      d.setUTCDate(d.getUTCDate() + days);
+      newExpiresAt = d.toISOString();
+    }
+  }
+
+  if (newExpiresAt !== conv.expires_at) {
+    updates.push('expires_at = ?');
+    params.push(newExpiresAt);
+  }
+
+  // status follows the expiry: a revived link goes back to active
+  updates.push('status = ?');
+  params.push(isExpired(newExpiresAt) ? 'expired' : 'active');
+
+  if (updates.length) {
+    params.push(conv.id);
+    db.prepare(`UPDATE conversations SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+  }
+
+  res.json(db.prepare('SELECT * FROM conversations WHERE id = ?').get(conv.id));
 });
 
 // Admin: token stats

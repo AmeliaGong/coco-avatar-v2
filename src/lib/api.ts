@@ -143,6 +143,28 @@ export async function adminCreateLink(title: string, expiresInDays: number | nul
   return res.json();
 }
 
+export async function adminUpdateConversation(
+  id: string,
+  payload: {
+    title?: string;
+    expires_in_days?: number | null;
+    expires_at?: string;
+    never?: boolean;
+  }
+) {
+  const res = await fetch(`/api/admin/conversations/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: adminHeaders(),
+    body: JSON.stringify(payload),
+  });
+  if (res.status === 401) throw new Error('Unauthorized');
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || 'Failed to update conversation');
+  }
+  return res.json();
+}
+
 export async function adminGetStats(from?: string, to?: string) {
   const qs = new URLSearchParams();
   if (from) qs.set('from', from);

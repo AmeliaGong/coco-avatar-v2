@@ -74,6 +74,7 @@ export function AdminConversations() {
                 <th className="text-center px-4 py-3">Tokens</th>
                 <th className="text-center px-4 py-3">状态</th>
                 <th className="text-center px-4 py-3">过期时间</th>
+                <th className="text-center px-4 py-3">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -105,6 +106,17 @@ export function AdminConversations() {
                   </td>
                   <td className="px-4 py-3 text-center text-gray-500 text-xs">
                     {c.expires_at ? new Date(c.expires_at).toLocaleDateString('zh-CN') : '永不'}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <button
+                      onClick={e => {
+                        e.stopPropagation();
+                        navigate(`/admin/conversations/${c.id}`);
+                      }}
+                      className="px-2 py-1 text-xs border border-warm-grey/50 rounded-lg text-gray-600 hover:bg-warm-beige/40 transition"
+                    >
+                      改期限
+                    </button>
                   </td>
                 </tr>
               ))}
