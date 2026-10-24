@@ -1,9 +1,5 @@
 import { buildStructuredInstruction, extractStructured, stripStructured } from './structuredOutput.js';
 
-function isPlainObject(value) {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
 // schemas 的值有两种写法，必须靠「自有属性是否存在」来区分，不能靠真值判断：
 //   - 直接就是 schema（值级示例，只有形状）
 //   - { schema, notes } —— 形状 + 字段语义
@@ -65,7 +61,12 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     systemPrompt += buildContextSection(clientContext);
 
     if (structuredOutput) {
-      const entry = schemas[structuredOutput];
+      // 只认自有属性：schemas 是普通对象，schemas['__proto__'] 会拿到
+      // Object.prototype，schemas['constructor'] 会拿到 Object ——
+      // 两者都「存在」，但都不是合法的结构化输出类型。structuredOutput
+      // 将来直接来自请求体，这两条原型链路径是可达输入。
+      const hasEntry = Object.prototype.hasOwnProperty.call(schemas, structuredOutput);
+      const entry = hasEntry ? schemas[structuredOutput] : undefined;
       if (!entry) {
         throw new Error(`未知的结构化输出类型：${structuredOutput}`);
       }

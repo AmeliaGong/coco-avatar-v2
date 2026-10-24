@@ -161,6 +161,28 @@ test('未知结构化输出类型直接报错且不调用模型', async () => {
   assert.equal(calls.length, 0);
 });
 
+test('原型链上的键名不是合法的结构化输出类型', async () => {
+  // schemas 是普通对象，schemas['__proto__'] 会拿到 Object.prototype，
+  // schemas['constructor'] 会拿到 Object —— 都不能当成已知类型，
+  // 否则会带着垃圾骨架去调模型。structuredOutput 将来直接来自请求体。
+  for (const key of ['__proto__', 'constructor', 'toString', 'hasOwnProperty']) {
+    const calls = [];
+    const engine = createCbtEngine({
+      getPrompt: () => 'SYSTEM',
+      callModel: async () => {
+        calls.push(1);
+        return { content: 'ok', usage: { total_tokens: 1 } };
+      },
+      schemas: { stuck_point: { title: '卡点标题' } },
+    });
+    await assert.rejects(
+      () => engine({ scenario: 'chat', history: [], structuredOutput: key }),
+      new RegExp(`未知的结构化输出类型：${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
+    );
+    assert.equal(calls.length, 0, `结构化输出类型 ${key} 不该调用模型`);
+  }
+});
+
 test('schema 存在但无效时报错且不调用模型', async () => {
   const calls = [];
   const engine = createCbtEngine({
