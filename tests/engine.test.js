@@ -923,8 +923,8 @@ test('全部候选都校验不过时，回退到最新的那个合法块（不�
   // 回退取下标 0（最新）；取末位会拿到最旧的那一份 —— 方向就反了。
   const content = [
     '正文。',
-    '{"__structured__": {"title": "卡点标题"}}',
-    '{"__structured__": {"title": "更旧的那份占位"}}',
+    '{"__structured__": {"title": "更早的那份占位"}}',
+    '{"__structured__": {"title": "最新的那份占位"}}',
   ].join('\n');
   const engine = engineWith(content);
   const result = await engine({
@@ -934,7 +934,7 @@ test('全部候选都校验不过时，回退到最新的那个合法块（不�
     validators: { stuck_point: titleValidator },
   });
   assert.equal(result.structuredValidated, false);
-  assert.deepEqual(result.structured, { title: '更旧的那份占位' });
+  assert.deepEqual(result.structured, { title: '最新的那份占位' });
 });
 
 test('全部候选都校验不过时：退回最后一个合法块，并标记 structuredValidated=false', async () => {

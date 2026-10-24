@@ -116,7 +116,10 @@ const MAX_CONTEXT_CHARS = 4000;
 //   - invalid_schema             schemas 里的 schema 写坏了（配置错） → 500
 //   - empty_content              模型没返回任何内容                   → 502
 //   - invalid_content_type       模型返回的内容不是字符串             → 502
-//   - empty_reply                剥掉结构化块后正文为空               → 502
+//   - empty_reply                剥掉结构化块后正文为空               → 200
+//                                （特判，不是失败：模型只交付了结构化
+//                                 块，那正是契约 1/2 的目标产出 —— 回 200，
+//                                 照常落库记账）
 //
 // 注意：**注入进来的组件自己抛的错不是这个类型** —— getPrompt / getPromptMeta
 // 抛的是 promptRegistry 的错（未知场景），callModel 抛的是网关的错。那些错
