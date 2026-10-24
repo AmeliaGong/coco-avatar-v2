@@ -1,3 +1,18 @@
 node_modules
 .env
 .git
+
+# 本地 SQLite 数据目录：COPY . . 会把它打进镜像并推到镜像仓库，
+# 而里面有本地开发会话内容（可能是 PII）。运行时用的是 fly 卷 /data，
+# 镜像里带一份没有任何用处，只有泄漏风险。
+data
+*.db
+*.db-wal
+*.db-shm
+
+# 内部服务间密钥文件：绝不能进镜像。（.gitignore 已经挡了提交，
+# 但 dockerignore 是另一道闸 —— build context 是独立的。）
+.internal-token
+
+# dist 在镜像里由 RUN npm run build 重新生成，不需要把本地的带进去。
+dist
