@@ -1,14 +1,40 @@
 export const STRUCTURED_MARKER = '__structured__';
 
+// 带引号的 marker token —— 模型输出里必须作为 JSON 键出现才算数。
+const MARKER_TOKEN = `"${STRUCTURED_MARKER}"`;
+
+function isPlainObject(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 // schemaHint 是「值级示例」—— 模型照着它输出，所以它只描述形状。
 // fieldNotes 承载语义（哪个必填、枚举有哪些、false 是什么意思），
 // 单独一段渲染，不混进 JSON 里 —— 混进去模型会照抄成输出的一部分。
 export function buildStructuredInstruction(schemaHint, fieldNotes) {
+  // schemaHint 缺失时 JSON.stringify({[marker]: undefined}) 会产出 "{}"，
+  // 指令里就没有 marker 键，模型完全不知道要输出什么 —— 那轮会静默丢掉
+  // 结构化输出。拼装期失败远好于每轮静默降级。
+  if (schemaHint === undefined || schemaHint === null) {
+    throw new Error(
+      'buildStructuredInstruction：schemaHint 必填（值级示例），缺失会让指令里没有 marker 键'
+    );
+  }
+  if (typeof schemaHint !== 'object') {
+    throw new Error(
+      'buildStructuredInstruction：schemaHint 必须是对象或数组（值级示例），不能用字符串/数字'
+    );
+  }
+  if (fieldNotes !== undefined && fieldNotes !== null && !isPlainObject(fieldNotes)) {
+    throw new Error(
+      'buildStructuredInstruction：fieldNotes 必须是普通对象（字段语义），不能用字符串/数组'
+    );
+  }
+
   const lines = [
     '',
     '---',
-    '在你这一轮回复的最后，另起一行，输出一个 JSON 对象。',
-    '这一行只能是 JSON，不要用代码块包裹，不要有多余解释文字。格式：',
+    '在你这一轮回复的最后，另起一行（可以多行），输出一个 JSON 对象。',
+    '整个 JSON 必须能被直接解析，不要用代码块包裹，不要有多余解释文字。格式：',
     JSON.stringify({ [STRUCTURED_MARKER]: schemaHint }, null, 2),
   ];
   if (fieldNotes && Object.keys(fieldNotes).length > 0) {
@@ -21,16 +47,9 @@ export function buildStructuredInstruction(schemaHint, fieldNotes) {
   return lines.join('\n');
 }
 
-// 找到 marker 所在的 JSON 对象边界。返回 {start, end}，end 为闭区间。
-// 没找到返回 null。
-export function findStructuredSpan(text) {
-  if (!text) return null;
-  const marker = `"${STRUCTURED_MARKER}"`;
-  const markerIdx = text.indexOf(marker);
-  if (markerIdx < 0) return null;
-  const start = text.lastIndexOf('{', markerIdx);
-  if (start < 0) return null;
-
+// 从 start 开始做花括号配对扫描，得到 {start, end}（end 为闭区间）。
+// 对嵌套对象与字符串里的花括号都是对的。没配平返回 null。
+function scanBraceSpan(text, start) {
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -53,23 +72,78 @@ export function findStructuredSpan(text) {
   return null;
 }
 
+// 找出「真正的」结构化块。
+//
+// 模型很常见的行为：先在正文里复述一遍格式（把 schema 的占位值原样抄一遍），
+// 再给出真正的块。所以不能简单地取第一个 marker —— 那会拿到模板占位值，
+// 而占位值往往是非空字符串，校验会放行，然后库里存进一条假卡点。
+//
+// 规则：收集所有 marker 出现位置，**从后往前**枚举（指令要求结构化块在回复末尾），
+// 每个候选都要自己站得住脚才算数：能配平、能 JSON.parse、且顶层有 marker 键。
+// 第一个站得住脚的候选就是答案。
+export function findStructuredSpan(text) {
+  if (!text) return null;
+
+  const candidates = [];
+  let idx = text.indexOf(MARKER_TOKEN);
+  while (idx >= 0) {
+    candidates.push(idx);
+    idx = text.indexOf(MARKER_TOKEN, idx + 1);
+  }
+
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const markerIdx = candidates[i];
+    const start = text.lastIndexOf('{', markerIdx);
+    if (start < 0) continue;
+
+    const span = scanBraceSpan(text, start);
+    if (!span) continue;
+
+    let parsed;
+    try {
+      parsed = JSON.parse(text.slice(span.start, span.end + 1));
+    } catch {
+      // 这不是结构化块（比如正文里的 "{核心信念}"，或被截断的 JSON）—— 试上一个。
+      continue;
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+    if (!Object.prototype.hasOwnProperty.call(parsed, STRUCTURED_MARKER)) continue;
+
+    return span;
+  }
+  return null;
+}
+
 export function extractStructured(text) {
   const span = findStructuredSpan(text);
   if (!span) return null;
+  let parsed;
   try {
-    const parsed = JSON.parse(text.slice(span.start, span.end + 1));
-    const value = parsed[STRUCTURED_MARKER];
-    return value === undefined ? null : value;
+    parsed = JSON.parse(text.slice(span.start, span.end + 1));
   } catch {
     return null;
   }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const value = parsed[STRUCTURED_MARKER];
+  return value === undefined || value === null ? null : value;
+}
+
+// 模型偶尔用 ```json 围栏包裹结构化块（指令明说不要，但模型常犯），
+// 剥掉块之后会残留空围栏，这里顺带清掉紧邻的围栏残留。
+function removeTrailingFence(text) {
+  return text.replace(/[ \t]*```[A-Za-z0-9_+.-]*[ \t]*\r?\n?$/, '').trimEnd();
+}
+
+function removeLeadingFence(text) {
+  return text.replace(/^\s*```[A-Za-z0-9_+.-]*[ \t]*\r?\n?/, '').trimStart();
 }
 
 export function stripStructured(text) {
   if (!text) return '';
   const span = findStructuredSpan(text);
+  // 没认定出块，就一个字都不动 —— 绝不能因为「看起来像」就吃掉正文。
   if (!span) return text;
-  const before = text.slice(0, span.start).trimEnd();
-  const after = text.slice(span.end + 1).trimStart();
+  const before = removeTrailingFence(text.slice(0, span.start));
+  const after = removeLeadingFence(text.slice(span.end + 1));
   return [before, after].filter(Boolean).join('\n\n');
 }
