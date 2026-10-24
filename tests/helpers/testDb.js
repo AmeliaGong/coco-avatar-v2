@@ -11,6 +11,14 @@ if (!process.env.DB_PATH?.includes('coco-test-')) {
 if (!DB_PATH?.includes('coco-test-')) {
   throw new Error('测试库未隔离，db.js 解析到的库路径=' + DB_PATH);
 }
+// 两个来源必须指向同一个库：db.js 在模块作用域捕获 DB_PATH，
+// 若它比 testEnv.js 更早求值，两边会指向不同的库 —— 只查 env 会漏掉这种情况。
+if (process.env.DB_PATH !== DB_PATH) {
+  throw new Error(
+    '测试库未隔离：process.env.DB_PATH 与 db.js 解析到的库路径不一致\n' +
+      `  env: ${process.env.DB_PATH}\n  db.js: ${DB_PATH}`
+  );
+}
 
 export function resetDb() {
   const db = getDb();

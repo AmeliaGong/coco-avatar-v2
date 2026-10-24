@@ -11,7 +11,8 @@ process.env.DB_PATH = DB_PATH;
 process.env.MINIMAX_API_KEY = 'test-key-not-used';
 process.env.ADMIN_PASSWORD = 'test-admin';
 process.env.INTERNAL_SERVICE_TOKEN = 'test-internal-token';
-// 指向一个不可达的本地端口：测试里的对话请求会立刻失败（不产生网络流量、不会挂起）。
+// 指向 WHATWG fetch 的「禁用端口」清单里的 9：fetch 会在建立 socket 之前
+// 就直接抛错（bad port），因此一个数据包都不会发出，测试立刻失败且不挂起。
 // 必须是无条件赋值：如果开发者 shell 里导出了真实的 MINIMAX_API_URL，
 // 套件就会带着真 key 打向生产网关 —— 这是项目明令禁止的。
 process.env.MINIMAX_API_URL = 'http://127.0.0.1:9/unreachable';
