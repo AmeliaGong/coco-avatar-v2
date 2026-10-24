@@ -265,3 +265,363 @@ test('remove 掉真实 id 返回 true，之后检索不到', () => {
   assert.equal(s.search({ tags: ['转型'] }).length, 0);
   assert.equal(s.list().length, 0);
 });
+
+// ======================================================================
+// 以下是代码质量评审（CHANGES REQUESTED）要求补的硬化项与测试盲区
+// ======================================================================
+
+// ------------------------------------------------- 拍板①：kind 是过滤器
+
+test('kind 是过滤器不是打分项：search 只返回该 kind 的条目', () => {
+  const s = store();
+  s.create({ kind: 'case', title: '案例 A', content: '正文', tags: ['共同'] });
+  s.create({ kind: 'quote', title: '语录 B', content: '正文', tags: ['共同'] });
+
+  const hits = s.search({ tags: ['共同'], kind: 'case' });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].kind, 'case');
+  assert.equal(hits[0].title, '案例 A');
+});
+
+test('search 与 list 的 kind 过滤行为一致', () => {
+  const s = store();
+  s.create({ kind: 'case', title: '案例 A', content: '正文', tags: ['共同'] });
+  s.create({ kind: 'quote', title: '语录 B', content: '正文', tags: ['共同'] });
+  s.create({ kind: 'case', title: '案例 C', content: '正文', tags: ['共同'] });
+
+  const viaSearch = s.search({ kind: 'case' }).map(e => e.id).sort();
+  const viaList = s.list({ kind: 'case' }).map(e => e.id).sort();
+  assert.deepEqual(viaSearch, viaList);
+  assert.equal(viaSearch.length, 2);
+  assert.ok(viaSearch.every(id => s.get(id).kind === 'case'));
+});
+
+test('kind 为空 / 非法时不过滤（search 与 list 一致）', () => {
+  const s = store();
+  s.create({ kind: 'case', title: '案例 A', content: '正文', tags: [] });
+  s.create({ kind: 'quote', title: '语录 B', content: '正文', tags: [] });
+
+  // 非字符串 kind → 当 null → 不过滤（list 仍返回整表）。
+  assert.equal(s.list({ kind: 42 }).length, 2);
+  assert.equal(s.list({ kind: '' }).length, 2);
+  assert.equal(s.list({ kind: null }).length, 2);
+  // search 的 kind 非法 → 不过滤；又没有任何打分条件 → 空数组。
+  assert.deepEqual(s.search({ kind: 42 }), []);
+  assert.deepEqual(s.search({ kind: '' }), []);
+});
+
+test('search 什么条件都不传时返回空数组（想取全部请用 list）', () => {
+  const s = store();
+  s.create({ kind: 'case', title: '案例 A', content: '正文', tags: ['x'] });
+  assert.deepEqual(s.search(), []);
+  assert.deepEqual(s.search({}), []);
+  assert.equal(s.list().length, 1);
+});
+
+// --------------------------------------------------------- 检索打分语义
+
+test('tag 命中的权重高于关键词命中', () => {
+  const db = getDb();
+  const insert = db.prepare(
+    `INSERT INTO knowledge_entries (id, kind, title, content, tags, source_url, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  // A 只命中 tag；B 只命中关键词。若 tag 权重被改成 *1，两者同分，
+  // 就会按 updated_at 倒序把 B 排到前面 —— 这条断言正好抓住那个变异。
+  insert.run('k-a', 'note', '只命中 tag', '毫不相关的正文', '["重要"]', null, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  insert.run('k-b', 'note', '只命中关键词', '关键词在这里', '["无关"]', null, '2026-01-02T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
+
+  const s = store();
+  const hits = s.search({ tags: ['重要'], query: '关键词' });
+  assert.equal(hits.length, 2);
+  assert.equal(hits[0].id, 'k-a');
+});
+
+test('同分但 updated_at 不同：新的在前', () => {
+  const db = getDb();
+  const insert = db.prepare(
+    `INSERT INTO knowledge_entries (id, kind, title, content, tags, source_url, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  // created_at 相同、updated_at 不同、同分。id 顺序与 updated_at 顺序相反：
+  // 少了 updated_at 这级 tiebreaker 就会排成 k-a 在前。
+  insert.run('k-a', 'note', '旧的一条', '同样的关键词', '[]', null, '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z');
+  insert.run('k-b', 'note', '新的一条', '同样的关键词', '[]', null, '2026-01-01T00:00:00.000Z', '2026-01-02T00:00:00.000Z');
+
+  const s = store();
+  const hits = s.search({ query: '同样' });
+  assert.deepEqual(hits.map(e => e.id), ['k-b', 'k-a']);
+});
+
+// ------------------------------------------------------- I-1 remove 类型
+
+test('remove 遇到非法 id 返回 false，不抛底层错误', () => {
+  const s = store();
+  assert.equal(s.remove({}), false);
+  assert.equal(s.remove([]), false);
+  assert.equal(s.remove(true), false);
+  assert.equal(s.remove(123), false);
+  assert.equal(s.remove(''), false);
+  assert.equal(s.remove(null), false);
+  assert.equal(s.remove(undefined), false);
+});
+
+// ------------------------------------------------------- I-2 list 的 limit
+
+test('list 的 limit 非法时退回默认 100（不会变成不限量）', () => {
+  const s = store();
+  for (let i = 0; i < 120; i++) {
+    s.create({ kind: 'case', title: `条目${i}`, content: '正文', tags: [] });
+  }
+  assert.equal(s.list({ limit: 0 }).length, 100);
+  assert.equal(s.list({ limit: -1 }).length, 100);
+  assert.equal(s.list({ limit: 'abc' }).length, 100);
+  assert.equal(s.list({ limit: null }).length, 100);
+  assert.equal(s.list({ limit: NaN }).length, 100);
+  assert.equal(s.list({ limit: 3 }).length, 3);
+});
+
+test('list 的 limit 是真的 LIMIT（不是固定 100）', () => {
+  const s = store();
+  for (let i = 0; i < 10; i++) {
+    s.create({ kind: 'case', title: `条目${i}`, content: '正文', tags: [] });
+  }
+  assert.equal(s.list({ limit: 3 }).length, 3);
+});
+
+// ------------------------------------------------------- I-4 source_url
+
+test('create 遇到非法 source_url 抛中文错误', () => {
+  const s = store();
+  assert.throws(
+    () => s.create({ kind: 'case', title: 'x', content: 'y', source_url: {} }),
+    (err) => {
+      assert.match(err.message, /source_url/);
+      assert.match(err.message, /字符串/);
+      return true;
+    }
+  );
+  assert.throws(() => s.create({ kind: 'case', title: 'x', content: 'y', source_url: 123 }), /source_url/);
+});
+
+test('source_url 存得进去、也读得回来', () => {
+  const s = store();
+  const created = s.create({
+    kind: 'case',
+    title: '自由职业转型',
+    content: '来访者从阿里离职',
+    tags: ['转型'],
+    source_url: 'http://example.com/a',
+  });
+  assert.equal(created.source_url, 'http://example.com/a');
+
+  const row = getDb()
+    .prepare('SELECT source_url FROM knowledge_entries WHERE id = ?')
+    .get(created.id);
+  assert.equal(row.source_url, 'http://example.com/a');
+
+  // search 返回的条目也必须带着 source_url。
+  const hits = s.search({ tags: ['转型'] });
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].source_url, 'http://example.com/a');
+});
+
+// --------------------------------------------------- I-5 五个出口的形状
+
+test('create / search / list / get / update 的返回字段完全一致，且不含 embedding', () => {
+  const s = store();
+  const created = s.create({
+    kind: 'case',
+    title: '自由职业转型',
+    content: '来访者从阿里离职',
+    tags: ['转型'],
+    source_url: 'http://example.com/a',
+  });
+
+  const shapes = [
+    created,
+    s.search({ tags: ['转型'] })[0],
+    s.list()[0],
+    s.get(created.id),
+    s.update(created.id, { title: '自由职业转型（修订）' }),
+  ];
+  const expected = [
+    'content',
+    'created_at',
+    'id',
+    'kind',
+    'source_url',
+    'tags',
+    'title',
+    'updated_at',
+  ];
+  for (const entry of shapes) {
+    assert.deepEqual(Object.keys(entry).sort(), expected);
+    assert.ok(!Object.keys(entry).includes('embedding'));
+    assert.ok(Array.isArray(entry.tags));
+  }
+});
+
+// --------------------------------------------------------- I-6 get/update
+
+test('get 取一条；不存在（或 id 非法）返回 null', () => {
+  const s = store();
+  const created = s.create({ kind: 'case', title: '标题', content: '正文', tags: ['x'] });
+  assert.equal(s.get(created.id).title, '标题');
+  assert.equal(s.get('不存在的id'), null);
+  assert.equal(s.get({}), null);
+  assert.equal(s.get(''), null);
+});
+
+test('update 改字段、刷新 updated_at、且不许改 id / created_at', async () => {
+  const s = store();
+  const created = s.create({
+    kind: 'case',
+    title: '标题',
+    content: '正文',
+    tags: ['旧标签'],
+    source_url: 'http://example.com/a',
+  });
+
+  await new Promise(r => setTimeout(r, 5));
+  const updated = s.update(created.id, {
+    kind: 'quote',
+    title: '新标题',
+    content: '新正文',
+    tags: ['新标签'],
+    source_url: 'http://example.com/b',
+  });
+
+  assert.equal(updated.id, created.id);
+  assert.equal(updated.kind, 'quote');
+  assert.equal(updated.title, '新标题');
+  assert.equal(updated.content, '新正文');
+  assert.deepEqual(updated.tags, ['新标签']);
+  assert.equal(updated.source_url, 'http://example.com/b');
+  // 创建时间不许改。
+  assert.equal(updated.created_at, created.created_at);
+  // 更新时间必须刷新。
+  assert.notEqual(updated.updated_at, created.updated_at);
+  assert.ok(updated.updated_at > created.updated_at);
+});
+
+test('update 没给的字段保持原值', () => {
+  const s = store();
+  const created = s.create({
+    kind: 'case',
+    title: '标题',
+    content: '正文',
+    tags: ['标签'],
+    source_url: 'http://example.com/a',
+  });
+  const updated = s.update(created.id, { title: '只改标题' });
+  assert.equal(updated.title, '只改标题');
+  assert.equal(updated.kind, 'case');
+  assert.equal(updated.content, '正文');
+  assert.deepEqual(updated.tags, ['标签']);
+  assert.equal(updated.source_url, 'http://example.com/a');
+});
+
+test('update 对不存在的 id 返回 false，且不会凭空插入一行', () => {
+  const s = store();
+  assert.equal(s.update('不存在的id', { title: 'x' }), false);
+  assert.equal(s.update({}, { title: 'x' }), false);
+  assert.equal(s.update('', { title: 'x' }), false);
+  assert.equal(s.list().length, 0);
+});
+
+test('update 忽略 patch 里的 id / created_at / updated_at', () => {
+  const s = store();
+  const a = s.create({ kind: 'case', title: 'A', content: '正文', tags: [] });
+  const b = s.create({ kind: 'case', title: 'B', content: '正文', tags: [] });
+
+  const updated = s.update(a.id, {
+    title: 'A 改了',
+    id: b.id,
+    created_at: '1999-01-01T00:00:00.000Z',
+    updated_at: '1999-01-01T00:00:00.000Z',
+  });
+
+  // 改的还是 A：id 与 created_at 没被动过。
+  assert.equal(updated.id, a.id);
+  assert.equal(updated.created_at, a.created_at);
+  assert.equal(updated.title, 'A 改了');
+  // B 一点没动。
+  assert.equal(s.get(b.id).title, 'B');
+  assert.equal(s.get(b.id).created_at, b.created_at);
+});
+
+test('update 的入参校验跟 create 一样：空的 kind/title/content 抛中文错误', () => {
+  const s = store();
+  const created = s.create({ kind: 'case', title: '标题', content: '正文', tags: [] });
+  assert.throws(() => s.update(created.id, { kind: '' }), /kind/);
+  assert.throws(() => s.update(created.id, { title: '' }), /title/);
+  assert.throws(() => s.update(created.id, { content: '' }), /content/);
+  assert.throws(() => s.update(created.id, { kind: 123 }), /kind/);
+  assert.throws(() => s.update(created.id, { source_url: {} }), /source_url/);
+});
+
+test('update 的 patch 不是对象时抛中文错误', () => {
+  const s = store();
+  const created = s.create({ kind: 'case', title: '标题', content: '正文', tags: [] });
+  assert.throws(() => s.update(created.id, null), /patch/);
+  assert.throws(() => s.update(created.id, '不是对象'), /patch/);
+});
+
+// ------------------------------------------------------- m3 tag 空白归一化
+
+test('tag 的空白被归一化：存 \' 转型 \' 用 \'转型\' 也能搜到', () => {
+  const s = store();
+  const created = s.create({ kind: 'case', title: '标题', content: '正文', tags: [' 转型 '] });
+  assert.deepEqual(created.tags, ['转型']);
+  assert.equal(s.search({ tags: ['转型'] }).length, 1);
+  assert.equal(s.search({ tags: [' 转型 '] }).length, 1);
+});
+
+test('tag 去重、空 tag 丢掉', () => {
+  const s = store();
+  const created = s.create({ kind: 'case', title: '标题', content: '正文', tags: ['a', 'a', '  ', 'b'] });
+  assert.deepEqual(created.tags, ['a', 'b']);
+  // 查询侧去重：重复的 tag 不改变结果。
+  assert.equal(s.search({ tags: ['a', 'a'] }).length, 1);
+});
+
+// ------------------------------------------------- m8 formatForPrompt 容错
+
+test('formatForPrompt 遇到 null / 缺字段的条目不崩', () => {
+  const s = store();
+  let out = '';
+  assert.doesNotThrow(() => {
+    out = s.formatForPrompt([null, undefined, [], '字符串', { kind: 'case' }, { title: '只有标题' }]);
+  });
+  assert.ok(out.includes('【case】'));
+  assert.ok(out.includes('只有标题'));
+});
+
+// ------------------------------------------------------ list 的 kind 过滤
+
+test('list 按 kind 过滤', () => {
+  const s = store();
+  s.create({ kind: 'case', title: '案例', content: '正文', tags: [] });
+  s.create({ kind: 'quote', title: '语录', content: '正文', tags: [] });
+  const rows = s.list({ kind: 'quote' });
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, 'quote');
+});
+
+test('list 带 kind 时 limit 也生效', () => {
+  const s = store();
+  for (let i = 0; i < 6; i++) {
+    s.create({ kind: 'case', title: `案例${i}`, content: '正文', tags: [] });
+  }
+  s.create({ kind: 'quote', title: '语录', content: '正文', tags: [] });
+  assert.equal(s.list({ kind: 'case', limit: 3 }).length, 3);
+});
+
+test('kind 的前后空白被归一化（search 与 list 一致）', () => {
+  const s = store();
+  s.create({ kind: 'case', title: '案例', content: '正文', tags: [] });
+  assert.equal(s.search({ kind: ' case ' }).length, 1);
+  assert.equal(s.list({ kind: ' case ' }).length, 1);
+});
+

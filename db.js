@@ -111,8 +111,10 @@ function initSchema(db) {
     CREATE INDEX IF NOT EXISTS idx_knowledge_kind ON knowledge_entries(kind);
   `);
 
-  // 建表语句只对**新建**的库生效；线上卷里的旧表不会因为
-  // CREATE TABLE IF NOT EXISTS 而长出新列 —— 靠这里补。
+  // 建表语句里的 CREATE TABLE IF NOT EXISTS 对**所有**库都生效 —— 新库建出
+  // 全部表，旧库也会把**缺的新表**补出来（比如 knowledge_entries）。
+  // 但它**不会改已存在的表结构**：线上卷里的旧表不会长出新列 —— 那靠这里补。
+  // 所以：新表不需要进 migrateSchema；给旧表**加列**才需要。
   migrateSchema(db);
 }
 
