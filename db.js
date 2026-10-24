@@ -95,6 +95,20 @@ function initSchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_prompt_scenarios_active
       ON prompt_scenarios(id, is_active);
+
+    CREATE TABLE IF NOT EXISTS knowledge_entries (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL,
+      title TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags TEXT,
+      source_url TEXT,
+      embedding TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_kind ON knowledge_entries(kind);
   `);
 
   // 建表语句只对**新建**的库生效；线上卷里的旧表不会因为
