@@ -54,8 +54,8 @@ export function AdminLayout() {
     `px-4 py-2 rounded-lg text-sm transition ${isActive ? 'bg-sage text-white' : 'text-gray-600 hover:bg-warm-beige/60'}`;
 
   return (
-    <div className="min-h-screen bg-warm-beige/20">
-      <header className="bg-gradient-to-r from-warm-beige to-soft-apricot border-b border-warm-grey/30 shadow-sm px-6 py-3 flex items-center justify-between">
+    <div className="h-screen bg-warm-beige/20 flex flex-col">
+      <header className="shrink-0 bg-gradient-to-r from-warm-beige to-soft-apricot border-b border-warm-grey/30 shadow-sm px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-4">
           <h1 className="font-bold text-gray-800">Coco Admin</h1>
           <nav className="flex gap-1">
@@ -68,8 +68,12 @@ export function AdminLayout() {
           退出
         </button>
       </header>
-      <main className="p-6 max-w-6xl mx-auto">
-        <Outlet />
+      {/* The global stylesheet locks html/body to overflow:hidden for the 3D
+          landing page, so the admin area scrolls inside this container. */}
+      <main className="flex-1 min-h-0 overflow-y-auto touch-auto">
+        <div className="p-6 max-w-6xl mx-auto">
+          <Outlet />
+        </div>
       </main>
     </div>
   );
