@@ -598,6 +598,51 @@ test('formatForPrompt 遇到 null / 缺字段的条目不崩', () => {
   assert.ok(out.includes('只有标题'));
 });
 
+test('limit 接受正整数的数字字符串（admin 路由的 query 一定是字符串）', () => {
+  const s = store();
+  for (let i = 0; i < 10; i++) {
+    s.create({ kind: 'case', title: `条目${i}`, content: '批量关键词', tags: ['批量'] });
+  }
+  assert.equal(s.search({ tags: ['批量'], limit: '3' }).length, 3);
+  assert.equal(s.list({ limit: '3' }).length, 3);
+  // 不是正整数的字符串 → 退回默认值（search 5 / list 100）。
+  assert.equal(s.search({ tags: ['批量'], limit: 'abc' }).length, 5);
+  assert.equal(s.list({ limit: 'abc' }).length, 10);
+  assert.equal(s.search({ tags: ['批量'], limit: '3.5' }).length, 5);
+  assert.equal(s.search({ tags: ['批量'], limit: '-1' }).length, 5);
+  assert.equal(s.search({ tags: ['批量'], limit: '' }).length, 5);
+});
+
+test('kind 写入侧也 trim：存 \' case \' 之后按 \'case\' 查得到', () => {
+  const s = store();
+  const created = s.create({ kind: ' case ', title: '标题', content: '正文', tags: [] });
+  assert.equal(created.kind, 'case');
+  assert.equal(s.search({ kind: 'case' }).length, 1);
+  assert.equal(s.list({ kind: 'case' }).length, 1);
+  // update 的写入侧同样 trim。
+  const updated = s.update(created.id, { kind: ' quote ' });
+  assert.equal(updated.kind, 'quote');
+  assert.equal(s.search({ kind: 'quote' }).length, 1);
+  assert.equal(s.list({ kind: 'quote' }).length, 1);
+});
+
+test('formatForPrompt 缺字段时渲染成空串，不出现 undefined / null / NaN', () => {
+  const s = store();
+  const out = s.formatForPrompt([
+    { kind: 'case' },
+    { title: '只有标题' },
+    { content: '只有正文' },
+    { kind: 'case', title: '完整', content: '正文' },
+  ]);
+  assert.ok(!out.includes('undefined'));
+  assert.ok(!out.includes('null'));
+  assert.ok(!out.includes('NaN'));
+  assert.ok(!out.includes('[object Object]'));
+  assert.ok(out.includes('【case】'));
+  assert.ok(out.includes('只有标题'));
+  assert.ok(out.includes('只有正文'));
+});
+
 // ------------------------------------------------------ list 的 kind 过滤
 
 test('list 按 kind 过滤', () => {

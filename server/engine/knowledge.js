@@ -21,6 +21,15 @@
 //      —— 这一条要改 server/engine/cbtEngine.js，**不属于本任务**。
 //   ④ 总量闸门改成按条目整条丢/留，并标注省略了多少条。
 //
+//   另外三条「接线时必须注意」的坑：
+//   ⑤ update(id, {tags:'不是数组'}) 会**静默清空全部 tag**（tags 归一化时
+//      非数组 → []）。接线时**admin 路由必须自己把字符串切成数组**再传给
+//      store，否则一次手滑就把管理员打的标签全抹了。
+//   ⑥ list() **没有 offset** —— 知识库超过 100 条时，后台**翻不到第 101 条**。
+//      接线时必须补分页。
+//   ⑦ query 是**整串 includes、不分词**。接线文档要写明「query 传**单个词或
+//      短语**，不要传一整段话」—— 一整段话几乎必然整串不命中，检索会静默返回空。
+//
 // ============================================================================
 // 性能备注：现在数据量小，检索是全表扫，够用。数据量上来之后需要
 // `updated_at` 索引（配合 `WHERE kind = ?`），或者直接上 FTS5 全文检索。
@@ -123,6 +132,10 @@ export function createKnowledgeStore({ db } = {}) {
     assertNonEmptyString(kind, 'kind');
     assertNonEmptyString(title, 'title');
     assertNonEmptyString(content, 'content');
+    // kind 写入前 trim：读取侧（search / list 的过滤值）也是 trim 过的，
+    // 两边不一致的话「存 ' case '」这条记录会对 kind 检索**隐身**。
+    // trim 之后为空 → assertNonEmptyString 已经抛了（空白视为空）。
+    const cleanKind = kind.trim();
     const cleanSourceUrl = normalizeSourceUrl(source_url);
 
     const id = crypto.randomUUID();
@@ -131,7 +144,7 @@ export function createKnowledgeStore({ db } = {}) {
       `INSERT INTO knowledge_entries
          (id, kind, title, content, tags, source_url, created_at, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).run(id, kind, title, content, JSON.stringify(normalizeTags(tags)), cleanSourceUrl, now, now);
+    ).run(id, cleanKind, title, content, JSON.stringify(normalizeTags(tags)), cleanSourceUrl, now, now);
     // 写完库再查一行出来返回：这样返回的 created_at / updated_at 与库里完全一致。
     return toEntry(selectById.get(id));
   }
@@ -145,6 +158,11 @@ export function createKnowledgeStore({ db } = {}) {
   //
   // 约定：**什么都不传时返回空数组** —— 想取全部请用 list()。
   // 传了 kind（合法字符串）时，kind 本身就是一个检索条件，返回该 kind 的条目。
+  //
+  // 注意：**只给 kind 时不做相关性判断** —— 返回该 kind 的全部条目（截断到
+  // limit）。相关性（tag / 关键词）只有在给了 tags 或 query 时才参与。
+  //
+  // query 是**整串 includes、不分词** —— 传一个词或短语，不要传一整段话。
   function search(params = {}) {
     const opts =
       params && typeof params === 'object' && !Array.isArray(params) ? params : {};
@@ -221,8 +239,9 @@ export function createKnowledgeStore({ db } = {}) {
   // 合法字符串 → 过滤。
   // 从 HTTP query 进来的 kind 一定是字符串（req.query.x 永远是 string 或
   // undefined），所以「非字符串 kind」只可能来自代码内部调用 —— 将来写 admin
-  // 路由时 kind 来自 query 天然安全，但 **limit 来自 query 是字符串**，所以
-  // limit 的校验**必须**在 store 层做（不能只在路由层做）。
+  // 路由时 kind 来自 query 天然安全。**limit 来自 query 也是字符串**，store 层
+  // 直接接受正整数的数字字符串（'3' → 3），其余取值退回默认 100 —— 校验在
+  // store 层做，路由层不必再自己转一次。
   function list({ kind = null, limit = DEFAULT_LIST_LIMIT } = {}) {
     const kindFilter =
       typeof kind === 'string' && kind.trim() !== '' ? kind.trim() : null;
@@ -257,6 +276,10 @@ export function createKnowledgeStore({ db } = {}) {
   // 可以改：kind / title / content / tags / source_url。
   // **不接受 id / created_at** —— 不许改主键、不许改创建时间（这两个字段一律忽略）。
   // patch 里没给的字段保持原值；只有显式给了才校验。
+  //
+  // 两种「不成功」的区别：
+  //   - **patch 不是对象 → 抛错**（编程错误，静默返回 false 会把调用方的 bug 吞掉）
+  //   - **id 非法或不存在 → 返回 false**（没这一条，属于正常情况）
   function update(id, patch = {}) {
     if (!isNonEmptyString(id)) return false;
     if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
@@ -275,7 +298,7 @@ export function createKnowledgeStore({ db } = {}) {
 
     if (patch.kind !== undefined) {
       assertNonEmptyString(patch.kind, 'kind');
-      kind = patch.kind;
+      kind = patch.kind.trim();
     }
     if (patch.title !== undefined) {
       assertNonEmptyString(patch.title, 'title');
@@ -318,16 +341,21 @@ export function createKnowledgeStore({ db } = {}) {
   return { create, search, formatForPrompt, list, get, update, remove };
 }
 
-// 非法 limit（非正整数：0 / 负数 / NaN / 字符串 / null）退回默认值。
+// 非法 limit（非正整数：0 / 负数 / NaN / 空串 / null）退回默认值。
 //
-// 为什么必须在 store 层做：将来 admin 路由的 limit 来自 HTTP query string，
-// 一定是字符串；SQLite 里 LIMIT -1 是「不限量」，LIMIT 'abc' 直接报
-// datatype mismatch —— 透传必炸。
+// **接受正整数的数字字符串**（'3' → 3）：将来 admin 路由的 limit 来自
+// HTTP query string，一定是字符串 —— 如果 store 把字符串当非法，那 admin
+// 列表就会永远返回默认的 100 条。'abc' → NaN → 退回默认；'3.5' → 非整数 →
+// 退回默认；'-1' → 退回默认。
+//
+// 为什么校验必须在 store 层做：SQLite 里 LIMIT -1 是「不限量」，LIMIT 'abc'
+// 直接报 datatype mismatch —— 透传必炸。
 function normalizeLimit(value, fallback) {
-  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+  const n = typeof value === 'string' ? Number(value.trim()) : value;
+  if (typeof n !== 'number' || !Number.isInteger(n) || n <= 0) {
     return fallback;
   }
-  return value;
+  return n;
 }
 
 function isNonEmptyString(value) {
