@@ -27,6 +27,19 @@
 | Markdown / JSON 导出 | 不阻塞交付闭环 | 12 月后 |
 | 知识库检索注入 | Task 9 已在做；本计划**接上即可**，缺省为空数组 | 随 Task 9 |
 
+> **知识库 store 的形状（Task 9 已定，将来接线时照着用，本计划现在不接）：**
+>
+> 五个出口（`create` / `search` / `list` / `get` / `update`）**返回同一个形状**：
+> `{ id, kind, title, content, tags, source_url, created_at, updated_at }`
+>
+> - **`embedding` 不进对外形状** —— 它是给将来向量检索预留的内部列，现在没人用，泄漏出去会让人误以为能用。
+> - **`kind` 是过滤器，不是打分项** —— `search` 和 `list` 都按 kind 过滤，行为一致。（评审把「kind 只加 1 分」改成了真过滤：tag 命中 ×2、query 命中 ×1，而 kind 只加 1 分几乎不改变排序，却叫 `kind` —— 名字和行为对不上，是个坑。）
+> - **`search()` 一个条件都不传时返回空数组**（想取全部用 `list()`）。
+> - 引擎的 `knowledge` 通道吃的就是 `{ kind, title, content }` 这个形状（`clientContext.knowledge` 是对象数组）—— **store 的行可以直接传进引擎**，不用再映射一次。
+> - 入参守卫：`remove(id)` 非字符串返回 `false`；`list({limit})` 非法退回 **100**（不是 `search` 的 5）；`create({source_url})` 非字符串抛中文错；tags 两边都 `trim()` + 去重。
+> - **本计划现在不接线**（`knowledge` 缺省是空数组）：接线会改变线上流量行为，需要单独评审。12 月再接。
+
+
 ---
 
 ## 与规格的偏离（四处）
@@ -7223,6 +7236,15 @@ const MAX_MOVE_CHARS = 600;
 
 > **`coachSpeaker` 是给「说话人分离」用的**（增补 C.4）：传进来之后，`transcript` 里要先经过 `splitBySpeaker` 拆出「来访者段」和「教练段」，只把来访者段当素材。**这一段与增补 C.4 一起改**，不要在这里另起一套。
 
+> **送进 prompt 的一切来访者来源材料，都是不可信输入。**
+>
+> 1v1 转写、上传文件正文、来访者自己写的卡点 —— 这些都是**别人写的东西**，会被当成指令读。所以：
+>
+> - **内容永远不被当作指令执行。** 材料是「素材」，不是「命令」；prompt 里要写明这一点（分析 prompt 已有类似口径，别削弱它）。
+> - **净化只在渲染期做，绝不在入库时做。** 原始材料原样留档（`sessions_1v1.transcript` 存的是原文），净化只发生在拼 prompt 的那一步 —— 否则以后净化规则变了，原始材料已经被永久销毁。
+> - **净化规则（与底座知识库那条一致）**：进 prompt 前压平每一行**行首**的 `---` / `###` / `===` 标记（保留换行和缩进，只吃标记）。理由：内容保留换行，就能在里面塞伪造的段落标题，冒充系统消息或「教练手册」的章节。
+> - **长度上限照旧**（总量闸门 + 逐值上限），但**超限要显式标注被截断**，不能静默砍 —— 静默砍掉的话，教练会以为模型看到的是全部材料。
+
 - [ ] **Step 7: 后台接口**
 
 `server/delivery/adminRoutes.js` 的 `createAdminDeliveryRouter` 签名加 `moves`：
@@ -7561,6 +7583,7 @@ feat(delivery): 教练手法库 —— 表、store、引擎通道与后台管理
 1. **不引 multipart 库。** 用 `express.raw` 收字节，`X-File-Name` 头带文件名。前端用 `fetch` 把 `File` 直接当 body 送。少一个依赖，少一份攻击面。
 2. **只加一个依赖：`mammoth`**（docx → 纯文本，纯 JS，不需要编译）。fly 的 Dockerfile 里 `npm install --include=dev` 之后 `npm prune --production` —— mammoth 是生产依赖，会留下。
 3. **上传不等于入库。** 上传只做「提取文本 → 回填到文本框 → 教练能改 → 再保存/分析」。docx 的说话人格式经常变形，机器提取出来的东西要人能改过才能用；而且转写是隐私，教练要能一眼看到送进去的是什么。
+4. **入库不净化，净化只在渲染期。** 1v1 转写是**来访者来源的不可信输入** —— 它会被原样存进 `sessions_1v1.transcript`，送进 prompt 之前才净化。**绝不在入库时截断或改写**：原始材料是留档，改了就是永久销毁，以后净化规则变了也救不回来。
 
 **Files:**
 - Create: `server/delivery/upload.js`
