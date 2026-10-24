@@ -58,5 +58,20 @@ function initSchema(db) {
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS stories (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      city TEXT NOT NULL,
+      country TEXT NOT NULL,
+      lat REAL NOT NULL,
+      lng REAL NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      content TEXT NOT NULL,
+      is_coco INTEGER DEFAULT 0,
+      avatar TEXT,
+      created_at TEXT NOT NULL
+    );
   `);
 }

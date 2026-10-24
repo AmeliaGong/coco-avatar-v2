@@ -11,7 +11,7 @@
 html, body {
   height: 100%;
   overflow: hidden;
-  touch-action: manipulation;
+  touch-action: none;
   -webkit-tap-highlight-color: transparent;
   -webkit-touch-callout: none;
   -webkit-user-select: text;
@@ -29,6 +29,7 @@ body {
 #root {
   height: 100%;
   overflow: hidden;
+  overflow: clip;
 }
 
 @keyframes fadeIn {

@@ -1,6 +1,5 @@
-import { useState, useCallback, useEffect } from 'react';
-import { streamChat, getConversation, Message } from '../lib/api';
-import { SYSTEM_PROMPT } from '../constants/systemPrompt';
+import { useState, useCallback, useEffect, useRef } from 'react';
+import { streamChat, getConversation } from '../lib/api';
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
@@ -14,6 +13,12 @@ export function useChat(initialMessage: string, conversationId?: string) {
   const [isLoading, setIsLoading] = useState(false);
   const [convId, setConvId] = useState<string | undefined>(conversationId);
   const [expired, setExpired] = useState(false);
+  const messagesRef = useRef(messages);
+
+  // Keep ref updated
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   // Load existing conversation messages
   useEffect(() => {
@@ -40,9 +45,10 @@ export function useChat(initialMessage: string, conversationId?: string) {
     setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
 
     try {
-      const chatMessages: Message[] = [
-        { role: 'system', content: SYSTEM_PROMPT },
-        ...messages.map(m => ({ role: m.role, content: m.content })),
+      // Use ref to get latest messages
+      const currentMessages = messagesRef.current;
+      const chatMessages = [
+        ...currentMessages.map(m => ({ role: m.role, content: m.content })),
         { role: 'user', content: userMessage },
       ];
 
@@ -77,7 +83,7 @@ export function useChat(initialMessage: string, conversationId?: string) {
     } finally {
       setIsLoading(false);
     }
-  }, [messages, convId]);
+  }, [convId]);
 
   return { messages, sendMessage, isLoading, conversationId: convId, expired };
 }
