@@ -247,15 +247,20 @@ test('差异 4：conversation_id 不是字符串 → 400（main 会抛 RangeErro
 });
 
 // ---------------------------------------------------------------------------
-// 差异 5（**正面的**）：main 上有两个请求形状会**杀掉整个进程**
+// 差异 5（**正面的**）：main 上有**四个**请求形状会**杀掉整个进程**
 //
 // main 的 `/api/chat`：
 //   - {"messages":[{"role":"user"}]} —— content 是 undefined，被当成 NULL 写进
 //     NOT NULL 列 → SqliteError 抛在 try **之外** → unhandled rejection → 进程退出；
-//   - {"messages":[null]} —— `m.filter(m => m.role === 'user')` → TypeError → 同样退出。
+//   - {"messages":[{"role":"user","content":null}]} —— 同上（NULL 写进 NOT NULL 列）；
+//   - {"messages":[null]} —— `m.filter(m => m.role === 'user')` → TypeError → 同样退出；
+//   - {"messages":"不是数组"} —— `messages.filter` 不是函数 → TypeError → 同样退出。
 //
-// fly.io 跑的是**单进程**，所以这两个输入等于「整站下线」。本分支两个都修好了
-// —— 现在回的是 **400**（这个请求没有一条有内容的消息可发），不建会话、
+// ⚠️ 这四个崩溃点**全都在 try 之外**（main 的 try 从 fetch 那行才开始），
+// 而 fly.io 跑的是**单进程** ⇒ 这四个输入每一个都等于「整站下线」。
+//
+// 本分支四个都修好了 —— 现在回的是 **400**（这个请求没有一条有内容的消息
+// 可发；`messages` 不是数组时是「messages 必须是数组」），不建会话、
 // 不调模型，进程当然也不崩。
 //
 // ⚠️ 这里以前钉的是 200（"content 不是非空字符串的消息不进库 → 200"）。
@@ -296,6 +301,44 @@ test('修好的 2：{"messages":[null]} → 400，进程不崩（main 上会整�
   try {
     const { res } = await postChat({
       messages: [null],
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求没内容却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+    assert.equal(rows('SELECT * FROM messages').length, 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('修好的 3：{"messages":"不是数组"} → 400，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: '这不是数组',
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求没内容却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+    assert.equal(rows('SELECT * FROM messages').length, 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('修好的 4：{"messages":[{"role":"user","content":null}]} → 400，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: null }],
     });
     assert.equal(res.status, 400);
     assert.equal(modelCalled, false, '请求没内容却调了模型');

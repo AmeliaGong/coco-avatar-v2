@@ -1942,6 +1942,12 @@ git commit -m "feat: CBT Engine 抽离为 HTTP 无关的 runCbt()"
 
 **背景：** 现在 `/api/chat` 有 110 行，把会话管理、消息落库、模型调用、伪 SSE 全塞在一个 handler 里。改完后它只剩「取数据 → 调引擎 → 写数据 → 吐 SSE」。
 
+> ⚠️ **交付后回填**（这一条原本写的是「handler 变短」，实测**不成立**）：模型调用
+> 确实搬进了 `server/engine/`，但 handler 因为多了一整排守卫（长度、字符集、
+> 过期、判据）与「先落库再吐流」的事务，反而**变长**了：main 108 行 /
+> 本分支 248 行（去注释与空行：85 / 135）。验收标准里那条已按此改写 ——
+> **判据是「handler 里没有模型调用逻辑」，不是「行数变少」**。
+
 - [ ] **Step 1: 写失败的测试**
 
 创建 `tests/api.chat.test.js`：
@@ -2812,7 +2818,7 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 | 2 | 上游网关状态**统一折叠成 502** | 网关回 429/401/500，一律回 `502` + `{error:'AI Gateway error'}`。`main` 是原样回 `res.status(response.status)`（429 就是 429）。 | 502 表达「模型侧出问题了」；上游的真实状态码仍带在 `ModelError.status` 里，只进服务端日志，不给客户端。 | `tests/api.livepath.test.js`「差异 2」（429 与 401 各一条） |
 | 3 | `conversation_id: ""` → **400** | 空串是**非法请求**。`main` 里空串是 falsy → **静默新建**一个会话（旧上下文被丢掉、调用方毫不知情）。 | 明确报错好过默默换一段会话。真实的客户端（`src/lib/api.ts`）传的是 `undefined`，从不传空串。 | `tests/api.livepath.test.js`「差异 3」 |
 | 4 | `client_id` / `conversation_id` **类型**不对 → **400** | `main` 把它们直接丢给 better-sqlite3 与 SQL：传对象会抛 `RangeError`，而那发生在 async handler 里 → Express 4 不接 → unhandled rejection → **整个进程退出**。 | 400 远好过崩进程。（`client_id` 是**客户端自报的标签**，不进响应头，所以**不做字符集限制** —— 非 ASCII / 邮箱 / 人写的标签都合法。） | `tests/api.livepath.test.js`「差异 4」 |
-| 5 | `conversation_id` **字符集**受限 → **400** | 只允许 `A-Za-z0-9._~-`（我们自己的 id 是 `crypto.randomUUID()`）。`main` 不限字符，于是 `conversation_id: "a\nb"` 会一路走到 `res.setHeader('X-Conversation-Id', ...)` 抛 `ERR_INVALID_CHAR`。 | 那个 id 会**原样进响应头**。在本分支的「先落库、再吐流」顺序下，它抛的时候**模型已经计费、库里已经留下孤儿会话与孤儿消息**了 —— 而这是公开端点，可以重复放大成本。所以字符集必须在**任何写库 / 调模型之前**拒掉。 | `tests/api.chat.test.js`「conversation_id 含换行 / 控制字符 / 空格 → 400」 |
+| 5 | `conversation_id` **字符集**受限 → **400** | 只允许 `A-Za-z0-9._~-`（我们自己的 id 是 `crypto.randomUUID()`）。`main` 不限字符，于是 `conversation_id: "a\nb"` 会一路走到 `res.setHeader('X-Conversation-Id', ...)` 抛 `ERR_INVALID_CHAR`。 | 那个 id 会**原样进响应头**。在本分支的「先落库、再吐流」顺序下，它抛的时候**模型已经计费、库里已经留下孤儿会话与孤儿消息**了 —— 而这是公开端点，可以重复放大成本。所以字符集必须在**任何写库 / 调模型之前**拒掉。 | `tests/api.chat.test.js`「conversation_id 含换行 → 400（不建会话、不写消息、**不调模型**）」「conversation_id 含控制字符（\r / \0）→ 400（不调模型）」「conversation_id 含空格 → 400（不调模型）」 |
 | 6 | `migrateSchema` 把 `duplicate column name` 当成**成功** | 之前任何 ALTER 失败都抛错 → `getDb()` 抛 → `server.js` 模块级 `const db = getDb()` 在 `listen()` 之前就抛 → 进程退出 → crash loop。 | `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` 是 check-then-act，**不是**跨进程原子的。fly 滚动部署可能短暂有两个机器对着同一个卷跑迁移，输的那一个拿到的 `duplicate column name` 恰恰是**想要的结果**（列已经存在了）。别的 ALTER 失败照旧抛。 | `tests/db.schema.test.js`「并发 ALTER 撞车」 |
 | 7 | 400 响应体里回显的用户输入**限长 40 + 去控制字符** | `Unknown scenario: ${scenario}` / `Unknown structured_output: ${structured_output}` 改成先过 `echoForError()`。合法取值**不变**（`'foo'` 还是 `'foo'`），只有超长 / 带控制字符的输入被改写。 | 这两个字段用户可控，而 `express.json()` 默认上限 100kb ⇒ 100kb 请求换来 100kb 响应（**响应放大**），而这个端点公开、可无限重复调用。控制字符还会污染日志与任何把错误体渲染成文本的地方。 | `tests/api.livepath.test.js`「差异 7」（两条） |
 | 8 | 没有「**可发消息**」的请求 → **400**（本地拒掉，不建会话、不调模型）；本平台不存在的角色被**剔掉** | 判据：**至少要有一条 user/assistant 的、content 非空的消息**。`{"messages":[]}`、只有 system 消息、消息的 content 是空的 —— 这些请求**一条能发给网关的消息都没有**。网关的底线是「至少一条**非 system 的非空**消息」—— 其中「只有 system 的请求会被回 2013 `invalid params, chat content is empty`」是**线上实测**的；「content 是空的 / 元素是 null」这两档是**按这条底线推出来的**（没单独验过），但它们连「一条非 system 的非空消息」都凑不齐，落进同一档。所以这类请求注定被拒。本分支在**本地**就说清楚：`400` + `{"error":"messages 里至少要有一条有内容的用户或助手消息"}`，**不建会话、不调模型**。<br>另一面：`tool` / `developer` 这类本平台**不存在**的角色现在被**剔掉**（本平台自己的判据只认 user/assistant），而不是原样发给网关换一个说不清的 502。⚠️ 这里要说准确：这两个 400 是**本平台**给的，**不是**网关回的 2013 —— 网关在 **role 这一维上的态度我们没有验过**（验过的只有两档：只有 system ⇒ 2013；只有 assistant ⇒ 200 被接受；tool/developer 未知，MiniMax 文档说的 `invalid role` 是另一种接口的约束）。本平台**从严**：只认 user/assistant，不冒「发过去才发现网关不认」的险。<br>`main` 是把请求照发给网关、由网关来拒：网关回非 2xx（429/401/500）⇒ **原样回网关的状态码** + `'AI Gateway error'`（**不是**固定 400；见「差异 2」）；网关以 HTTP 200 + `base_resp{status_code:2013}` 回（老接口的形状）⇒ `data.choices?.[0]?.message?.content \|\| ''` 拿到空串 ⇒ 客户端收到一个**空气泡**（200，正文为空）。两种都不是「明确拒绝这个请求」，而且 `main` 这时**已经建了会话**（一个没人说话的会话行）。<br>（`content` 缺失 / `null` 元素这两种形状在 `main` 上更早就崩了 —— 见下面的「修好的」表。） | ①**可归因**：502「AI Gateway error」的语义是「AI 侧挂了」，会让调用方以为要重试或换模型；真相是「你压根没说要聊什么」，那是 400。②**不花钱**：这个端点公开且可重复调用，不该为「没内容」的请求花一次网关往返。③**不留垃圾**：`main` 那种「建了会话却没人说话」的行会一直堆在库里。 | `tests/api.livepath.test.js`「差异 8」（两条） |
@@ -2820,6 +2826,38 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 > 表里的编号与测试名里的编号一一对应（「差异 1」…「差异 8」）。
 > 第 5、6 两条的测试在**别的文件**里，所以没有用「差异 N」开头 ——
 > 按「测试」列给出的文件与用例名去找即可。
+
+#### 其余的行为差异（行为差异审计逐条核过的）
+
+上面 8 条是**一开始就计划内**的。底座上线前又做了一次「逐条对着 `main` 核」
+的行为审计（目的是确认「零行为变化」这句话到底在什么范围内成立），
+核出下面这些**同样是差异、但不在原来那张表里**的条目。它们的共同点：
+**每一条都是「`main` 的行为 ≠ 本分支的行为」，每一条都有测试钉住**。
+
+| # | 差异 | `main` 上是什么 | 本分支是什么 | 为什么 | 测试 |
+|---|---|---|---|---|---|
+| 9 | 失败的一轮（上游 200 但**没有正文**）**照记账** | 回 **200** + 空气泡（正文为空），**有 usage 就照记 token 账** —— **实测**：`token_usage` 有一行（total 40），`messages` 里只有 user 行 | 回 **502**（`ModelError` ⇒ `statusForEngineError`），**也照记 token 账** —— 有 user 行、有 token 账、**没有** assistant 行（没有正文可存）—— **实测**：同样有 `token_usage` 一行（total 40、`scenario='chat'`、`prompt_version` 有值） | 「没拿到正文」不是「没付钱」：请求已经跑完了、tokens 已经被扣了。`server.js` 里本来就写着「token 账：**任何情况下都要记**」—— 502 那一档不记账就与这句话自相矛盾 | `tests/api.chat.test.js`「上游 200 但没有正文 → 502，这一轮的钱**照样记账**（有账、无 assistant 行）」 |
+| 10 | 网关返回**无法解析的响应体**（HTTP 200 + HTML / 被截断） | `await response.json()` 抛原生 `SyntaxError`，落在 try 里 ⇒ 被 catch ⇒ 回 **500** `{"error":"Internal server error"}` —— **实测** | `modelClient` 把解析失败包成 `ModelError` ⇒ 回 **502** `{"error":"AI Gateway error"}` —— **实测** | 500 的语义是「我们自己的代码错了」；真相是「模型侧返回了坏东西」。502 才是「可以重试/该找模型侧」的那一档 | `tests/api.chat.test.js`「网关回 200 但响应体**不是 JSON** → 502（不是 500：那不是我们自己的错）」、`tests/engine.structured.test.js`「网关返回无法解析的响应时抛 ModelError 而不是原生 SyntaxError」 |
+| 11 | 请求体**不是合法 JSON** ⇒ **400 + 简短 JSON**（永不给堆栈） | 交给 Express 的默认错误处理器（`finalhandler`）⇒ 回 **HTML** 错误页。⚠️ 本仓库**从未设置 `NODE_ENV`**（`fly.toml` / `Dockerfile` / `.env.example` 里都没有）⇒ finalhandler 的 env 恒为 `'development'` ⇒ **线上部署里那页同样是带完整堆栈和绝对路径的**（**实测**：`/Users/…/node_modules/body-parser/…`） | 自建的错误中间件 ⇒ **400** + `{"error":"Invalid request body"}`，**任何时候都不给堆栈** | 堆栈是内部细节（路径、依赖版本、源码片段），与「500 不泄露内部细节」的目标一致 | `tests/api.chat.test.js`「请求体不是合法 JSON → 400 + 简短 JSON（不给堆栈）」 |
+| 12 | 请求体**超过 100KB** ⇒ **400**（`main` 是 413） | body-parser 抛 `entity.too.large` ⇒ 默认处理器回 **413** + HTML（**实测**） | 同一个错误中间件把它映射成 **400** + JSON（**实测**） | 请求体太大是**请求本身**的问题 ⇒ 4xx。413 在这里没有信息量（调用方并不需要知道上限是多少） | `tests/api.chat.test.js`「请求体超过 100KB → 400 + 简短 JSON（不给堆栈）」 |
+| 13 | `client_id` / `conversation_id` **长度上限 128** | 没有任何长度上限 | 超过 128 ⇒ **400**（在**任何写库 / 调模型之前**） | `conversation_id` 会当**主键**写进库，还会原样进 `X-Conversation-Id` 响应头 —— 几万个字符会把响应头撑到客户端的接收上限之外：**服务端照发**（Node 对**响应**头大小没有上限，**实测** 30KB 的响应头原样发出去了；16KB 那个限制是**请求**头那边的），**是客户端**按 16KB 上限拒收（undici 报 `UND_ERR_HEADERS_OVERFLOW`，浏览器同理）⇒ 客户端拿到的是「连接被掐」，**不是** 500；而那时库里已经落了行、模型的钱也已经付过了。`client_id` 会原样进库并进后台列表 | `tests/api.chat.test.js`「client_id 超过长度上限 → 400」「conversation_id 超过长度上限 → 400」 |
+| 14 | `client_id` 与 `scenario` **被记进会话行** | `main` 的 `conversations` 表里**没有这两列**，`main` 的 `/api/chat` 也只解构了 `messages` 与 `conversation_id` ⇒ 传了也**被丢掉** | 两列都记下来（表里还多一列 `link_kind`，DEFAULT `'test'`，本轮没有任何服务代码写它，但会话读取一律 `SELECT *` ⇒ 它**也会**被带出来）⇒ `GET /api/conversations/:id` 与后台接口的响应体**多了三个字段** | 交付线要按 client 归集会话；`scenario` 是 prompt 的一部分，不记下来就查不出「这条会话用的是哪个 prompt」 | `tests/api.chat.test.js`「client_id 是字符串 → 原样记进会话」「scenario 也记进会话行（不记就查不出「这条会话用的是哪个 prompt」）」 |
+| 15 | 会话过期时，POST **顺手把 `status` 置成 `expired`** | `main` 的 POST **只**回 410、**不**置 status（`main` 里做这个副作用的是它的 **GET** 会话接口） | POST 里顺手置了 | 那个会话确实过期了；「状态」与「事实」对不上会让后台的会话列表失真 | `tests/api.chat.test.js`「过期会话 → 410，会话状态被置为 expired」 |
+| 16 | **先落库、再吐流** | 先 `res.write`/`res.end` 把回复**发出去**，**之后**才插 assistant 消息与 token 账 ⇒ 落库失败时**用户已经看到了回复、库里却没有这一轮、账也丢了** | 助手消息 + token 账 + 标题在**一个事务**里落完；落库失败就回 500、**一个字都不发** | 「用户看到了回复、库里却没有」是补不回来的残缺回合。顺序反过来之后，「库里有了、用户没看到」（用户刷新一下就能看到）就变成了可接受的失败 | `tests/api.chat.test.js`「落库发生在响应体写出去之前」「token 账写不进去时，助手消息也跟着回滚（同一个事务）」 |
+| 17 | 新增 `GET /api/internal/ping`（内部服务鉴权自检） | 没有这个端点 | `requireInternal` 保护 ⇒ 无 token 一律 **401**；服务端没配 token ⇒ **503** | 计划 2 的内部接口要有「服务间鉴权可用」的探针，否则上线后第一件事就是「鉴权到底通没通」没人知道 | `tests/auth.test.js`「内部接口：没带 token → 401」「内部接口：token 正确 → 200 + { ok: true }」 |
+| 18 | `token_usage` 多两列（`scenario` / `prompt_version`） | 只有 (id, conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at) | 多两列 ⇒ 后台会话详情接口吐出的 `token_usage` 行**多了两个字段** | 成本要能**按场景**归集、要能追到**具体版本的 prompt**（两段内容哈希） | `tests/api.chat.test.js`「token_usage 记下 scenario 与 prompt_version（两段内容哈希，不是 0.0）」 |
+| 19 | async 路由的异常**被兜住** | `/api/chat` 是**裸的** async handler ⇒ handler 里任何 throw（包括那几处**在 try 之外**的读库/写库）⇒ Express 4 不接 ⇒ unhandled rejection ⇒ **进程退出** | async 路由都过 `asyncRoute`（`server/asyncRoute.js`）⇒ 记日志 +（**响应还没发出去时**）**500** + JSON；已经发出去就只 `res.end()`（本分支的 `server.js` 里目前只有 `/api/chat` 这一个 async 路由） | 这是「修好的 1–4」能成立的前提：崩溃点从「进程退出」降级成「一个 500」。它是一条**规矩**（所有 async 路由都得包），所以单独成文件而不是塞在某一份路由代码里 | `tests/api.chat.test.js`「建会话失败时回 500，进程不崩（async handler 的兜底）」、`tests/asyncRoute.test.js` |
+
+> 这张表里**没有**「请求体逐字节相同」那一条 —— 那不是差异，是**限定条件**，
+> 见下面「仍然成立的『零行为变化』保证」一节。
+
+**「实测」是怎么做的**（可复现）：把 `main` 的 `server.js` 拷到 `/tmp`，把里面
+硬编码的网关地址换成 `http://127.0.0.1:8299/gateway`，另起一个假网关按需回
+「200 + 空正文 + usage」或「200 + HTML」；两边各起一个服务，同一个请求打过去，
+比状态码、比响应体、再直接查各自的 SQLite（`token_usage` / `messages`）。
+`main` 那份的网关 URL 是**硬编码**的（不是环境变量），所以只能拷贝改；
+本分支那边直接给 `MINIMAX_API_URL` 指过去即可。
+⇒ 全程**一个包都没发给真实网关**。
 
 #### 「差异 8」的两道防线
 
@@ -2920,7 +2958,7 @@ user 消息**（这个端点公开、无鉴权 ⇒ 谁都能这么发）：那�
   （`main` **根本没有** scenario 校验，过期检查在最前），我们是 **400
   Unknown scenario**（我们先校验参数）。两个都是 4xx、请求本身也确实非法，
   方向上是「更具体的错先报」，但**顺序与 main 不一致** —— 钉在
-  `tests/api.chat.test.js`「过期 + 坏参数」那条。
+  `tests/api.chat.test.js`「过期会话 + 别的参数也写错了 → 400（参数错先报；与 main 的顺序不同）」那条。
 
 另外：过期检查在守卫之前 ⇒ 「过期会话 + 没内容的消息」这个请求，**会先把
 会话状态置成 `expired`** 再回 410。⚠️ `main` 的 POST **只**回 410、**不**置
@@ -2957,18 +2995,122 @@ status（`main` 里做这个副作用的是它的 GET 会话接口）—— 这�
 
 ### 本分支**修好**的（`main` 上会整站下线）—— 正面的差异
 
-`main` 的 `/api/chat` 有两个请求形状会**杀掉整个进程**。fly.io 跑的是**单进程**，
-所以这两个输入等于「整站不可用」（Node 20 默认 `unhandledRejection = throw` → 进程退出）：
+`main` 的 `/api/chat` 有**四个**请求形状会**杀掉整个进程**。fly.io 跑的是**单进程**，
+所以这四个输入每一个都等于「整站不可用」（Node 20 默认 `unhandledRejection = throw` → 进程退出）：
 
-| 输入 | `main` 上发生了什么 | 本分支 |
-|---|---|---|
-| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | **400**（`messages 里至少要有一条有内容的用户或助手消息`）⇒ 不建会话、不调模型、进程不崩 |
-| `{"messages":[null]}` | `m.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | **400**（同上） |
+| 输入 | `main` 上发生了什么 | 本分支 | 测试 |
+|---|---|---|---|
+| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | **400**（`messages 里至少要有一条有内容的用户或助手消息`）⇒ 不建会话、不调模型、进程不崩 | 「修好的 1」 |
+| `{"messages":[{"role":"user","content":null}]}` | 同上（NULL 写进 `NOT NULL` 的 `content` 列） | **400**（同上） | 「修好的 4」 |
+| `{"messages":[null]}` | `messages.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | **400**（同上） | 「修好的 2」 |
+| `{"messages":"不是数组"}` | `messages.filter` 不是一个函数 → `TypeError` → 同样 unhandled rejection → **进程退出** | **400**（`messages 必须是数组`） | 「修好的 3」 |
+
+⚠️ 四个崩溃点**全都在 `main` 的 try 之外**（那个 try 从 `fetch` 那行才开始），
+所以 `main` 的 `catch` 接不住它们 —— 这就是为什么它们是「进程退出」而不是「500」。
+
+**实测（2026-10-25，本地跑 `main` 的 `server.js`，每个输入起一个新进程）**：
+
+| 输入 | 客户端收到 | 进程 | 日志里的第一行 |
+|---|---|---|---|
+| `{"messages":[{"role":"user"}]}` | `http=000`（空回复） | **退出** | `SQLITE_CONSTRAINT_NOTNULL` |
+| `{"messages":[{"role":"user","content":null}]}` | `http=000` | **退出** | `SQLITE_CONSTRAINT_NOTNULL` |
+| `{"messages":[null]}` | `http=000` | **退出** | `TypeError: Cannot read properties of null (reading 'role')` |
+| `{"messages":"不是数组"}` | `http=000` | **退出** | `TypeError: messages.filter is not a function` |
+
+（`http=000` + 进程没了 = 客户端一个响应都收不到，站点直接不可用 —— 这就是
+「整站下线」的字面意思。fly.io 是**单进程**，所以这不是「一个请求失败」，
+是**整站没了**。）
 
 **这是本分支最重要的正面差异**，也是「零行为变化」这句话必须读成
 「对**格式正确**的请求零行为变化」的原因。
 
-两条都有测试：`tests/api.livepath.test.js`「修好的 1」「修好的 2」。
+四条都有测试：`tests/api.livepath.test.js`「修好的 1」…「修好的 4」
+（上表的「测试」列给的是**编号**；全名在那个文件里）。
+
+### 本分支**修好**的（`main` 上**根本构建不起来**）
+
+这不是运行时差异，是**构建**差异 —— 但它同样让「从 `main` 干净地重建线上
+镜像」这件事做不到，所以必须记下来：
+
+| 问题 | `main` 上 | 本分支 |
+|---|---|---|
+| `src/data/stories.ts` **从来没被提交过** | `.gitignore` 里有一条**没锚定**的 `data/`（第 37 行）—— gitignore 的规则是「**只有前导或中间带斜杠**的模式才相对根目录锚定；**只带尾部斜杠不算锚定**」⇒ `data/` 仍然**在任意层级都匹配** ⇒ `src/data/` 一起被忽略 ⇒ `src/data/stories.ts`（前端源码，`src/pages/GlobeScene.tsx` 与 `src/pages/StoryPage.tsx` 都 import 它）永远进不了仓库 ⇒ **干净 clone 之后 `npm run build` 必失败** | `c405842` 把文件提交进来；`b8896fc` 把 `data/` 改成 `/data/`（**只改了这一行**；`*.db` / `*.db-wal` / `*.db-shm` 三个模式**原样未动** —— 在 git 里它们本来就匹配任意层级，够用） |
+
+⚠️ 为什么在本地「看起来是好的」：文件在**磁盘上**（只是没进 git），
+所以在开发机上 `npm run build` 能过、`docker build` 也能过（构建上下文里有这个
+文件）。**只有干净 clone 才暴露** —— 而 CI、别人的机器、新同事的第一次
+`git clone`、以及**任何从 `main` 干净地重建线上镜像的动作**，全是干净 clone。
+所以这条是「看着没问题、换个环境就炸」的那一类。
+
+**实测（2026-10-25）**：
+
+```bash
+git clone --no-local --branch main <repo> /tmp/cleanclone-main
+cd /tmp/cleanclone-main && npx vite build
+# ⇒ x Build failed in 617ms
+#   Could not resolve "../data/stories" from "src/pages/GlobeScene.tsx"
+```
+
+同一件事在本分支上：
+
+```bash
+git clone --no-local --branch feature/foundation-2026-10-24 <repo> /tmp/cleanclone
+cd /tmp/cleanclone && npx vite build
+# ⇒ ✓ built in 3.31s
+```
+
+（两个 clone 都复用了同一个 `node_modules` —— 这里验的是**源码能不能解析**，
+不是依赖能不能装。）
+
+⚠️ **同一个坑在 `.dockerignore` 里也有一份，但两边的规则是反的** ——
+这是本轮复核出来的一处**真错**：之前这段写的是「Docker 的忽略文件用 gitignore
+式语义，**不含斜杠的模式匹配任意层级**」—— **正好相反**。
+
+**Docker 的 `.dockerignore` 语义（实测，Docker 29.2.1）**：模式是拿**相对构建
+上下文的完整路径**去匹配的 ⇒ **不带斜杠的模式只匹配根目录那一层**；
+要匹配任意层级必须写 `**/...`。
+
+| `.dockerignore` 模式 | 命中 | **不**命中 |
+|---|---|---|
+| `data` | 根 `data/` | `src/data/` |
+| `*.db` | 根级的 `x.db` | `data/coco.db`、`src/inner.db` |
+| `/data` 或 `data/` | 根 `data/` | `src/data/` |
+| `**/*.db` | 任意深度的 `*.db` | —— |
+
+⇒ 所以：**「`c096715` 写了 `data` ⇒ 把 `src/data/` 一起排除 ⇒ 镜像里的
+`RUN npm run build` 解析不到 `../data/stories` ⇒ 构建失败、部署被卡死」这个
+因果链不成立**（`data` 根本没命中 `src/data/`）。若确实有构建被卡，需要另找
+原因 —— 仓库里没留下任何证据，所以这里只写「这条推论不成立」，**不替它编一个
+新原因**。
+
+⇒ 而**真正被挡错的**是另一件事：`8b58d90` 删掉 `data` 那一行、改用 `*.db` /
+`*.db-wal` / `*.db-shm` —— 但在 Docker 里这三个模式**只匹配根级**，而本地库在
+`data/coco.db`（`db.js` 里 `DB_PATH` 的默认值就在这儿）—— **实测：用当时那份
+`.dockerignore` 构建，产出的镜像层里带着 `data/coco.db`**。也就是说，
+`.dockerignore` 注释里承诺的「本地库绝不能进镜像」**并没有生效** ——
+**注释说了不等于做到了**。
+
+⇒ **本轮已修**：`.dockerignore` 改成 `/data/`（锚定根目录的 `data/` 整个目录）
++ `**/*.db` / `**/*.db-wal` / `**/*.db-shm`（兜住任意深度的散落 `.db`），
+并把注释里的错语义换成实测结论。**实测**（Docker 29.2.1，用修好的
+`.dockerignore` 构建一个含 `data/coco.db` 与 `src/data/stories.ts` 的上下文）：
+镜像里**没有** `data/coco.db`，**有** `src/data/stories.ts`（前端源码没被误排）。
+
+⇒ 这条**有测试钉住**：`tests/ignoreFiles.test.js`（`.dockerignore` 用复写的
+Docker 匹配规则判 —— 那份规则的每个分支都对着**真的 Docker** 实测过；
+`.gitignore` 直接调**真的 `git check-ignore`**）。变异测试验过：把
+`.dockerignore` 退回 `*.db` ⇒ 「本地 SQLite 库不能进镜像」那条**变红**；把
+`.gitignore` 退回 `data/` ⇒ 「`src/data/` 不能忽略」那条**变红**。
+
+⇒ 教训：**两个忽略文件的规则方向相反，改之前先确认自己在改哪一个** ——
+- **`.gitignore`**：只有**前导或中间**带斜杠才锚定根目录；`data/` 这种只带
+  尾部斜杠的**仍然**在任意层级命中 ⇒ 危险在**误伤**（`src/data/` 里的源码）。
+- **`.dockerignore`**：不带斜杠**只匹配根目录**；`data` 不会误伤 `src/data/`，
+  但 `*.db` 也**匹配不到** `data/coco.db` ⇒ 危险在**漏配**（本地库进镜像）。
+
+⇒ 再往前一步的教训：**「某个忽略文件挡住了什么」要实测，不能靠推理注释** ——
+上一版的注释推理错了两次（先说 Docker 像 gitignore，又说 `*.db` 覆盖了
+`data/`），而**注释里承诺的 PII 防护从来没生效过**。
 
 > ⚠️ 这两条以前写的是「→ 200」，那是**虚构**。
 >
@@ -2978,33 +3120,57 @@ status（`main` 里做这个副作用的是它的 GET 会话接口）—— 这�
 > （2013 `chat content is empty`）⇒ 回 **502**。也就是说「200 + 一条助手
 > 消息」只在测试里发生过。
 >
-> 现在回 400：这两个请求确实**一条能发的话都没有**（`{"role":"user"}` 的
-> content 是 `undefined`；`[null]` 整个元素就是空的），说清楚比假装回了一轮
+> 现在回 400：这些请求确实**一条能发的话都没有**（`{"role":"user"}` 的
+> content 是 `undefined`；`content: null` 是 NULL；`[null]` 整个元素就是空的；
+> `messages` 不是数组时根本连「消息」都谈不上），说清楚比假装回了一轮
 > 对话好。判据与「差异 8」是同一条：**至少要有一条有内容的 user/assistant
 > 消息**。
 
-### 仍然成立的「零行为变化」保证
+### 仍然成立的「零行为变化」保证（**以及它的适用范围**）
 
-- **发给网关的请求体逐字节不变**：`tests/api.prompt.test.js`「发往网关的请求体与
-  main 逐字节一致」断言 `init.body` 与
+⚠️ 「逐字节不变」这句话**有条件**。它成立的范围是：**线上 `main` 那种
+请求**（`scenario` 是 `chat`、没有结构化输出、没有注入上下文、消息只带
+`{role, content}` 且内容非空）。超出这个范围，请求体就**不**逐字节相同了 ——
+而且**这是有意的**，因为那些都是 `main` 上根本不存在的功能：
+
+| 条件 | 请求体为什么不再与 `main` 相同 |
+|---|---|
+| `scenario` 不是 `chat` | system prompt = 「persona 底座段 + **该场景的段**」。`main` 只有一个 `SYSTEM_PROMPT`，没有场景这回事（这条差异是**加功能**，不是改行为） |
+| 本轮请求了结构化输出 | 引擎往 system prompt 后面追加了格式说明（`buildStructuredInstruction`）⇒ system 段变了 |
+| 引擎拿到了 `clientContext`（`buildContextSection`） | 引擎往 system prompt 后面追加了上下文段 ⇒ system 段变了。⚠️ 但**走 HTTP 时这一档够不着**：`POST /api/chat` 的请求体里**没有** `client_context` 字段，路由也不传 clientContext（`server/engine/knowledge.js` 目前只被测试引用）⇒ 这条只对**直接调引擎**的调用方（将来的 BFF）可达 |
+| 消息带 `{role, content}` 以外的字段 | `main` 把消息对象**整个**转发给网关（`...messages.filter(...)`），本分支只转发 `{role, content}`（`usableMessages`（`cbtEngine.js`）与 `modelClient` **各做一次** `.map(m => ({role, content}))`）⇒ 多出来的键被丢掉了 |
+| 消息对象的**键顺序**不是 `role` 在前、`content` 在后 | `main` 转发的是**原对象**（键顺序照抄）⇒ 客户端发 `{"content":…,"role":…}` 时 `main` 的请求体就是这个顺序；本分支是 `{role, content}` ⇒ **并非逐字节相同** |
+| 消息里有空 content / `tool` / `developer` 角色 | `main` 原样转发；本分支**剔掉**（判据见「差异 8」）⇒ 消息数组变短 |
+
+所以准确的说法是：
+
+- **对 `main` 那种请求**（`scenario=chat`、无结构化输出、无注入上下文、
+  消息只带 `{role, content}`、内容非空、**且键顺序是 `role` 在前 `content` 在后**），
+  **发给网关的请求体逐字节不变**：
+  `tests/api.prompt.test.js`「发往网关的请求体与 main 逐字节一致」断言
+  `init.body` 与
   `JSON.stringify({model, messages:[{role:'system',content:<黄金快照>}, ...], max_tokens:2000})`
   **完全相等**（包括键的顺序）。system prompt 用的是
   `tests/fixtures/legacy-chat-prompt.txt` —— 那份文件与 `main` 的 `SYSTEM_PROMPT`
   字面量逐字节相同，所以这里钉的是**请求**，不是拼装。
-- **prompt 拼装不变**：`tests/api.prompt.test.js`「线上 prompt 与黄金快照仍然一致」。
+- **prompt 拼装不变**：`tests/api.prompt.test.js`「线上 prompt 与黄金快照仍然一致」
+  （同样只针对 `chat` 场景）。
+- **其余场景的 prompt 是新加的**，不在「逐字节不变」的保证范围内 ——
+  它们是新功能，不是行为回归。
 
 ---
 
 ## 验收标准
 
-- [ ] `npm test` 全绿，且**不引入任何 npm 依赖**（`git diff package.json` 只多一行 `test` 脚本）
+- [ ] `npm test` 全绿，且**不引入任何 npm 依赖**（`git diff package.json` 只多**两行**脚本：`test` 与 `prompt:split`；依赖没动）
 - [ ] `registry.getPrompt('chat')` 与 `tests/fixtures/legacy-chat-prompt.txt` 逐字节相同 —— **这是"部署后行为零变化"的唯一保证**
 - [ ] **发给网关的请求体**（不只是 prompt 拼装）与 `main` 逐字节相同 —— 见 `tests/api.prompt.test.js`「发往网关的请求体与 main 逐字节一致」
-- [ ] 「有意为之的行为变更」一节里列的每一条差异都有对应的回归测试（`tests/api.livepath.test.js`）
+- [ ] 「有意为之的行为变更」一节里列的每一条差异都有对应的回归测试（差异 1–4、7、8 在 `tests/api.livepath.test.js`；差异 5 在 `tests/api.chat.test.js`；差异 6 在 `tests/db.schema.test.js`）
+- [ ] **干净 clone 之后** `npm ci && npm run build && npm test` 都过（`src/data/stories.ts` 在仓库里；`.gitignore` 的 `data/` 已改成 `/data/`；`.dockerignore` 用 `/data/` + `**/*.db` 把本地库挡在镜像外 —— **实测**镜像里没有 `data/coco.db`，而 `src/data/stories.ts` 还在；这两条由 `tests/ignoreFiles.test.js` 钉住）
 - [ ] `src/constants/systemPrompt.ts` 已删除，仓库里不再有两份 prompt
-- [ ] `/api/chat` handler 从 110 行降到 60 行以内，模型调用逻辑全部在 `server/engine/`
-- [ ] 线上 `conversations` / `messages` / `token_usage` 数据量与部署前一致，新列已存在
-- [ ] `/api/internal/*` 无 token 一律 401
+- [ ] `/api/chat` handler 里**没有**模型调用逻辑（全部在 `server/engine/`）—— ⚠️ **行数这条没达成**：main 108 行 / 本分支 248 行（去注释与空行：85 / 135），比 `main` 长了一倍多（多出来的是守卫、校验与事务）。原来写的「从 110 行降到 60 行以内」**不成立**，改成「handler 里没有模型调用逻辑」这一条
+- [ ] 部署后核对：线上 `conversations` / `messages` / `token_usage` 的**表结构**已含新列（`conversations.client_id` / `.scenario` / `.link_kind`，`token_usage.scenario` / `.prompt_version`），历史行可读；⚠️ **行数会增长**（本分支对每轮网关调用都记账，**含失败轮次**），所以「数据量与部署前一致」字面上不成立
+- [ ] 配了 `INTERNAL_SERVICE_TOKEN` 时，`/api/internal/*` 无 token 一律 **401**；服务端没配 token 时是 **503**（`server/auth.js`）
 
 ---
 
