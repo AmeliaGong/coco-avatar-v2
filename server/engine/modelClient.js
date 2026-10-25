@@ -1,8 +1,15 @@
 export class ModelError extends Error {
-  constructor(message, status) {
+  constructor(message, status, usage = null) {
     super(message);
     this.name = 'ModelError';
     this.status = status;
+    // 这一轮的 token 用量（网关给了才有）。
+    //
+    // 为什么错误上也带 usage：上游 200 但**没有正文**时（2013 / 空 choices /
+    // content 不是字符串），请求照样跑完了、tokens 照样被扣 —— 「没拿到正文」
+    // 不是不记账的理由。调用方靠这个字段把这一轮的成本记下来
+    // （见 server.js 的 recordFailedTurnUsage）。
+    this.usage = usage;
   }
 }
 
@@ -96,6 +103,18 @@ export function createModelClient({
 
     const content = data?.choices?.[0]?.message?.content || '';
 
+    // usage 要在抛错**之前**取出来 ——
+    // 「这一轮没有正文」也是付过钱的一轮，账不能丢。
+    const usage = data?.usage
+      ? {
+          prompt_tokens: data.usage.prompt_tokens || 0,
+          completion_tokens: data.usage.completion_tokens || 0,
+          total_tokens:
+            data.usage.total_tokens ||
+            (data.usage.prompt_tokens || 0) + (data.usage.completion_tokens || 0),
+        }
+      : null;
+
     // MiniMax 有可能以 HTTP 200 返回业务错误，例如
     // {"base_resp":{"status_code":1004,"status_msg":"insufficient balance"},"choices":[]}
     //
@@ -113,7 +132,8 @@ export function createModelClient({
     ) {
       throw new ModelError(
         `AI 网关业务错误：${statusCode} ${baseResp?.status_msg || ''}`.trim(),
-        res.status
+        res.status,
+        usage
       );
     }
 
@@ -123,22 +143,14 @@ export function createModelClient({
     if (!content) {
       throw new ModelError(
         `AI 网关没有返回任何内容（HTTP ${res.status}）`,
-        res.status
+        res.status,
+        usage
       );
     }
 
-    const usage = data?.usage || null;
     return {
       content,
-      usage: usage
-        ? {
-            prompt_tokens: usage.prompt_tokens || 0,
-            completion_tokens: usage.completion_tokens || 0,
-            total_tokens:
-              usage.total_tokens ||
-              (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
-          }
-        : null,
+      usage,
     };
   };
 }

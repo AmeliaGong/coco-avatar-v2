@@ -244,6 +244,41 @@ function persistTurn({ convId, scenario, turn }) {
   }
 }
 
+// 失败的一轮也要**记账**。
+//
+// 「这一轮已经付过钱了」是硬事实：网关回 200 但**没有正文**（2013 / 空
+// choices / content 不是字符串），请求照样跑完了、tokens 照样被扣。
+// `main` 在这一档是回 200 + 空气泡，并且**照记 token 账**（有 usage 就记）。
+// 本分支把这一档判成 502（更可归因：不是「AI 挂了」而是「这一轮没正文」），
+// 但**不能**因此不记账 —— 上面 persistTurn 里那句「token 账：**任何情况下
+// 都要记**」说的就是这件事。
+//
+// 落库的形状与 `main` 一致：有 user 行、有 token 账、**没有** assistant 行
+// （没有正文可存）。会话标题这一轮不生成（它由成功路径的事务顺手设置；
+// 下一轮成功时会补上）。
+//
+// ⚠️ 记账失败**不能**让请求变成崩溃：Express 4 不接 async handler 的
+// rejection ⇒ 未捕获 ⇒ 进程退出 ⇒ 整站下线。所以这里 try/catch 兜住，只记日志。
+// 账丢了是「少记一笔」，进程退出是「整站没了」—— 两者不能比。
+function recordFailedTurnUsage({ convId, scenario, error }) {
+  if (!error || !error.usage) return; // 没有用量可记（请求压根没发出去 / 上游没给 usage）
+  try {
+    const promptTokens = error.usage.prompt_tokens || 0;
+    const completionTokens = error.usage.completion_tokens || 0;
+    const total = error.usage.total_tokens || promptTokens + completionTokens;
+    // prompt_version 与成功路径同一份算法（引擎那边也是
+    // `${baseVersion}.${scenarioVersion}`），否则同一个会话里两轮的行
+    // 会指向不同的版本串。
+    const meta = promptRegistry.getPromptMeta(scenario);
+    const promptVersion = meta ? `${meta.baseVersion}.${meta.scenarioVersion}` : null;
+    db.prepare(
+      'INSERT INTO token_usage (conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at, scenario, prompt_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(convId, promptTokens, completionTokens, total, now(), scenario, promptVersion);
+  } catch (err) {
+    console.error('Failed to record token usage for a failed turn:', err);
+  }
+}
+
 // 伪 SSE：前端按 `data: ` 行读，结尾是 `data: [DONE]`。
 function streamReply(res, convId, text) {
   res.setHeader('Content-Type', 'application/json');
@@ -558,6 +593,17 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
         promptVersion: error.promptVersion,
       };
     } else {
+      // 失败的一轮也要**记账**（见 recordFailedTurnUsage 的注释）。
+      //
+      // 这一档的形态与成功路径不同：
+      //   - user 行**已经**落了库（上面 persistUserMessage 那一步）——
+      //     「用户说了什么」是事实，不会因为模型这一轮没给出正文而消失；
+      //   - assistant 行**没有**（没有正文可存）；
+      //   - token 账要记（网关给了 usage 的话）。
+      //
+      // `main` 在这一档是回 200 + 空气泡并且照记 token 账；本分支回 502
+      // （更可归因），但**不记账就是漏账**。
+      recordFailedTurnUsage({ convId, scenario, error });
       return respondWithEngineError(res, error);
     }
   }

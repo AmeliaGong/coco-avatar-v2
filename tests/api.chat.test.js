@@ -719,6 +719,9 @@ test('模型网关返回 500 → 502，且没有任何 assistant 消息落库', 
 
   assert.equal(res.status, 502);
   assert.equal(countMessages('assistant'), 0);
+  // 非 2xx ⇒ 网关没给 usage ⇒ 没有这一行。
+  // （下面「失败的一轮也要记账」那一组里有更完整的同名断言，
+  //   这里保留这条是因为它是「网关直接报错」这条路径的最小回归。）
   assert.equal(rows('SELECT * FROM token_usage').length, 0);
 });
 
@@ -740,6 +743,92 @@ test('模型返回空内容 → 502，且没有任何 assistant 消息落库', {
 
   assert.equal(res.status, 502);
   assert.equal(countMessages('assistant'), 0);
+});
+
+// ---------------------------------------------------------------------------
+// 失败的一轮也要记账（差异 9）
+//
+// 「没拿到正文」不是「没付钱」。上游 200 但没有正文时，请求照样跑完了、
+// tokens 照样被扣 —— 这一轮的钱必须记进 token_usage。
+//
+// `main` 在这一档是回 200 + 空气泡并且照记账；本分支回 502（更可归因），
+// 但**不记账就是漏账**。
+// ---------------------------------------------------------------------------
+
+test('上游 200 但没有正文 → 502，这一轮的钱**照样记账**（有账、无 assistant 行）', { timeout: 15000 }, async () => {
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [{ message: { content: '' } }],
+        usage: { prompt_tokens: 40, completion_tokens: 0, total_tokens: 40 },
+      };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '我最近总是失眠' }],
+  });
+
+  assert.equal(res.status, 502);
+  // 没有正文 ⇒ 没有 assistant 行。
+  assert.equal(countMessages('assistant'), 0);
+  // 但「用户说了什么」是事实，不因为模型这一轮没给出正文而消失。
+  assert.equal(countMessages('user'), 1);
+
+  // 账在。
+  const usage = rows('SELECT * FROM token_usage');
+  assert.equal(usage.length, 1, '失败的一轮没有记账');
+  assert.equal(usage[0].total_tokens, 40);
+  assert.equal(usage[0].prompt_tokens, 40);
+  assert.equal(usage[0].completion_tokens, 0);
+  assert.equal(usage[0].scenario, 'chat');
+  assert.ok(usage[0].prompt_version, '没有记 prompt_version');
+  assert.equal(usage[0].conversation_id, rows('SELECT id FROM conversations')[0].id);
+});
+
+test('失败路径上 token_usage 写不进去时，仍然回 502（记账失败不能让请求崩溃）', { timeout: 15000 }, async () => {
+  const db = getDb();
+  db.exec(`
+    CREATE TRIGGER block_token_usage_insert
+    BEFORE INSERT ON token_usage
+    BEGIN
+      SELECT RAISE(ABORT, 'token usage insert blocked by test');
+    END;
+  `);
+
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [{ message: { content: '' } }],
+        usage: { prompt_tokens: 40, completion_tokens: 0, total_tokens: 40 },
+      };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    // ⚠️ 这一条是「进程不许崩」的守卫：
+    // Express 4 不接 async handler 的 rejection ⇒ 未捕获 ⇒ 进程退出 ⇒
+    // 整站下线。记账失败必须被兜住，代价是「少记一笔」而不是「站点没了」。
+    assert.equal(res.status, 502);
+    assert.ok(!text.includes('data: '), '响应体里出现了流式内容');
+    assert.equal(rows('SELECT * FROM token_usage').length, 0);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS block_token_usage_insert');
+  }
 });
 
 // ---------------------------------------------------------------------------
