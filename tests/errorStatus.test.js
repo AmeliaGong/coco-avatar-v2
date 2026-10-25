@@ -30,7 +30,8 @@ test('映射表的完整内容（加一条或改一条，这里都必须跟着�
     invalid_structured_output: 400,
     unknown_structured_output: 400,
     invalid_history: 400,
-    // 请求本身没有内容（网关只接受带 user/assistant 消息的请求）⇒ 400，
+    // 请求本身没有内容（网关的底线是「至少一条非 system 的非空消息」，
+    // 这一点线上验过：只有 system 的请求会被回 2013）⇒ 400，
     // 不是 502 —— 502 的语义是「AI 侧挂了」。
     empty_history: 400,
     invalid_config: 500,

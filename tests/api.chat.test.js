@@ -324,7 +324,7 @@ test('本平台更严：tool/developer 这些角色本平台不认（**不是**�
   }
 });
 
-test('tool 消息被剔掉：不进网关、不进库（判据与发模型的那份是同一份）', { timeout: 15000 }, async () => {
+test('tool / developer 消息被剔掉：不进网关、不进库（判据与发模型的那份是同一份）', { timeout: 15000 }, async () => {
   const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
   globalThis.__cocoFetchImpl = fetchImpl;
   try {
@@ -332,16 +332,30 @@ test('tool 消息被剔掉：不进网关、不进库（判据与发模型的那
       messages: [
         { role: 'user', content: '你好' },
         { role: 'tool', content: '工具结果' },
+        { role: 'developer', content: '开发者消息' },
       ],
     });
     assert.equal(res.status, 200);
-    // 发给网关的请求体里没有 tool 消息
+    // 发给网关的请求体里没有 tool / developer 消息
     const sent = calls[0].messages;
     assert.equal(sent.length, 2, '只有 system + user');
     assert.deepEqual(sent[1], { role: 'user', content: '你好' });
-    // 库里也没有 tool 消息
+    // **边界断言**：发出去的请求体里只允许出现这三种 role。
+    //
+    // 为什么要有这条：假 fetch（gatewayRule）的 role 维度是**宽松**的
+    // （它只看「非 system 且 content 非空」），所以它抓不住「哪天有人把
+    // 判据放宽成 role !== 'system'，于是 tool 被原样发到网关」这类回归。
+    // 网关在 tool/developer 上的态度**我们没验过** ⇒ 只能靠这条自己守住。
+    for (const m of sent) {
+      assert.ok(
+        ['system', 'user', 'assistant'].includes(m.role),
+        `请求体里出现了不该发的 role：${m.role}`
+      );
+    }
+    // 库里也没有 tool / developer 消息
     assert.equal(countMessages('user'), 1);
     assert.equal(countMessages('tool'), 0);
+    assert.equal(countMessages('developer'), 0);
   } finally {
     globalThis.__cocoFetchImpl = undefined;
   }
@@ -374,7 +388,11 @@ test('落库的用户消息 = 真正发给模型的那一条（不是「最后�
 });
 
 test('错误优先级：更具体的错先报出来（空消息不盖住配置错）', { timeout: 15000 }, async () => {
-  installFetch('不该被调用');
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
   const cases = [
     [{ messages: [], scenario: 'no_such_scenario' }, 'Unknown scenario'],
     [{ messages: [], structured_output: 'no_such_type' }, 'Unknown structured_output'],
@@ -386,6 +404,7 @@ test('错误优先级：更具体的错先报出来（空消息不盖住配置�
     assert.equal(res.status, 400, JSON.stringify(body));
     assert.ok(text.includes(expected), `期望包含「${expected}」，实际：${text}`);
   }
+  assert.equal(modelCalled, false, '参数就不对的请求不该调模型');
   assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
 });
 
@@ -408,6 +427,34 @@ test('会话过期优先于「消息没内容」（410 先报）', { timeout: 15
   });
   assert.equal(res.status, 410);
   assert.ok(text.includes('expired'), text);
+  // 过期检查在守卫之前 ⇒ 副作用先发生：会话状态被置成 expired
+  const conv = rows('SELECT * FROM conversations WHERE id = ?', 'conv-expired-empty')[0];
+  assert.equal(conv.status, 'expired');
+});
+
+test('过期会话 + 别的参数也写错了 → 400（参数错先报；与 main 的顺序不同）', { timeout: 15000 }, async () => {
+  // main 压根没有 scenario 校验，过期检查在最前 ⇒ 同样这个请求 main 是 410。
+  // 我们先校验参数 ⇒ 400 Unknown scenario。方向上是「更具体的错先报」，
+  // 但顺序与 main 不一致 —— 写下来，别装作一致。
+  getDb()
+    .prepare(
+      'INSERT INTO conversations (id, title, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?)'
+    )
+    .run(
+      'conv-expired-badparam',
+      null,
+      new Date().toISOString(),
+      new Date(Date.now() - 60_000).toISOString(),
+      'active'
+    );
+  installFetch('不该被调用');
+  const { res, text } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    conversation_id: 'conv-expired-badparam',
+    scenario: 'no_such_scenario',
+  });
+  assert.equal(res.status, 400);
+  assert.ok(text.includes('Unknown scenario'), text);
 });
 
 test('网关规则：正常请求照发到网关，且请求体里带着那条 user 消息', { timeout: 15000 }, async () => {

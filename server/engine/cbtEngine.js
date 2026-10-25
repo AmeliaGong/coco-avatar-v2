@@ -17,10 +17,10 @@
 //     不能指望调用方都做这些事 —— 第二个调用方（BFF）未必过滤 system，
 //     结果是两条 system 消息或一条 content 缺失的请求，网关直接 400。
 //   - **引擎**还负责保证「**至少有一条能发给网关的消息**」。
-//     网关只接受带 user/assistant 消息的请求：只有 system 的请求会被拒
-//     （2013 invalid params, chat content is empty）。素材全走注入通道
-//     （进 system prompt）的调用方手上没有对话，history 就是空的 ——
-//     那种调用方**必须自己补一条任务轮**，引擎替不了它（引擎不知道任务）。
+//     网关的底线是「至少要有一条非 system 的非空消息」：只有 system 的请求
+//     会被拒（2013 invalid params, chat content is empty）—— 这一点线上验过。
+//     素材全走注入通道（进 system prompt）的调用方手上没有对话，history 就是
+//     空的 —— 那种调用方**必须自己补一条任务轮**，引擎替不了它（引擎不知道任务）。
 //   - **调用方**负责决定何时用哪个 scenario、给哪些 clientContext。
 //
 // 返回值语义：
@@ -244,21 +244,23 @@ function renderEvidence(value) {
 
 // 一条「**能发给网关**」的消息。
 //
-// 规则来自网关（MiniMax）本身，不是我们发明的：
-//   - 网关只接受 role 为 user / assistant / system 的消息；system 只能有
-//     一条且必须在最前；
-//   - 而且**至少要有一条非 system 的消息** —— 只有 system 的请求会被拒
-//     （2013 invalid params, chat content is empty）。
+// ⚠️ 关于「网关的规则」，**我们只验过两档**（2026-10-24 直接打网关）：
+//   - 只有 system 的请求 → **被拒**（2013 invalid params, chat content is empty）；
+//   - 只有 assistant 的请求 → **被接受**（200，有内容）。
+// 也就是说网关的底线是「**至少要有一条非 system 的非空消息**」，而不是
+// 「最后一条必须是 user」。
+//
+// role 这一维上**别的档（tool / developer…）我们没有验过**。MiniMax 的文档说
+// 会回 2013 `invalid role`，但那是另一种接口的约束，不能当成我们这个端点的
+// 实测结论。所以本平台**从严**：只认 user / assistant，其它角色一律剔掉 ——
+// 宁可少发，也不冒「发过去换一个说不清的 502」的险。（真要说的话，这也
+// 符合我们自己的会话模型：tool / developer 在本平台根本不存在。）
 //
 // 所以「能发」= role 是 user 或 assistant，且 content 是非空字符串。
 //
-// 为什么只认 user / assistant（而不是「除了 system 都行」）：其它角色
-// （tool、developer…）本平台的会话里根本不存在，网关也不认（2013
-// invalid role）。剔掉它们，好过原样发出去换一个说不清的 502。
-//
 // 为什么导出：路由层要用**同一份**判据在调模型之前就拒掉「没有内容」的
-// 请求（省一次网关往返、不留孤儿会话）。判据必须只有一份 —— 两处各写
-// 一遍，迟早会漂。
+// 请求（省一次网关往返、不留孤儿会话），落库时也要用**同一份**挑出
+// 「模型真的看见的那几条」。判据必须只有一份 —— 两处各写一遍，迟早会漂。
 export function usableMessages(history) {
   if (!Array.isArray(history)) return [];
   return history

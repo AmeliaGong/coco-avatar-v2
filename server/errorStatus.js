@@ -36,9 +36,11 @@ export const ENGINE_ERROR_STATUS = {
   // history 里**没有任何一条能发给网关的消息**（只有 system / 空内容 /
   // 本平台不存在的角色）。
   //
-  // 网关只接受「至少带一条 user/assistant 消息」的请求
-  // （2013 invalid params, chat content is empty）—— 素材全走注入通道的
-  // 调用方（进 system prompt）手上没有对话时就会落到这里。
+  // 网关的底线是「至少带一条**非 system 的非空**消息」：只有 system 的请求
+  // 被拒（2013 invalid params, chat content is empty）—— 这一点线上验过；
+  // 只有 assistant 的请求网关是**接受**的。所以这一档说的不是「网关只认
+  // user/assistant」，而是「**本平台**从严，只认 user/assistant」。
+  // 素材全走注入通道的调用方（进 system prompt）手上没有对话时就会落到这里。
   //
   // 映射成 400 而不是 502：502 的语义是「AI 侧挂了」，而这里的事实是
   // **请求本身没有内容**。回 502 会让调用方以为要重试或换模型。
