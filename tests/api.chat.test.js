@@ -12,11 +12,14 @@
 import './helpers/testEnv.js';
 import { test, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { createServer } from './helpers/testServer.js';
 import { resetDb } from './helpers/testDb.js';
 import { getDb } from '../db.js';
 import { createCbtEngine, CbtEngineError } from '../server/engine/cbtEngine.js';
 import { STUCK_POINT_SCHEMA } from '../server/contracts/stuckPoint.js';
+import { STRUCTURED_OUTPUT_TYPE_NAMES, structuredJsonToPersist } from '../server/structuredTypes.js';
 
 let base;
 let server;
@@ -544,4 +547,516 @@ test('E7-2：复述留下的截断残骸之后那行正文必须原样保留', {
   );
   // 残骸本身不该进正文
   assert.ok(!assistant.content.includes('卡点的一句话概括'));
+});
+
+// ---------------------------------------------------------------------------
+// C-1：client_id / conversation_id 必须是字符串
+//
+// 这两个字段之前是直接丢给 better-sqlite3 的：传一个对象会抛 RangeError
+// （bind 参数不支持对象/数组），而那发生在 async handler 里 → Express 4
+// 不接这个异常 → 进程直接退出、请求挂死。
+// ---------------------------------------------------------------------------
+
+test('client_id 不是字符串 → 400（不建会话、不调模型、进程不崩）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      client_id: { evil: true },
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0);
+    assert.equal(countMessages(), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('client_id 超过长度上限 → 400', { timeout: 15000 }, async () => {
+  installFetch('不该被调用');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    client_id: 'x'.repeat(129),
+  });
+  assert.equal(res.status, 400);
+  assert.equal(rows('SELECT * FROM conversations').length, 0);
+});
+
+test('client_id 是字符串 → 原样记进会话', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    client_id: 'client-abc',
+  });
+  assert.equal(res.status, 200);
+  const conv = rows('SELECT * FROM conversations')[0];
+  assert.equal(conv.client_id, 'client-abc');
+});
+
+test('conversation_id 不是字符串 → 400（不崩进程）', { timeout: 15000 }, async () => {
+  installFetch('不该被调用');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    conversation_id: { evil: true },
+  });
+  assert.equal(res.status, 400);
+  assert.equal(countMessages(), 0);
+});
+
+test('conversation_id 是空串 → 400', { timeout: 15000 }, async () => {
+  installFetch('不该被调用');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    conversation_id: '',
+  });
+  assert.equal(res.status, 400);
+  assert.equal(rows('SELECT * FROM conversations').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// I-1：conversation_id 的**字符集**
+//
+// conversation_id 会**原样**进 `X-Conversation-Id` 响应头。Node 的
+// setHeader 拒绝控制字符（\n / \r / \0 …）—— 抛 ERR_INVALID_CHAR。
+//
+// 而本分支的顺序是「先落库、再吐流」：setHeader 发生在**模型调用之后**。
+// 所以一个 'a\nb' 会走完：建会话 → 写用户消息 → **调模型（花钱）** →
+// 落库 → setHeader 炸 → 500。用户拿到 500，库里留下孤儿会话与孤儿消息，
+// 模型的钱已经付了。而且这是公开端点 —— 可以重复放大成本。
+//
+// 所以字符集必须在**任何写库 / 调模型之前**拒掉：400，且模型没被叫醒。
+// ---------------------------------------------------------------------------
+
+test('conversation_id 含换行 → 400（不建会话、不写消息、**不调模型**）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      conversation_id: 'a\nb',
+    });
+    assert.equal(res.status, 400);
+    // 关键断言：模型不能被叫醒 —— 那一步是要花钱的。
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '留下了孤儿会话');
+    assert.equal(countMessages(), 0, '留下了孤儿消息');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('conversation_id 含控制字符（\\r / \\0）→ 400（不调模型）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    for (const bad of ['a\rb', 'a\u0000b']) {
+      const { res } = await postChat({
+        messages: [{ role: 'user', content: '你好' }],
+        conversation_id: bad,
+      });
+      assert.equal(res.status, 400, `conversation_id=${JSON.stringify(bad)} 应该 400`);
+      assert.equal(modelCalled, false, '请求不合法却调了模型');
+      assert.equal(rows('SELECT * FROM conversations').length, 0);
+      assert.equal(countMessages(), 0);
+    }
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('conversation_id 含空格 → 400（不调模型）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    for (const bad of ['a b', ' abc', 'abc ']) {
+      const { res } = await postChat({
+        messages: [{ role: 'user', content: '你好' }],
+        conversation_id: bad,
+      });
+      assert.equal(res.status, 400, `conversation_id=${JSON.stringify(bad)} 应该 400`);
+      assert.equal(modelCalled, false, '请求不合法却调了模型');
+      assert.equal(rows('SELECT * FROM conversations').length, 0);
+      assert.equal(countMessages(), 0);
+    }
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('conversation_id 是合法 UUID → 正常走完（不是 400）', { timeout: 15000 }, async () => {
+  // 我们自己的会话 id 就是 crypto.randomUUID()（server.js 的 generateId），
+  // 前端把它原样回传（src/lib/api.ts:39）。所以 UUID **必须**能过 ——
+  // 字符集检查不是要把正常的会话挡在门外。
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('好的。');
+  };
+  try {
+    const uuid = crypto.randomUUID();
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      conversation_id: uuid,
+    });
+    assert.notEqual(res.status, 400, `合法 UUID 被拒了：${uuid}`);
+    assert.equal(res.status, 200);
+    assert.equal(modelCalled, true, '合法 UUID 没有走到模型');
+    // 会话按这个 id 建出来了
+    assert.equal(rows('SELECT * FROM conversations').length, 1);
+    assert.equal(rows('SELECT * FROM conversations')[0].id, uuid);
+    // 响应头里也是同一个值（这就是 setHeader 能接受它的原因）
+    assert.equal(res.headers.get('x-conversation-id'), uuid);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// C-2：async handler 的兜底 —— 出错要回 500，不能把进程带走
+//
+// 之前这里抛出的异常会变成 unhandledRejection → Node 默认让进程退出，
+// 客户端只看到「连接被重置」。这条测试用触发器把「建会话」这一步打断：
+// 没有兜底的话，整个测试进程会被带走（node --test 直接失败）。
+// ---------------------------------------------------------------------------
+
+test('建会话失败时回 500，进程不崩（async handler 的兜底）', { timeout: 15000 }, async () => {
+  const db = getDb();
+  db.exec(`
+    CREATE TRIGGER block_conversation_insert
+    BEFORE INSERT ON conversations
+    BEGIN
+      SELECT RAISE(ABORT, 'conversation insert blocked by test');
+    END;
+  `);
+
+  installFetch('这条回复不该被写出去。');
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    assert.equal(res.status, 500);
+    assert.ok(!text.includes('data: '), '响应体里出现了流式内容');
+    assert.equal(countMessages(), 0);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS block_conversation_insert');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// I-1：助手消息、token 账、会话标题必须同一个事务
+// ---------------------------------------------------------------------------
+
+test('token 账写不进去时，助手消息也跟着回滚（同一个事务）', { timeout: 15000 }, async () => {
+  const db = getDb();
+  db.exec(`
+    CREATE TRIGGER block_token_usage_insert
+    BEFORE INSERT ON token_usage
+    BEGIN
+      SELECT RAISE(ABORT, 'token usage insert blocked by test');
+    END;
+  `);
+
+  installFetch('这条回复不该被写出去。');
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    assert.equal(res.status, 500);
+    assert.ok(!text.includes('data: '), '响应体里出现了流式内容');
+    // 事务回滚：助手消息与 token 账**都**不该在 ——
+    // 「有消息没记账」和「有账没消息」一样是残缺的一轮。
+    assert.equal(countMessages('assistant'), 0);
+    assert.equal(rows('SELECT * FROM token_usage').length, 0);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS block_token_usage_insert');
+  }
+});
+
+// ---------------------------------------------------------------------------
+// I-3：几处「应该发生」的事（用户消息 / 自动标题 / 兜底正文 / 错误体）
+// ---------------------------------------------------------------------------
+
+test('用户消息落库了（模型看得见的那条也在库里）', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '我最近总是失眠' }],
+  });
+  assert.equal(res.status, 200);
+  const user = rows("SELECT * FROM messages WHERE role = 'user'");
+  assert.equal(user.length, 1);
+  assert.equal(user[0].content, '我最近总是失眠');
+});
+
+test('会话标题自动取首条用户消息的前 50 个字', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: 'x'.repeat(80) }],
+  });
+  assert.equal(res.status, 200);
+  const conv = rows('SELECT * FROM conversations')[0];
+  assert.equal(conv.title, 'x'.repeat(50) + '...');
+});
+
+test('兜底正文里不会出现没过契约校验的占位标题', { timeout: 15000 }, async () => {
+  // 模型只复述了格式（占位骨架）→ 这份结构化没过契约校验。
+  // 兜底正文**绝不能**把那份占位标题展示给用户。
+  installFetch(`{"__structured__": ${JSON.stringify(RESTATED_CARD)}}`);
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '我卡住了' }],
+    structured_output: 'stuck_point',
+  });
+
+  assert.equal(res.status, 200);
+  const assistant = rows("SELECT * FROM messages WHERE role = 'assistant'")[0];
+  assert.ok(assistant, '助手消息没有落库');
+  assert.ok(
+    !assistant.content.includes(STUCK_POINT_SCHEMA.title),
+    `兜底正文里出现了占位标题：${assistant.content}`
+  );
+  assert.ok(
+    !assistant.content.includes(STUCK_POINT_SCHEMA.belief),
+    `兜底正文里出现了占位信念：${assistant.content}`
+  );
+});
+
+test('502 的响应体里没有网关的内部细节', { timeout: 15000 }, async () => {
+  installFailingFetch(500, 'gateway exploded: SECRET_INTERNAL_DETAIL');
+  const { res, text } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+  });
+
+  assert.equal(res.status, 502);
+  assert.ok(
+    !text.includes('SECRET_INTERNAL_DETAIL'),
+    `响应体泄漏了网关的内部细节：${text}`
+  );
+  assert.deepEqual(JSON.parse(text), { error: 'AI Gateway error' });
+});
+
+test('500 的响应体只有一句通用文案（不泄漏 SQL / 触发器报错）', { timeout: 15000 }, async () => {
+  const db = getDb();
+  db.exec(`
+    CREATE TRIGGER block_assistant_insert_for_body
+    BEFORE INSERT ON messages
+    WHEN NEW.role = 'assistant'
+    BEGIN
+      SELECT RAISE(ABORT, 'assistant insert blocked by test SECRET_SQL');
+    END;
+  `);
+
+  installFetch('这条回复不该被写出去。');
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    assert.equal(res.status, 500);
+    assert.ok(!text.includes('SECRET_SQL'), `响应体泄漏了内部细节：${text}`);
+    assert.deepEqual(JSON.parse(text), { error: 'Internal server error' });
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS block_assistant_insert_for_body');
+  }
+});
+
+test('白名单里的每一种类型都能真的走通（白名单与引擎的 schemas 不能漂）', { timeout: 15000 }, async () => {
+  // 白名单、引擎的 schemas、契约的 validators 出自同一张表
+  // （server/structuredTypes.js）。这张测试是那道保证的**外部**证据：
+  // 白名单里多了一个引擎不认识的类型，这里就会 400。
+  for (const type of STRUCTURED_OUTPUT_TYPE_NAMES) {
+    installFetch('好的。');
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      structured_output: type,
+    });
+    assert.equal(res.status, 200, `structured_output=${type} 没能走通`);
+  }
+});
+
+test('处理完请求后，外键检查仍然是开着的', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+  });
+  assert.equal(res.status, 200);
+  // 路由里不该有「临时关掉外键检查」的 pragma —— 就算有，也必须成对恢复。
+  assert.equal(getDb().pragma('foreign_keys', { simple: true }), 1);
+});
+
+test('conversation_id 超过长度上限 → 400（不建会话、不调模型）', { timeout: 15000 }, async () => {
+  // conversation_id 会**直接当 conversations.id 主键**写进去，还会原样进
+  // X-Conversation-Id 响应头 —— 太长会把响应头撑爆（客户端连 500 都收
+  // 不到），而那时库里已经落了行、模型的钱也已经付过了。
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      conversation_id: 'x'.repeat(50000),
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0);
+    assert.equal(countMessages(), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('网关返回非字符串的 content → 502（invalid_content_type 是可达的）', { timeout: 15000 }, async () => {
+  // modelClient 不做类型强制：`content || ''` 只挡假值，真值非字符串
+  // （这里是一个对象）会原样穿过 → 引擎抛 invalid_content_type → 502。
+  // 这条测试顺带钉住 errorStatus.js 里那句注释（「这条是可达的」）。
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [{ message: { content: { text: 'hi' } } }],
+        usage: { total_tokens: 3 },
+      };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  // 抓一下服务端记下来的那个错误，确认走的是 invalid_content_type
+  // （而不是「空内容」那条 —— 两者都映射到 502，光看状态码分不出来）。
+  const logged = [];
+  const originalError = console.error;
+  console.error = (...args) => {
+    logged.push(args);
+  };
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    assert.equal(res.status, 502);
+    assert.deepEqual(JSON.parse(text), { error: 'AI Gateway error' });
+    assert.equal(countMessages('assistant'), 0);
+
+    const engineError = logged
+      .flat()
+      .find((a) => a && typeof a === 'object' && typeof a.code === 'string');
+    assert.ok(engineError, '没有记录到带 code 的引擎错误');
+    assert.equal(engineError.code, 'invalid_content_type');
+  } finally {
+    console.error = originalError;
+  }
+});
+
+test('没做契约校验的结构化内容（validated === null）不落库', { timeout: 15000 }, async () => {
+  // 造一个**不传 validators** 的引擎（将来的 BFF 就是这么调它的）：
+  // 这时 structuredValidated 是 null（压根没校验），不是 true。
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => ({
+      content: `这是你的卡点。\n{"__structured__": ${JSON.stringify(REAL_CARD)}}`,
+      usage: { total_tokens: 1 },
+    }),
+    schemas: { stuck_point: { schema: STUCK_POINT_SCHEMA, notes: {} } },
+  });
+  const result = await engine({
+    scenario: 'chat',
+    history: [],
+    structuredOutput: 'stuck_point',
+  });
+
+  assert.equal(result.structuredValidated, null, '前提：这条路径确实没做契约校验');
+  assert.ok(result.structured, '前提：这一轮确实拿到了结构化内容');
+  // 路由用的落库判定：没校验过的不落库
+  assert.equal(structuredJsonToPersist(result.structured, result.structuredValidated), null);
+  // 校验过的照落
+  assert.equal(structuredJsonToPersist(REAL_CARD, true), JSON.stringify(REAL_CARD));
+  // 校验没过的也不落（既有行为，不许被改坏）
+  assert.equal(structuredJsonToPersist(REAL_CARD, false), null);
+});
+
+test('路由落库用的是 structuredJsonToPersist（不是自己那套「只挡 false」的判定）', () => {
+  // 上面那条测的是判据本身；这条钉住**路由确实用它** —— 否则改回
+  // 「structuredValidated === false 才不落」的话，判据测得再对也没用。
+  const source = fs.readFileSync(new URL('../server.js', import.meta.url), 'utf8');
+  assert.ok(
+    source.includes('structuredJsonToPersist(turn.structured, turn.structuredValidated)'),
+    'server.js 的 persistTurn 没有用 structuredJsonToPersist'
+  );
+  assert.ok(
+    !/structuredValidated\s*===\s*false/.test(source),
+    'server.js 里还有自己那套「只挡 false」的判定'
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Express 错误处理中间件：body 解析失败不泄露堆栈
+// ---------------------------------------------------------------------------
+
+test('请求体不是合法 JSON → 400 + 简短 JSON（不给堆栈）', { timeout: 15000 }, async () => {
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{"messages": [',
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 400);
+  assert.deepEqual(JSON.parse(text), { error: 'Invalid request body' });
+  assert.ok(!text.includes('at '), `响应体里出现了堆栈：${text}`);
+  assert.ok(!text.includes('node_modules'), `响应体里出现了内部路径：${text}`);
+});
+
+test('请求体超过 100KB → 400 + 简短 JSON（不给堆栈）', { timeout: 15000 }, async () => {
+  const res = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(200000) }] }),
+  });
+  const text = await res.text();
+
+  assert.equal(res.status, 400);
+  assert.deepEqual(JSON.parse(text), { error: 'Invalid request body' });
+  assert.ok(!text.includes('at '), `响应体里出现了堆栈：${text}`);
+});
+
+// ---------------------------------------------------------------------------
+// M-1：兜底正文要分「有没有请求结构化输出」两种文案
+// ---------------------------------------------------------------------------
+
+test('本轮没请求结构化输出时，兜底正文说的是「没有请求结构化输出」', { timeout: 15000 }, async () => {
+  // 模型只给了结构化块，但本轮**没**要求结构化输出 ——
+  // 说「只交付了结构化内容」会让人一头雾水（引擎那边也是分开的两句）。
+  installFetch(`{"__structured__": ${JSON.stringify(REAL_CARD)}}`);
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+  });
+
+  assert.equal(res.status, 200);
+  const assistant = rows("SELECT * FROM messages WHERE role = 'assistant'")[0];
+  assert.ok(
+    assistant.content.includes('没有请求结构化输出'),
+    `兜底正文文案不对：${assistant.content}`
+  );
+  assert.ok(
+    !assistant.content.includes('我怕被抛弃'),
+    '没请求结构化输出，就不该把卡点标题当正文'
+  );
 });

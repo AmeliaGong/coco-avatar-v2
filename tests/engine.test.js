@@ -849,7 +849,7 @@ function titleValidator(value) {
   return { ok: true, errors: [], value: { title } };
 }
 
-function engineWith(content, validators) {
+function engineWith(content) {
   const engine = createCbtEngine({
     getPrompt: () => 'SYSTEM',
     callModel: async () => ({ content, usage: { total_tokens: 1 } }),
@@ -959,7 +959,7 @@ test('全部候选都校验不过时：退回最后一个合法块，并标记 s
   assert.deepEqual(result.structured, { title: '卡点标题' });
 });
 
-test('没给 validators 时行为与从前完全一致：取最后一个合法块', async () => {
+test('没给 validators 时：取最新的那个带值块（不校验，validated 是 null）', async () => {
   const content = [
     '正文。',
     '{"__structured__": {"title": "第一份"}}',

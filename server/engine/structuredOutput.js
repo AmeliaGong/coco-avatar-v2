@@ -196,9 +196,16 @@ export function findAllStructuredSpans(text) {
   return spans;
 }
 
-export function extractStructured(text) {
-  const span = findStructuredSpan(text);
-  if (!span) return null;
+// 一个块里的 marker 值。
+//
+// 「这个块算不算候选」与「这个块的值是什么」是两件事，但取值规则只能有
+// 一份 —— 有 validators 与没有 validators 的两条路径都走这个函数，
+// 否则「最后一个块的 marker 是 null」这种输入下两条路径会给出不同答案
+// （一条返回 null，另一条跳过它往前找）。
+//
+// 返回 null 表示「这个块没有可用的值」：marker 键的值是 null/undefined，
+// 或者块本身解析不出来。
+function valueAtSpan(text, span) {
   let parsed;
   try {
     parsed = JSON.parse(text.slice(span.start, span.end + 1));
@@ -208,6 +215,17 @@ export function extractStructured(text) {
   if (!parsed || typeof parsed !== 'object') return null;
   const value = parsed[STRUCTURED_MARKER];
   return value === undefined || value === null ? null : value;
+}
+
+// 取**最新**那份结构化内容。
+//
+// 走的是与 extractStructuredCandidates 完全一样的候选集（同一套 spanAt
+// 判据、同一套取值规则），只是不做契约校验 —— 校验是引擎那一层的事。
+export function extractStructured(text) {
+  const candidates = extractStructuredCandidates(text);
+  if (!candidates.length) return null;
+  // candidates 是「最新的在前」，所以第一份就是答案。
+  return candidates[0].value;
 }
 
 // 挑出「顶层」的那些块：被别的块包住的块随外块一起消失。
@@ -244,15 +262,9 @@ export function extractStructuredCandidates(text) {
   const spans = selectTopLevelSpans(findAllStructuredSpans(text));
   const candidates = [];
   for (const span of spans) {
-    let parsed;
-    try {
-      parsed = JSON.parse(text.slice(span.start, span.end + 1));
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== 'object') continue;
-    const value = parsed[STRUCTURED_MARKER];
-    if (value === undefined || value === null) continue;
+    // 取值规则只有这一份（valueAtSpan）：值是 null/undefined 的块不算候选。
+    const value = valueAtSpan(text, span);
+    if (value === null) continue;
     candidates.push({ value, span });
   }
   // 最新的在前（selectTopLevelSpans 给的是从前往后）。

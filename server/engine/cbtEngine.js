@@ -51,8 +51,11 @@
 //   - 候选列表按出现位置**从后往前**排（**最新的在前**）。
 //   - 有 validator 时**正着遍历**这份列表，取**第一个通过校验的** ——
 //     即**最新**的那份合法卡点。
-//   - **没有 validator 时行为与从前完全一致**（extractStructured：取最后
-//     一个合法块）。两者方向一致，都偏向靠后出现的交付物。
+//   - **没有 validator 时**（extractStructured）：取**最新**那个**带值**的
+//     合法块。「带值」的意思是 marker 的值不是 null/undefined —— 这条
+//     规则由 structuredOutput.js 的 valueAtSpan 统一给出，有 validator 与
+//     没有 validator 的两条路径完全一致（否则「最后一个块的 marker 是
+//     null」这种输入下两条路径会给出不同答案）。
 //   - 全部候选都不过校验时，回退到**最新的**那个合法块，并标记
 //     structuredValidated=false。回退用的那份是**语法合法**的、**契约没过**
 //     的（多半是模型复述格式时抄的占位骨架），所以路由**不落库**。
@@ -311,11 +314,17 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
   // 候选列表的顺序是「从后往前」（最新的在前，见
   // extractStructuredCandidates 的说明）—— 所以**正着遍历**取第一个通过的，
   // 拿到的就是**最新**的那份通过校验的卡点。这与「没给 validators 时取
-  // 最后一个合法块」（extractStructured 的语义）方向一致：两者都偏向
+  // 最新的带值块」（extractStructured 的语义）方向一致：两者都偏向
   // 靠后出现的交付物。
   //
-  // validators 没给 → 行为与今天**完全一致**（取最后一个站得住脚的块）。
-  // 加一个新参数不该改变默认行为。
+  // validators 没给 → 取**最新的那个带值**的合法块（extractStructured）。
+  // 「带值」= marker 的值不是 null/undefined（取值规则见 structuredOutput.js
+  // 的 valueAtSpan，两条路径共用同一份）。注意这**不是**「与从前完全
+  // 一致」：最后一个块的 marker 值为 null 时，现在会往前找那份有值的块
+  // （以前直接给 null）—— 两条路径必须同规则，否则同一段模型输出在
+  // 有 / 没有 validator 的调用方手里会挑出不同的东西。
+  // validated 在这条路径上是 null（压根没做契约校验）—— 调用方要把它
+  // 当成「**没校验过**」，不是「校验通过」。
   function selectStructured(raw, structuredOutput, validators) {
     const hasValidator =
       validators &&

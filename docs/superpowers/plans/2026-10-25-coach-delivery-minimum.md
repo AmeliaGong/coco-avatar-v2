@@ -3998,10 +3998,14 @@ Expected: 全部通过。
 
 线上数据库在 fly 卷 `coco_data` 上。部署前先把库拉一份下来：
 
+⚠️ **不要用 `cp /data/coco.db ...`** —— 库是 **WAL 模式**，已提交但还留在
+`coco.db-wal` 里的数据**不在主文件里**。只 `cp` 主文件会漏掉最近写入的数据，
+而且**看不出来**。用 better-sqlite3 的 `db.backup()`（SQLite 的在线备份 API）：
+
 ```bash
 cd /Users/cocogong/coco-startup/coco-avatar-main
 https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
-  flyctl ssh console --app coco-avatar-icy-sun-5917 -C "cp /data/coco.db /data/coco-$(date +%Y%m%d-%H%M%S).db && ls -la /data"
+  flyctl ssh console --app coco-avatar-icy-sun-5917 -C "node -e \"const D=require('/app/node_modules/better-sqlite3');const db=new D('/data/coco.db',{readonly:true});db.backup('/data/coco-$(date +%Y%m%d-%H%M%S).db').then(()=>{console.log('backup ok');db.close();}).catch(e=>{console.error(e);process.exit(1);})\" && ls -la /data"
 ```
 
 - [ ] **Step 5: 部署**

@@ -6,10 +6,17 @@ import { realpathSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { getDb } from './db.js';
 import { createPromptRegistry, SCENARIO_IDS } from './server/promptRegistry.js';
-import { createModelClient, ModelError } from './server/engine/modelClient.js';
+import { createModelClient } from './server/engine/modelClient.js';
 import { createCbtEngine } from './server/engine/cbtEngine.js';
-import { STUCK_POINT_SCHEMA, STUCK_POINT_FIELD_NOTES, parseStuckPoint } from './server/contracts/stuckPoint.js';
-import { PLAN_SCHEMA, PLAN_FIELD_NOTES, parsePlanPayload } from './server/contracts/plan.js';
+import {
+  STRUCTURED_OUTPUT_TYPE_NAMES,
+  STRUCTURED_SCHEMAS,
+  STRUCTURED_VALIDATORS,
+  structuredJsonToPersist,
+} from './server/structuredTypes.js';
+import { statusForEngineError, errorBodyForStatus } from './server/errorStatus.js';
+import { asyncRoute } from './server/asyncRoute.js';
+import { createRequireAdmin, createRequireInternal } from './server/auth.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -47,6 +54,17 @@ if (!MINIMAX_API_KEY) {
 // Initialize database
 const db = getDb();
 
+// 鉴权中间件。db 必须**注入进去**（server/auth.js 不 import db.js）。
+// getDb() 是懒初始化的单例，上面已经调用过，所以这里 db 已就绪。
+//
+// 注意：**不传 adminPassword**。密码校验在 POST /api/admin/login 里，
+// 中间件只管会话 token 的有效性 —— 传一个没人用的值会让人以为密码是
+// 这条鉴权链的一部分。工厂函数的签名仍接受它（将来可能用）。
+const requireAdmin = createRequireAdmin({ db });
+// 服务间鉴权。serviceToken 在**构造时**从环境变量读一次 —— 所以
+// INTERNAL_SERVICE_TOKEN 必须在模块加载前就设好（server/auth.js 里有说明）。
+const requireInternal = createRequireInternal();
+
 // Prompt Registry：文件是兜底真相源，数据库里的激活版本优先。
 // 这样真人教练可以随时调整话术而不需要重新部署。
 const promptRegistry = createPromptRegistry({ db });
@@ -77,10 +95,10 @@ const cbtEngine = createCbtEngine({
   // 形状给模型看，语义（哪个必填、枚举、worth_practicing 的 false
   // 是什么意思）必须一起给 —— 只给形状的话模型不知道 worth_practicing
   // 还有个有意义的 false 状态，会一律输出 true。
-  schemas: {
-    stuck_point: { schema: STUCK_POINT_SCHEMA, notes: STUCK_POINT_FIELD_NOTES },
-    plan: { schema: PLAN_SCHEMA, notes: PLAN_FIELD_NOTES },
-  },
+  //
+  // schemas 与 validators 都从 server/structuredTypes.js 的同一张表派生，
+  // 白名单也是 —— 三者不会漂。
+  schemas: STRUCTURED_SCHEMAS,
 });
 
 // Clean up expired admin sessions on startup
@@ -104,21 +122,6 @@ function isExpired(expiresAt) {
   return new Date(expiresAt) < new Date();
 }
 
-function requireAdmin(req, res, next) {
-  const token = req.headers['x-admin-token'];
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  const session = db.prepare('SELECT * FROM admin_sessions WHERE token = ?').get(token);
-  if (!session || new Date(session.expires_at) < new Date()) {
-    if (session) {
-      db.prepare('DELETE FROM admin_sessions WHERE token = ?').run(token);
-    }
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-}
-
 // --- Conversation API (frontend) ---
 
 // Create a new conversation
@@ -132,6 +135,14 @@ app.post('/api/conversations', (req, res) => {
 });
 
 // Get conversation info (with expiry check)
+//
+// 注意：这条路由**没有任何鉴权** —— 拿到 id 就能读走整个会话的全部消息。
+// 它比 /api/chat 更容易滥用（不花钱、不限速、还把历史全吐出来），
+// 而且早于本轮改造就存在。
+//
+// 什么时候必须收口：见 /api/chat 上方「client_id 与『会话归属』」那段
+// 注释（clients 表成立 / 对外开放 / 会话里出现可识别个人的信息）——
+// 届时**读写两条路径要一起**做归属校验。
 app.get('/api/conversations/:id', (req, res) => {
   const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(req.params.id);
   if (!conv) {
@@ -164,24 +175,10 @@ app.get('/api/conversations/:id', (req, res) => {
 //      账永久丢失，而用户已经看到回复了。反过来（先落库再写流），
 //      任何时刻 messages 表与 token_usage 表都和用户看到的内容一致。
 
-// 请求体里 structured_output 的取值域。与引擎 schemas 的键一一对应。
-const STRUCTURED_OUTPUT_TYPES = ['stuck_point', 'plan'];
-
-// 引擎错误码 → HTTP 状态码。
-//   400 客户端错（请求本身不对）    500 我们的配置错    502 模型侧错
+// 请求体里 structured_output 的取值域：STRUCTURED_OUTPUT_TYPE_NAMES
+// （来自 server/structuredTypes.js 的单一来源表，与引擎 schemas 的键一一对应）。
 //
-// 注意：'empty_reply' **不在这张表里** —— 它不是失败，走的是特判分支
-// （模型只交付了结构化块 → 回 200，照常落库记账）。把它列进表里会误导
-// 读者以为 empty_reply 映射到 502。
-const ENGINE_ERROR_STATUS = {
-  invalid_structured_output: 400,
-  unknown_structured_output: 400,
-  invalid_history: 400,
-  invalid_config: 500,
-  invalid_schema: 500,
-  empty_content: 502,
-  invalid_content_type: 502,
-};
+// 引擎错误码 → HTTP 状态码的映射在 server/errorStatus.js（独立模块，可单测）。
 
 // 从结构化内容里取一个能当标题的字段，给「模型只给了结构化块、没有正文」
 // 的那种轮次拼一句兜底正文。
@@ -199,7 +196,14 @@ function structuredTitle(type, structured) {
 }
 
 // 兜底正文。取不到标题就用一句固定文案 —— 宁可短，不可假。
-function fallbackReplyText(type, structured, validated) {
+//
+// requested：本轮**是否请求了**结构化输出。两种情况的文案必须分开 ——
+// 本轮根本没要结构化输出时说「只交付了结构化内容」会让人一头雾水
+// （引擎那边也是分开的两句，见 cbtEngine.js 里 empty_reply 的文案）。
+function fallbackReplyText(type, structured, validated, requested) {
+  if (!requested) {
+    return '这一轮没有请求结构化输出，正文是空的。';
+  }
   // 没通过契约校验的那份（多半是模型复述格式时抄的占位骨架）不能拿来
   // 当正文 —— 那等于把占位符展示给用户。
   const title = validated === false ? null : structuredTitle(type, structured);
@@ -211,12 +215,11 @@ function fallbackReplyText(type, structured, validated) {
 function persistTurn({ convId, scenario, turn }) {
   // 没通过契约校验的结构化输出**绝不落库** —— 那多半是模型复述格式时
   // 抄的占位骨架，存进库就是一条假卡点。
-  const structuredJson =
-    turn.structuredValidated === false ||
-    turn.structured === null ||
-    turn.structured === undefined
-      ? null
-      : JSON.stringify(turn.structured);
+  //
+  // 「压根没校验过」（structuredValidated === null）与「校验没过」（false）
+  // 同等对待：只有 true 才落。判据在 server/structuredTypes.js 的
+  // structuredJsonToPersist 里（将来直接调引擎的 BFF 也用同一份）。
+  const structuredJson = structuredJsonToPersist(turn.structured, turn.structuredValidated);
 
   db.prepare(
     'INSERT INTO messages (conversation_id, role, content, created_at, structured_json) VALUES (?, ?, ?, ?, ?)'
@@ -259,24 +262,98 @@ function streamReply(res, convId, text) {
 // 引擎的错误 → HTTP 状态码。
 function respondWithEngineError(res, error) {
   console.error('Error in chat endpoint:', error);
-  // 网关错（ModelError）→ 502：不是我们的问题，也别报成 500。
-  if (error instanceof ModelError || (error && error.name === 'ModelError')) {
-    return res.status(502).json({ error: 'AI Gateway error' });
-  }
-  const code = error && typeof error.code === 'string' ? error.code : null;
-  const status = (code && ENGINE_ERROR_STATUS[code]) || 500;
-  if (status === 400) {
-    // 客户端错：把原因说清楚（这是请求本身的问题，不是服务器炸了）。
-    return res.status(400).json({ error: error.message || 'Bad request' });
-  }
-  // 500 / 502：**不带** error.message —— 那是内部细节（堆栈、SQL、路径），
-  // 对客户端没有意义。排障看服务端日志（上面已经 console.error 了）。
-  return res
-    .status(status)
-    .json({ error: status === 502 ? 'AI Gateway error' : 'Internal server error' });
+  const status = statusForEngineError(error);
+  return res.status(status).json(errorBodyForStatus(status, error));
 }
 
-app.post('/api/chat', async (req, res) => {
+// client_id 的长度上限。client_id 是**客户端自报**的标签，不是凭证
+// （见下面的「会话归属」说明），但它会原样进库、还会进后台列表 ——
+// 不设上限的话，一个几百 KB 的字符串就能塞进一行。
+const MAX_CLIENT_ID_LENGTH = 128;
+
+// conversation_id 的长度上限。
+//
+// 我们的会话 id 是 crypto.randomUUID()（36 个字符），128 绰绰有余。
+//
+// 不设上限的后果比 client_id 严重得多：
+//   - 它会**直接当 conversations.id 主键**写进去（新会话那条路），
+//     每条 messages.conversation_id 还要再存一份；
+//   - 它还会原样进 `X-Conversation-Id` 响应头 —— 几万个字符会把响应头
+//     撑爆（Node 默认 16KB 上限），客户端拿到的是「连接被掐」
+//     （UND_ERR_HEADERS_OVERFLOW），**不是** 500；
+//   - 而那时库里已经落了行、模型的钱也已经付过了。
+//
+// 所以上限必须在**任何写库 / 调模型之前**生效。
+const MAX_CONVERSATION_ID_LENGTH = 128;
+
+// 400 响应体里**回显**用户输入时用。
+//
+// 回显本身有用 —— 告诉调用方「哪个值不对」比「什么值都不对」好排查。
+// 但用户可以把任意内容塞进 scenario / structured_output：
+//   - express.json() 的默认上限是 100kb ⇒ 100kb 的请求能换来 100kb 的
+//     400 响应（响应放大）。而这个端点公开、可无限重复调用。
+//   - 控制字符会污染日志与任何把错误体渲染成文本的地方。
+//
+// 所以回显前统一处理：去掉控制字符 + 限长。合法取值不受影响
+// （'foo' 还是 'foo'），只有超长/带控制字符的输入会被改写。
+const MAX_ECHOED_ERROR_VALUE_LENGTH = 40;
+
+function echoForError(value) {
+  if (typeof value !== 'string') return '';
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, '');
+  return cleaned.length > MAX_ECHOED_ERROR_VALUE_LENGTH
+    ? `${cleaned.slice(0, MAX_ECHOED_ERROR_VALUE_LENGTH)}…`
+    : cleaned;
+}
+
+// conversation_id 的**字符集**上限。
+//
+// 长度上限管不住「里面的字符」。conversation_id 会**原样**进
+// `X-Conversation-Id` 响应头，而 Node 的 setHeader 拒绝控制字符
+// （含 \n / \r / \0）—— 抛的是 ERR_INVALID_CHAR。
+//
+// 失败顺序很要命（本分支是「先落库、再吐流」）：
+//   校验 → 建会话 → 写用户消息 → **调模型（花钱）** → 落库 →
+//   streamReply 里 setHeader 才炸。
+// 所以一个 'a\nb' 会：用户拿到 500、库里留下孤儿会话与孤儿消息、
+// 模型的钱**已经付了**。而这个端点是公开的 —— 可以重复放大成本。
+//
+// 所以字符集必须在**任何写库 / 调模型之前**拒掉。
+//
+// 我们自己的会话 id 是 crypto.randomUUID()（36 字符，形如
+// xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx），只有十六进制与连字符；
+// 前端把服务端返回的 id 原样回传（src/lib/api.ts:39）。
+// 允许集因此取 URL / 响应头都安全的 ASCII：字母、数字、. _ ~ -。
+const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9._~-]+$/;
+
+// --- client_id 与「会话归属」---
+//
+// client_id 是**客户端自报**的标识，**不是凭证**：
+//   - 现在的实现只是把它原样记进 conversations.client_id（一个可检索的
+//     标签），**不**用它做任何鉴权、也不代表任何人的身份。
+//   - 谁传什么就存什么 —— 传 'a' 的人可以冒充传 'b' 的人。这是**已知且
+//     有意为之**的现状：还没有 clients 表，服务端没有任何东西能把一个
+//     client_id 验成「某个真人」。
+//   - 等真的有了 clients 表（或者任何绑定到真人/客户的会话），client_id
+//     就要从「自报标签」升级成「服务端认的标识」，那时候才谈得上归属校验。
+//
+// 什么时候**必须**开始做会话归属校验（读和写都要）：
+//   1. 有了 clients 表 / 任何绑定到客户的会话；
+//   2. 服务从「内部/教练自用」变成「对外开放给外部用户」；
+//   3. 会话里开始出现可识别个人的信息（真名、联系方式、病史），
+//      或者开始区分付费/等级。
+//
+// 为什么现在**不做**：现在做不了 —— 没有可信的身份来源，硬做只是把
+// 「拿不到 id 就能看别人的会话」换成「拿不到 id 也能冒充别人的
+// client_id」，看着像有鉴权，其实没有。真正要落地时，读路径和写路径
+// 必须**一起**收口：
+//   - 写路径：POST /api/chat —— 带上 conversation_id 时必须校验这个
+//     会话属于当前 client_id，否则谁都能往别人的会话里插消息。
+//   - 读路径：GET /api/conversations/:id —— **这条现在完全没有鉴权**，
+//     拿到 id 就能读走整个会话的全部消息。它比 /api/chat 更容易滥用
+//     （不花钱、不限速、还把历史全吐出来），而且它早于本次改造就存在。
+//     对外之前必须一起收。
+app.post('/api/chat', asyncRoute(async (req, res) => {
   const body = req.body || {};
   const {
     messages: rawMessages,
@@ -303,22 +380,74 @@ app.post('/api/chat', async (req, res) => {
   const messages = rawMessages;
 
   if (!SCENARIO_IDS.includes(scenario)) {
-    return res.status(400).json({ error: `Unknown scenario: ${scenario}` });
+    return res
+      .status(400)
+      .json({ error: `Unknown scenario: ${echoForError(scenario)}` });
   }
 
   let structuredType = null;
   if (structured_output !== undefined && structured_output !== null) {
     if (
       typeof structured_output !== 'string' ||
-      !STRUCTURED_OUTPUT_TYPES.includes(structured_output)
+      !STRUCTURED_OUTPUT_TYPE_NAMES.includes(structured_output)
     ) {
-      return res.status(400).json({ error: `Unknown structured_output: ${structured_output}` });
+      return res
+        .status(400)
+        .json({ error: `Unknown structured_output: ${echoForError(structured_output)}` });
     }
     structuredType = structured_output;
   }
 
+  // client_id：只接受字符串（null / 不传 = 没有客户端标识）。
+  //
+  // 之前它是被直接丢给 better-sqlite3 的 —— 传一个对象
+  // （{evil: true}）会抛 RangeError（bind 参数不支持对象/数组），而这
+  // 发生在 async handler 里 → 进程直接退出、请求挂死。
+  //
+  // 非字符串**不**静默当成 null：调用方以为自己传了标识（于是以为会话
+  // 是「自己的」），服务端却记成「无标识」—— 这种不一致比报错更难查。
+  if (client_id !== null && client_id !== undefined) {
+    if (typeof client_id !== 'string') {
+      return res.status(400).json({ error: 'client_id 必须是字符串' });
+    }
+    if (client_id.length > MAX_CLIENT_ID_LENGTH) {
+      return res
+        .status(400)
+        .json({ error: `client_id 超过 ${MAX_CLIENT_ID_LENGTH} 字符上限` });
+    }
+  }
+
+  // conversation_id：同理，只接受非空字符串、且有长度上限。
+  //
+  // 之前同样是可以直接传对象进来的崩溃点。空串也没意义（查不到会话，
+  // 最后会新建一个）—— 当成非法请求说清楚，比默默新建一个会话好。
+  //
+  // 长度上限的理由见 MAX_CONVERSATION_ID_LENGTH 的注释：它会直接当主键
+  // 写进库，还会进响应头 —— 太长会把响应头撑爆，客户端连 500 都收不到。
+  if (conversation_id !== null && conversation_id !== undefined) {
+    if (typeof conversation_id !== 'string' || conversation_id.trim() === '') {
+      return res.status(400).json({ error: 'conversation_id 必须是非空字符串' });
+    }
+    if (conversation_id.length > MAX_CONVERSATION_ID_LENGTH) {
+      return res
+        .status(400)
+        .json({ error: `conversation_id 超过 ${MAX_CONVERSATION_ID_LENGTH} 字符上限` });
+    }
+    // 字符集检查：它会原样进 X-Conversation-Id 响应头，而 Node 拒绝
+    // 响应头里的控制字符（\n / \r / \0 …）—— setHeader 会抛
+    // ERR_INVALID_CHAR。而这一步发生在**模型调用之后**（本分支先落库、
+    // 再吐流），所以不挡在这里就是「模型已经计费、然后 500」。
+    // 详见 CONVERSATION_ID_PATTERN 的注释。
+    if (!CONVERSATION_ID_PATTERN.test(conversation_id)) {
+      return res.status(400).json({
+        error:
+          'conversation_id 含有非法字符（只允许字母、数字、. _ ~ -）',
+      });
+    }
+  }
+
   // --- 会话 ---
-  let convId = conversation_id;
+  let convId = conversation_id || null;
   const existing = convId
     ? db.prepare('SELECT * FROM conversations WHERE id = ?').get(convId)
     : null;
@@ -329,13 +458,17 @@ app.post('/api/chat', async (req, res) => {
     return res.status(410).json({ error: 'Conversation expired', expired: true });
   }
   if (!existing) {
-    // 会话不存在就建一个（外键检查临时关掉，插完立刻打开）。
+    // 会话不存在就建一个。
+    //
+    // 注意这里**没有**（也不需要）临时关掉外键检查：会话行先插、消息行
+    // 后插，顺序上本来就满足外键。之前那对
+    // `db.pragma('foreign_keys = OFF/ON')` 只是把外键检查在中间这段时间
+    // 关掉（而 SQLite 的 PRAGMA foreign_keys 在事务里是空操作），没有
+    // 任何好处，却让「外键到底开没开」变得不可知。
     convId = convId || generateId();
-    db.pragma('foreign_keys = OFF');
     db.prepare(
       'INSERT INTO conversations (id, title, created_at, status, scenario, client_id) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(convId, null, now(), 'active', scenario, client_id);
-    db.pragma('foreign_keys = ON');
+    ).run(convId, null, now(), 'active', scenario, client_id ?? null);
   }
 
   // --- 用户消息 ---
@@ -362,10 +495,9 @@ app.post('/api/chat', async (req, res) => {
       // 契约层的校验函数：签名正好是 (payload) => ({ok, errors, value})。
       // 模型复述格式时抄的占位串会被 parseStuckPoint 拒掉 —— 这正是
       // 「落库的是真卡点、不是占位骨架」的实现方式。
-      validators: {
-        stuck_point: parseStuckPoint,
-        plan: parsePlanPayload,
-      },
+      //
+      // 与 schemas、白名单同出一张表（server/structuredTypes.js）。
+      validators: STRUCTURED_VALIDATORS,
     });
     turn = {
       text: result.reply,
@@ -380,7 +512,12 @@ app.post('/api/chat', async (req, res) => {
     // 记账，然后回 200 + 一句兜底正文。
     if (error && error.code === 'empty_reply') {
       turn = {
-        text: fallbackReplyText(structuredType, error.structured, error.structuredValidated),
+        text: fallbackReplyText(
+          structuredType,
+          error.structured,
+          error.structuredValidated,
+          structuredType !== null
+        ),
         structured: error.structured,
         structuredValidated: error.structuredValidated,
         usage: error.usage,
@@ -392,7 +529,11 @@ app.post('/api/chat', async (req, res) => {
   }
 
   // --- 落库（先落库，再吐流） ---
-  try {
+  //
+  // 助手消息、token 账、会话标题**必须一起成功或一起失败**：
+  // 少了标题只是一次「标题没自动生成」，少了助手消息或 token 账却是
+  // 「用户看到了回复，库里却没有这一轮」—— 账丢了就再也补不回来。
+  const persistAll = db.transaction(() => {
     persistTurn({ convId, scenario, turn });
 
     // Auto-set title from first user message if not set
@@ -402,15 +543,19 @@ app.post('/api/chat', async (req, res) => {
         userContent.substring(0, 50) + (userContent.length > 50 ? '...' : '');
       db.prepare('UPDATE conversations SET title = ? WHERE id = ?').run(title, convId);
     }
+  });
+
+  try {
+    persistAll();
   } catch (err) {
     // 落库失败就**不要**把回复发出去 —— 发出去的内容用户看到了，
-    // 库里却没有，账也丢了。
+    // 库里却没有，账也丢了。（事务已回滚：不会出现「有消息没记账」。）
     console.error('Error persisting chat turn:', err);
     return res.status(500).json({ error: 'Internal server error' });
   }
 
   streamReply(res, convId, turn.text);
-});
+}));
 
 // --- Admin API ---
 
@@ -427,6 +572,20 @@ app.post('/api/admin/login', (req, res) => {
   db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(createdAt);
   db.prepare('INSERT INTO admin_sessions (token, created_at, expires_at) VALUES (?, ?, ?)').run(token, createdAt, expiresAt);
   res.json({ token });
+});
+
+// --- Internal API (service-to-service) ---
+//
+// 内部服务鉴权自检端点。计划 2 会在这里挂真正的业务接口。
+//
+// 必须挂在 express.static 之前（否则 dist 里有同名文件时会被静态中间件截走）。
+//
+// 服务端没配 INTERNAL_SERVICE_TOKEN 时这里返回 **503** +
+// { error: 'INTERNAL_SERVICE_TOKEN not configured' }。这是**配置信号**，
+// 不是攻击信号：它只说明「服务在跑但没配内部密钥」，
+// 排查时应该去查环境变量，而不是去查 token。泄露的只是配置状态，不是秘密。
+app.get('/api/internal/ping', requireInternal, (req, res) => {
+  res.json({ ok: true });
 });
 
 // Admin: list conversations
@@ -657,6 +816,36 @@ app.use(express.static(path.join(__dirname, 'dist')));
 // Serve index.html for all other routes (SPA support)
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
+// --- Express 的错误处理中间件 ---
+//
+// 必须放在**所有路由之后**：Express 只把错误交给它后面的错误中间件。
+//
+// 为什么需要它：express.json() 解析请求体失败时（body 不是合法 JSON、
+// 或者 body 超过 100KB）会抛错，交给 Express 的默认错误处理器 —— 而默认
+// 处理器在非 production 环境下会把**堆栈**回给客户端。那是内部细节
+// （路径、依赖版本、源码片段），和「500 不泄露内部细节」的目标不一致。
+//
+// 一律不给堆栈（生产也不给）：排障看服务端日志。
+//
+// 注意 headersSent：响应已经开始写了就不能再设状态码/写 body，否则会抛
+// "Cannot set headers after they are sent"，把一次错误变成二次崩溃。
+app.use((err, req, res, next) => {
+  console.error('Unhandled error in request pipeline:', err);
+  if (res.headersSent) {
+    res.end();
+    return;
+  }
+  // body-parser 的两类错误：请求体不是合法 JSON（entity.parse.failed）、
+  // 请求体太大（entity.too.large）。都是**请求本身**的问题 → 400。
+  const isBodyError =
+    err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large');
+  if (isBodyError) {
+    res.status(400).json({ error: 'Invalid request body' });
+    return;
+  }
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 // 只有当本文件是进程入口时才启动监听器。

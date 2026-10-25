@@ -2709,11 +2709,31 @@ echo "machine: $MACHINE_ID"
 
 再备份（`machine exec` 的整条命令必须作为一个带引号的字符串参数）：
 
+⚠️ **不要用 `cp /data/coco.db /data/coco.db.bak`** —— 库是 **WAL 模式**，
+已提交但还留在 `coco.db-wal` 里的数据**不在主文件里**。只 `cp` 主文件会
+漏掉最近写入的会话与消息，而且**看不出来**（备份文件大小正常、内容少了一截）。
+
+用 **better-sqlite3 的 `db.backup()`**（SQLite 自己的在线备份 API，
+容器里已经装着 better-sqlite3 —— 见 Step 7 用的就是 `/app/node_modules/better-sqlite3`）。
+它会走 SQLite 的 backup API，产出一份**包含 WAL 里已提交数据**的一致快照，
+而且**不需要停服**：
+
 ```bash
 https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
-  flyctl machine exec "$MACHINE_ID" "cp /data/coco.db /data/coco.db.bak.pre-foundation && ls -la /data/"
+  flyctl machine exec "$MACHINE_ID" "node -e \"const D=require('/app/node_modules/better-sqlite3');const db=new D('/data/coco.db',{readonly:true});db.backup('/data/coco.db.bak.pre-foundation').then(()=>{console.log('backup ok');db.close();}).catch(e=>{console.error(e);process.exit(1);})\" && ls -la /data/"
 ```
-Expected: 输出 `coco.db.bak.pre-foundation` 及其大小。
+Expected: 输出 `backup ok`，以及 `coco.db.bak.pre-foundation` 及其大小。
+
+（`sqlite3 .backup` 是等价方案，但容器里没有装 sqlite3 CLI；better-sqlite3
+的 `db.backup()` 走的是同一个 SQLite backup API，且不引入新依赖。）
+
+**验一下备份真的包含数据**（可选但建议）：
+
+```bash
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 \
+  flyctl machine exec "$MACHINE_ID" "node -e \"const D=require('/app/node_modules/better-sqlite3');const db=new D('/data/coco.db.bak.pre-foundation',{readonly:true});console.log('conversations:',db.prepare('SELECT COUNT(*) c FROM conversations').get().c);console.log('messages:',db.prepare('SELECT COUNT(*) c FROM messages').get().c);\""
+```
+Expected: `conversations:` 与 `messages:` 的数量与备份前一致（**不为 0**）。
 
 - [ ] **Step 5: 设置内部服务密钥**
 
@@ -2772,10 +2792,67 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 
 ---
 
+## 有意为之的行为变更（相对 `main`）
+
+本计划标题里那句「prompt 字节级不变 / 零行为变化」，准确含义是：
+
+> **对格式正确的请求，线上 `POST /api/chat` 的行为不变**；
+> 另有若干条**有意为之**的差异列在下面，每一条都有对应的回归测试钉住
+> （`tests/api.livepath.test.js`），并且都记在这里。
+
+不写下来的差异就是「惊喜」—— 未来的读者会以为「零行为变化」是字面意思，
+然后在某个依赖旧行为的调用方那里踩坑。所以这一节是这份计划的一部分，
+不是附录。
+
+### 差异一览（全部有测试）
+
+| # | 差异 | 现在是什么 | 为什么 | 测试 |
+|---|---|---|---|---|
+| 1 | 正文**无条件**剥结构化块 + trim | 即使本轮**没有**请求结构化输出，`stripAllStructured(raw).trim()` 也会跑：正文里恰好出现的合法 `{"__structured__": ...}` 块会被静默剥掉，首尾空白也会被 trim。`main` 是把模型原文逐字透传。 | 结构化块是**给程序看的** —— 不该出现在用户的聊天气泡里，也不该原样存进 `messages` 表再回灌给模型。 | `tests/api.livepath.test.js`「差异 1」 |
+| 2 | 上游网关状态**统一折叠成 502** | 网关回 429/401/500，一律回 `502` + `{error:'AI Gateway error'}`。`main` 是原样回 `res.status(response.status)`（429 就是 429）。 | 502 表达「模型侧出问题了」；上游的真实状态码仍带在 `ModelError.status` 里，只进服务端日志，不给客户端。 | `tests/api.livepath.test.js`「差异 2」（429 与 401 各一条） |
+| 3 | `conversation_id: ""` → **400** | 空串是**非法请求**。`main` 里空串是 falsy → **静默新建**一个会话（旧上下文被丢掉、调用方毫不知情）。 | 明确报错好过默默换一段会话。真实的客户端（`src/lib/api.ts`）传的是 `undefined`，从不传空串。 | `tests/api.livepath.test.js`「差异 3」 |
+| 4 | `client_id` / `conversation_id` **类型**不对 → **400** | `main` 把它们直接丢给 better-sqlite3 与 SQL：传对象会抛 `RangeError`，而那发生在 async handler 里 → Express 4 不接 → unhandled rejection → **整个进程退出**。 | 400 远好过崩进程。（`client_id` 是**客户端自报的标签**，不进响应头，所以**不做字符集限制** —— 非 ASCII / 邮箱 / 人写的标签都合法。） | `tests/api.livepath.test.js`「差异 4」 |
+| 5 | `conversation_id` **字符集**受限 → **400** | 只允许 `A-Za-z0-9._~-`（我们自己的 id 是 `crypto.randomUUID()`）。`main` 不限字符，于是 `conversation_id: "a\nb"` 会一路走到 `res.setHeader('X-Conversation-Id', ...)` 抛 `ERR_INVALID_CHAR`。 | 那个 id 会**原样进响应头**。在本分支的「先落库、再吐流」顺序下，它抛的时候**模型已经计费、库里已经留下孤儿会话与孤儿消息**了 —— 而这是公开端点，可以重复放大成本。所以字符集必须在**任何写库 / 调模型之前**拒掉。 | `tests/api.chat.test.js`「conversation_id 含换行 / 控制字符 / 空格 → 400」 |
+| 6 | `migrateSchema` 把 `duplicate column name` 当成**成功** | 之前任何 ALTER 失败都抛错 → `getDb()` 抛 → `server.js` 模块级 `const db = getDb()` 在 `listen()` 之前就抛 → 进程退出 → crash loop。 | `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` 是 check-then-act，**不是**跨进程原子的。fly 滚动部署可能短暂有两个机器对着同一个卷跑迁移，输的那一个拿到的 `duplicate column name` 恰恰是**想要的结果**（列已经存在了）。别的 ALTER 失败照旧抛。 | `tests/db.schema.test.js`「并发 ALTER 撞车」 |
+| 7 | 400 响应体里回显的用户输入**限长 40 + 去控制字符** | `Unknown scenario: ${scenario}` / `Unknown structured_output: ${structured_output}` 改成先过 `echoForError()`。合法取值**不变**（`'foo'` 还是 `'foo'`），只有超长 / 带控制字符的输入被改写。 | 这两个字段用户可控，而 `express.json()` 默认上限 100kb ⇒ 100kb 请求换来 100kb 响应（**响应放大**），而这个端点公开、可无限重复调用。控制字符还会污染日志与任何把错误体渲染成文本的地方。 | `tests/api.livepath.test.js`「差异 7」（两条） |
+
+> 表里的编号与测试名里的编号一一对应（「差异 1」…「差异 7」）。
+> 第 5、6 两条的测试在**别的文件**里，所以没有用「差异 N」开头 ——
+> 按「测试」列给出的文件与用例名去找即可。
+
+### 本分支**修好**的（`main` 上会整站下线）—— 正面的差异
+
+`main` 的 `/api/chat` 有两个请求形状会**杀掉整个进程**。fly.io 跑的是**单进程**，
+所以这两个输入等于「整站不可用」（Node 20 默认 `unhandledRejection = throw` → 进程退出）：
+
+| 输入 | `main` 上发生了什么 | 本分支 |
+|---|---|---|
+| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | `server.js` 的用户消息提取处做了类型/空值检查：content 不是非空字符串的消息**不进库**（模型本来也看不见它）→ 200 |
+| `{"messages":[null]}` | `m.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | null 元素被跳过 → 200 |
+
+**这是本分支最重要的正面差异**，也是「零行为变化」这句话必须读成
+「对**格式正确**的请求零行为变化」的原因。
+
+两条都有测试：`tests/api.livepath.test.js`「修好的 1」「修好的 2」。
+
+### 仍然成立的「零行为变化」保证
+
+- **发给网关的请求体逐字节不变**：`tests/api.prompt.test.js`「发往网关的请求体与
+  main 逐字节一致」断言 `init.body` 与
+  `JSON.stringify({model, messages:[{role:'system',content:<黄金快照>}, ...], max_tokens:2000})`
+  **完全相等**（包括键的顺序）。system prompt 用的是
+  `tests/fixtures/legacy-chat-prompt.txt` —— 那份文件与 `main` 的 `SYSTEM_PROMPT`
+  字面量逐字节相同，所以这里钉的是**请求**，不是拼装。
+- **prompt 拼装不变**：`tests/api.prompt.test.js`「线上 prompt 与黄金快照仍然一致」。
+
+---
+
 ## 验收标准
 
 - [ ] `npm test` 全绿，且**不引入任何 npm 依赖**（`git diff package.json` 只多一行 `test` 脚本）
 - [ ] `registry.getPrompt('chat')` 与 `tests/fixtures/legacy-chat-prompt.txt` 逐字节相同 —— **这是"部署后行为零变化"的唯一保证**
+- [ ] **发给网关的请求体**（不只是 prompt 拼装）与 `main` 逐字节相同 —— 见 `tests/api.prompt.test.js`「发往网关的请求体与 main 逐字节一致」
+- [ ] 「有意为之的行为变更」一节里列的每一条差异都有对应的回归测试（`tests/api.livepath.test.js`）
 - [ ] `src/constants/systemPrompt.ts` 已删除，仓库里不再有两份 prompt
 - [ ] `/api/chat` handler 从 110 行降到 60 行以内，模型调用逻辑全部在 `server/engine/`
 - [ ] 线上 `conversations` / `messages` / `token_usage` 数据量与部署前一致，新列已存在
