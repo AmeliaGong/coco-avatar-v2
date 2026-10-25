@@ -538,8 +538,11 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       if (transcriptBlock) {
         const over = budgetOf(body) - MAX_CONTEXT_CHARS;
         const entry = transcriptBlock.entries.find(e => !e.droppable);
-        const keep = Math.max(0, entry.text.length - over);
-        entry.text = entry.text.slice(0, keep) + '\n（1v1 转写因注入段过长被截断）';
+        // 标注本身也占字数 —— 不算进去的话，截完还是超预算
+        // （闸门是「超了就砍」，砍完还超就等于没砍）。
+        const note = '\n（1v1 转写因注入段过长被截断）';
+        const keep = Math.max(0, entry.text.length - over - note.length);
+        entry.text = entry.text.slice(0, keep) + note;
         body = renderContextBlocks(blocks);
       }
     }

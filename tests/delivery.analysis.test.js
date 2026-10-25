@@ -197,6 +197,72 @@ test('注入顺序：转写 → 手法（转写是主素材，手法排其后）
 });
 
 // ---------------------------------------------------------------------------
+// 总量闸门：按条目整条丢/留
+// ---------------------------------------------------------------------------
+
+test('超预算时整条丢弃知识库条目，并标注省略了多少条', async () => {
+  const capture = {};
+  const engine = makeEngine(capture);
+  // 120 条 × 200 字 ≈ 24000 > 总量闸门（20000）—— 闸门会真的触发。
+  const knowledge = Array.from({ length: 120 }, (_, i) => ({
+    kind: 'case',
+    title: `条目${i}`,
+    content: 'w'.repeat(200),
+  }));
+  await engine({
+    scenario: 'analysis',
+    history: [],
+    clientContext: { knowledge },
+    structuredOutput: 'plan',
+  });
+  assert.ok(capture.systemPrompt.includes('因过长省略了'), '必须写明省略了多少条');
+  // 整条丢：最后那几条不在了（不是被砍成半句）。
+  assert.ok(!capture.systemPrompt.includes('条目119'), '末尾条目应被整条丢弃');
+  // 保留的那条是完整的 —— 半句话对模型是噪音。
+  assert.ok(capture.systemPrompt.includes('条目0'), '第一条应完整保留');
+});
+
+test('超预算时被丢的是知识库，卡点段完整保留', async () => {
+  const capture = {};
+  const engine = makeEngine(capture);
+  const knowledge = Array.from({ length: 120 }, (_, i) => ({
+    kind: 'case',
+    title: `条目${i}`,
+    content: 'w'.repeat(200),
+  }));
+  await engine({
+    scenario: 'analysis',
+    history: [],
+    clientContext: {
+      stuckPoint: { title: '我不能停下来', belief: '停下来就会被抛弃' },
+      knowledge,
+    },
+    structuredOutput: 'plan',
+  });
+  assert.ok(capture.systemPrompt.includes('卡点：我不能停下来'));
+  assert.ok(capture.systemPrompt.includes('限制性信念：停下来就会被抛弃'));
+  assert.ok(!capture.systemPrompt.includes('条目119'));
+});
+
+test('转写永远不被整条丢弃（它是主素材，丢了这次分析就没了）', async () => {
+  const capture = {};
+  const engine = makeEngine(capture);
+  const knowledge = Array.from({ length: 120 }, (_, i) => ({
+    kind: 'case',
+    title: `条目${i}`,
+    content: 'w'.repeat(200),
+  }));
+  await engine({
+    scenario: 'analysis',
+    history: [],
+    clientContext: { transcript: '来访者原话：我一停下来就慌。', knowledge },
+    structuredOutput: 'plan',
+  });
+  assert.ok(capture.systemPrompt.includes('来访者原话：我一停下来就慌。'), '转写必须还在');
+  assert.ok(capture.systemPrompt.includes('因过长省略了'), '被丢的其它内容要说出来');
+});
+
+// ---------------------------------------------------------------------------
 // 分析服务
 // ---------------------------------------------------------------------------
 
@@ -344,6 +410,18 @@ test('二次分析：上一轮方案的结论拼在转写开头', async () => {
   const text = calls[0].clientContext.transcript;
   assert.ok(text.includes('上一轮诊断结论'), '上一轮结论必须在');
   assert.ok(text.indexOf('上一轮诊断结论') < text.indexOf('那我该怎么办'), '上一轮结论在前面');
+});
+
+test('二次分析：契约没过时返回 invalid_plan_payload，不抛错（路由按它回 422）', async () => {
+  const calls = [];
+  const analysis = createAnalysisService({
+    callEngine: fakeEngine({ structured: PLAN_PAYLOAD, structuredValidated: false }, calls),
+    validators: {},
+  });
+  const result = await analysis.generateSecondaryDraft({ transcript: '来访者原话' });
+  assert.equal(result.ok, false);
+  assert.equal(result.error, 'invalid_plan_payload');
+  assert.equal(result.payload, undefined, '没过契约的 payload 不能交出去');
 });
 
 test('二次分析：平台对话里的 system 消息与空消息被剔掉', async () => {

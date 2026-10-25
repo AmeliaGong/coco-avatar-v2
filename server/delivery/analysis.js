@@ -155,6 +155,26 @@ export function createAnalysisService({ callEngine, validators = {} }) {
     return result.structured;
   }
 
+  // 二次分析用的「软失败」版本：**不抛错，返回一个带 error 的结果**。
+  //
+  // 为什么与 generateDraft 不一样：两条路由对失败的表达方式不同。
+  // 「生成方案草稿」那条路由把带 code 的异常当成 422（内容不合格），
+  // 而「二次分析」那条路由按 result.error 分流（no_input=400、
+  // engine_error=500、其它=422）—— 抛错过去会被它当成 500，
+  // 「模型抄了示例骨架」这种内容问题会被报成服务器故障，误导排查。
+  //
+  // 语义不变：**没通过契约校验的 payload 一律不返回给调用方落库。**
+  function pickPayloadSoft(result) {
+    try {
+      return { ok: true, payload: pickPayload(result) };
+    } catch (err) {
+      if (err.code === 'empty_plan_payload') {
+        return { ok: false, error: 'no_structured_output', detail: err.message };
+      }
+      return { ok: false, error: 'invalid_plan_payload', detail: err.message };
+    }
+  }
+
   // 生成方案草稿：1v1 咨询记录 → 契约 2 的 payload。
   //
   // **没有素材就完全不调模型**：返回 no_input，而不是让模型对着空气写一份
@@ -234,9 +254,15 @@ export function createAnalysisService({ callEngine, validators = {} }) {
       return { ok: false, error: 'engine_error', detail: err.message };
     }
 
+    // 二次分析用「软失败」：契约没过 ⇒ {ok:false, error:'invalid_plan_payload'}，
+    // 不抛错（adminRoutes 的二次分析那条路由按 result.error 分流状态码）。
+    const picked = pickPayloadSoft(result);
+    if (!picked.ok) {
+      return { ok: false, error: picked.error, detail: picked.detail };
+    }
     return {
       ok: true,
-      payload: pickPayload(result),
+      payload: picked.payload,
       usage: result.usage,
       promptVersion: result.promptVersion,
     };
