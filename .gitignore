@@ -36,9 +36,13 @@ pnpm-debug.log*
 # SQLite database
 #
 # ⚠️ 这里**必须锚定根目录**（写成 `/data/`），不能写 `data/`。
-# gitignore 的语义与 .dockerignore 一样：**不含斜杠的模式匹配任意层级** ——
-# `data/` 会把 `src/data/` 一起忽略掉，而 `src/data/stories.ts` 是前端源码
+# gitignore 的规则：**只有前导或中间带斜杠**的模式才相对本文件所在目录锚定；
+# **只带尾部斜杠不算锚定** —— 所以 `data/` 仍然在任意层级匹配，
+# 会把 `src/data/` 一起忽略掉，而 `src/data/stories.ts` 是前端源码
 # （src/pages/GlobeScene.tsx 与 src/pages/StoryPage.tsx 都 import 它）。
+#
+# ⚠️ 这跟 .dockerignore 的语义**正好相反**（那边不带斜杠只匹配根目录）——
+# 两个文件的规则方向不同，改一个别照抄另一个。
 # 后果：那个文件从来没被提交过 ⇒ 干净 clone / CI / 新 worktree 里
 # `npm run build` 直接失败（找不到模块）。本地能构建只是因为文件
 # 恰好躺在工作目录里。

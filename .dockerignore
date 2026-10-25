@@ -6,16 +6,28 @@ node_modules
 # 而里面有本地开发会话内容（可能是 PII）。运行时用的是 fly 卷 /data，
 # 镜像里带一份没有任何用处，只有泄漏风险。
 #
-# ⚠️ 这里**故意不用 `data` 这个模式**：Docker 的 .dockerignore 用的是
-# gitignore 式语义，**不含斜杠的模式会匹配任意层级** —— `data` 会连
-# `src/data/` 一起排除掉，而 src/data/stories.ts 是前端源码
-# （src/pages/GlobeScene.tsx 与 src/pages/StoryPage.tsx 都 import 它），
-# 排除它会让镜像里的 `RUN npm run build` 直接失败、部署被卡死。
-# 根目录 data/ 里只有 coco.db / coco.db-shm / coco.db-wal 三个文件，
-# 下面这三个模式已经全覆盖，而且**不可能**匹配到 stories.ts。
-*.db
-*.db-wal
-*.db-shm
+# ⚠️ Docker 的 .dockerignore 语义**与 gitignore 相反**（实测，Docker 29.2.1）：
+# 模式是拿**相对构建上下文的完整路径**去匹配的，所以**不带斜杠的模式只匹配
+# 根目录那一层** ——
+#   · `data` 只会命中根目录的 `data/`，**不会**命中 `src/data/`；
+#   · 但 `*.db` 也**匹配不到** `data/coco.db`（`*` 不跨 `/`）——
+#     本地库就在 `data/` 里，**不在根目录**。
+# ⇒ 之前那三个 `*.db` / `*.db-wal` / `*.db-shm` **其实没挡住**本地库：
+#   实测用当时那份 .dockerignore 构建，产出的镜像层里**带着 `data/coco.db`**。
+#   （注释里承诺的 PII 防护并没有生效 —— 这就是「注释说了不等于做到了」。）
+# ⇒ 现在双保险：
+#   · `/data/`  —— 锚定根目录的 `data/` 整个目录（coco.db / -wal / -shm 都在里面）；
+#   · `**/*.db` 系列 —— 兜住散落在任意深度的 .db（比如有人改了 DB_PATH）。
+#
+# ⚠️ 这套语义**不能搬到 .gitignore**：那边**只有前导或中间的斜杠**才锚定
+# 根目录，`data/` 这种只带尾部斜杠的**仍然**匹配任意层级 —— 所以 .gitignore
+# 里那条 `data/` 曾经误伤了 `src/data/`（前端源码 `src/data/stories.ts`
+# 从来没被提交过 ⇒ 干净 clone 之后 `npm run build` 必失败）。
+# 两个文件的规则**方向相反**，改之前先想清楚自己在改哪个。
+/data/
+**/*.db
+**/*.db-wal
+**/*.db-shm
 
 # 内部服务间密钥文件：绝不能进镜像。（.gitignore 已经挡了提交，
 # 但 dockerignore 是另一道闸 —— build context 是独立的。）
@@ -29,9 +41,10 @@ dist
 #   tests/   —— 测试用 node:test 跑，不需要进生产镜像
 #   scripts/ —— prompt:split 是开发期工具，构建与运行都用不到
 #
-# ⚠️ 同样注意：不含斜杠的模式匹配**任意层级**。这三个名字当前只在根目录
-# 出现（src/ 下没有同名的目录），所以安全；**将来在 src/ 下建了同名目录
-# 的话，这里要改成只锚定根目录的写法**。
+# ✅ 这三行按 Docker 的语义是**对的**：不带斜杠 ⇒ 只匹配根目录那一份，
+#    `src/` 下就算将来出现同名目录也**不会**被误排（我们要保留的是 src/）。
+#    反过来说，如果哪天想连嵌套的同名目录也排掉，要写 `**/docs` ——
+#    但那会把 `src/` 下的源码也排掉，那才是事故。
 docs
 tests
 scripts
