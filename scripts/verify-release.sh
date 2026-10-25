@@ -37,10 +37,10 @@ ctype() { curl -sS -m 30 -o /dev/null -w '%{content_type}' "$@"; }
 
 c=$(code "$URL/"); t=$(ctype "$URL/")
 [ "$c" = "200" ] && ok "GET / → 200 ($t)" || bad "GET / → $c"
-case "$t" in text/html*) ok "GET / 返回 HTML";; *) bad "GET / 返回 $t，不是 HTML";; esac
+case "$t" in text/html*) ok "GET / 返回 HTML";; *) bad "GET / 返回 ${t}，不是 HTML";; esac
 
 c=$(code "$URL/api/internal/ping"); t=$(ctype "$URL/api/internal/ping")
-[ "$c" = "401" ] && ok "ping 无 token → 401" || bad "ping 无 token → $c（期望 401）"
+[ "$c" = "401" ] && ok "ping 无 token → 401" || bad "ping 无 token → ${c}（期望 401）"
 case "$t" in application/json*) ok "ping 返回 JSON（真路由，不是 SPA 兜底）";; *) bad "ping 返回 $t —— 还是 SPA catch-all？";; esac
 
 if [ -f "$WORKDIR/.internal-token" ]; then
@@ -145,12 +145,12 @@ if [ -f "$ADMIN_PW_FILE" ]; then
   fi
   unset ADMIN_TOKEN
 else
-  bad "找不到 $ADMIN_PW_FILE，测不了 admin 侧"
+  bad "找不到 ${ADMIN_PW_FILE}，测不了 admin 侧"
 fi
 
 # 未登录的后台接口必须 401
 c=$(code "$URL/api/admin/clients")
-[ "$c" = "401" ] && ok "admin 未登录 → 401" || bad "admin 未登录 → $c（期望 401）"
+[ "$c" = "401" ] && ok "admin 未登录 → 401" || bad "admin 未登录 → ${c}（期望 401）"
 
 # 公开层：会话不存在 → has_plan:false（**零鉴权**，链接即凭证）
 c=$(code "$URL/api/conversations/nonexistent/plan")
@@ -158,11 +158,11 @@ c=$(code "$URL/api/conversations/nonexistent/plan")
 
 # 内部层：先认证再解析主体 —— 没 token 是 401（不是 404）
 c=$(code "$URL/api/internal/clients/by-external/nobody/plan")
-[ "$c" = "401" ] && ok "internal 无 token → 401" || bad "internal 无 token → $c（期望 401）"
+[ "$c" = "401" ] && ok "internal 无 token → 401" || bad "internal 无 token → ${c}（期望 401）"
 if [ -f "$WORKDIR/.internal-token" ]; then
   TOK=$(cat "$WORKDIR/.internal-token")
   c=$(code -H "Authorization: Bearer $TOK" "$URL/api/internal/clients/by-external/nobody/plan")
-  [ "$c" = "404" ] && ok "internal 带 token + 查不到人 → 404（先认证后解析）" || bad "internal → $c（期望 404）"
+  [ "$c" = "404" ] && ok "internal 带 token + 查不到人 → 404（先认证后解析）" || bad "internal → ${c}（期望 404）"
   unset TOK
 fi
 
