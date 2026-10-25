@@ -37,10 +37,10 @@ ctype() { curl -sS -m 30 -o /dev/null -w '%{content_type}' "$@"; }
 
 c=$(code "$URL/"); t=$(ctype "$URL/")
 [ "$c" = "200" ] && ok "GET / → 200 ($t)" || bad "GET / → $c"
-case "$t" in text/html*) ok "GET / 返回 HTML";; *) bad "GET / 返回 $t，不是 HTML";; esac
+case "$t" in text/html*) ok "GET / 返回 HTML";; *) bad "GET / 返回 ${t}，不是 HTML";; esac
 
 c=$(code "$URL/api/internal/ping"); t=$(ctype "$URL/api/internal/ping")
-[ "$c" = "401" ] && ok "ping 无 token → 401" || bad "ping 无 token → $c（期望 401）"
+[ "$c" = "401" ] && ok "ping 无 token → 401" || bad "ping 无 token → ${c}（期望 401）"
 case "$t" in application/json*) ok "ping 返回 JSON（真路由，不是 SPA 兜底）";; *) bad "ping 返回 $t —— 还是 SPA catch-all？";; esac
 
 if [ -f "$WORKDIR/.internal-token" ]; then
