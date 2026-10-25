@@ -109,6 +109,151 @@ function initSchema(db) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_knowledge_kind ON knowledge_entries(kind);
+
+    -- ── 交付模块的新表 ────────────────────────────────────────────
+    --
+    -- 这些表都还没上线过，所以直接改 CREATE TABLE 即可，不需要迁移脚本
+    -- （CREATE TABLE IF NOT EXISTS 对所有库都生效，旧库也会被补出缺的新表）。
+    -- 形状取自计划的最终版：Task 1 的六张表 + 增补 B.1 的轮次/来源列 +
+    -- 增补 D.0.2 的「圈 / 情景 / 靶子」+ 增补 D.2 的教练手法库 +
+    -- 增补 B.1 的交付项目表 journeys（它没有对外的 store，依赖的是这张表）。
+
+    CREATE TABLE IF NOT EXISTS clients (
+      id TEXT PRIMARY KEY,
+      display_name TEXT NOT NULL,
+      phone TEXT,
+      email TEXT,
+      source TEXT NOT NULL DEFAULT 'manual',   -- 'manual' | 'nomad_era'
+      external_id TEXT,
+      status TEXT NOT NULL DEFAULT 'active',   -- 'active' | 'archived'
+      notes TEXT,                              -- 教练私有备注，永不下发给用户端
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS stuck_points (
+      id TEXT PRIMARY KEY,
+      client_id TEXT REFERENCES clients(id),
+      source TEXT NOT NULL,                    -- 'chat' | 'manual' | 'extracted'
+      title TEXT NOT NULL,
+      belief TEXT,
+      evidence_against TEXT,                   -- JSON array
+      emotion TEXT,
+      micro_action TEXT,
+      raw_json TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS sessions_1v1 (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL REFERENCES clients(id),
+      transcript TEXT NOT NULL,
+      source TEXT,                             -- 'manual_paste' | 'whisper'
+      -- 下面几列是增补 B 加的：一次真人咨询有来源、日期、时长，
+      -- 还要知道它是为了哪个交付项目做的。
+      source_type TEXT NOT NULL DEFAULT 'paste', -- 'paste'|'feishu_link'|'recording_transcript'
+      source_url TEXT,                          -- 飞书文档链接 / 腾讯视频链接
+      occurred_at TEXT,                         -- 咨询发生的时间
+      duration_minutes INTEGER,                -- 1 小时 = 60
+      journey_id TEXT,                          -- 这次咨询服务于哪个交付项目
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS plans (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL REFERENCES clients(id),
+      stuck_point_id TEXT,
+      status TEXT NOT NULL DEFAULT 'draft',    -- 'draft'|'pending_activation'|'active'|'archived'
+      version INTEGER NOT NULL DEFAULT 1,
+      payload TEXT NOT NULL,                   -- 契约 2 的 JSON（内容真相源）
+      diagnosis_md TEXT,                       -- 教练手写补充
+      -- 下面几列是增补 B 加的：诊断会做很多轮，一轮改一版。
+      round INTEGER NOT NULL DEFAULT 1,        -- 第几轮诊断（1v1 之后会是第 2 轮）
+      supersedes_id TEXT,                      -- 这一轮取代哪一份旧方案
+      source_session_id TEXT,                  -- 这一轮是基于哪一次 1v1 做的
+      journey_id TEXT,                         -- 这一轮是为哪个交付项目做的
+      mode TEXT NOT NULL DEFAULT 'sequence',   -- 'sequence'|'daily_repeat'
+      repeat_days INTEGER,                     -- mode='daily_repeat' 时：同一个圈跑几天
+      created_at TEXT NOT NULL,
+      published_at TEXT,
+      activated_at TEXT,
+      archived_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS practices (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL REFERENCES plans(id),
+      day INTEGER,
+      title TEXT NOT NULL,
+      intent TEXT,
+      action TEXT,
+      evidence_prompt TEXT,
+      success_criteria TEXT,
+      circle TEXT,                            -- 用的是哪个圈（教练手法库的一条）
+      scenario TEXT,                          -- 这一天切入的具体情景
+      target_belief TEXT,                     -- 这一天针对的外周信念名
+      custom_data TEXT,                       -- 教练手工补充的个性化数据（契约 2 的 D5）
+      sort_order INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS evidences (
+      id TEXT PRIMARY KEY,
+      practice_id TEXT NOT NULL REFERENCES practices(id),
+      client_id TEXT NOT NULL REFERENCES clients(id),
+      content TEXT NOT NULL,
+      occurred_at TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS coach_moves (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,                     -- 圈/手法的名字，唯一
+      summary TEXT NOT NULL,                  -- 一句话：这一手在干什么
+      when_to_use TEXT,                       -- 适用情景
+      script TEXT,                            -- 教练的原话脚本
+      targets TEXT,                           -- JSON array：它打的是哪类信念
+      tags TEXT,                              -- JSON array
+      active INTEGER NOT NULL DEFAULT 1,      -- 0 = 归档（不物理删：方案里引用过它）
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    -- 交付项目：教练在外部平台（workbuddy 等）做出来、发给来访者的东西。
+    --
+    -- **为什么要单独一张表，而不是塞进 plans：** 交付物和诊断方案是两种东西。
+    -- 方案是我们系统里生成的、逐条可回填的；交付物是教练手工做的一份完整文档
+    -- （游学手册、练习稿），它的正文在外部平台上，**我们只做留档**。
+    --
+    -- **为什么要存 snapshot_md：** 外部平台的链接是**可变的** —— 同一个 URL 会被
+    -- 覆盖成新一版。只存 URL 等于什么都没存。
+    CREATE TABLE IF NOT EXISTS journeys (
+      id TEXT PRIMARY KEY,
+      client_id TEXT NOT NULL,
+      title TEXT NOT NULL,                    -- '5 天大理游学' / '14 天核心信念练习'
+      kind TEXT NOT NULL DEFAULT 'other',     -- 'study_tour'|'practice_program'|'other'
+      source TEXT NOT NULL DEFAULT 'workbuddy', -- 'workbuddy'|'manual'
+      url TEXT,                               -- 外部链接（可空）
+      snapshot_md TEXT,                       -- 内容快照（留档用，链接会变）
+      status TEXT NOT NULL DEFAULT 'active',  -- 'planned'|'active'|'completed'|'archived'
+      phase_note TEXT,                        -- '第一阶段：入住 WeStream 空间'
+      started_at TEXT,
+      ended_at TEXT,
+      notes TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_external
+      ON clients(external_id) WHERE external_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_stuck_points_client ON stuck_points(client_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_1v1_client ON sessions_1v1(client_id);
+    CREATE INDEX IF NOT EXISTS idx_plans_client ON plans(client_id);
+    CREATE INDEX IF NOT EXISTS idx_practices_plan ON practices(plan_id);
+    CREATE INDEX IF NOT EXISTS idx_evidences_practice ON evidences(practice_id);
+    CREATE INDEX IF NOT EXISTS idx_evidences_client ON evidences(client_id);
+    CREATE INDEX IF NOT EXISTS idx_journeys_client ON journeys(client_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_coach_moves_name ON coach_moves(name);
+    CREATE INDEX IF NOT EXISTS idx_coach_moves_active ON coach_moves(active);
   `);
 
   // 建表语句里的 CREATE TABLE IF NOT EXISTS 对**所有**库都生效 —— 新库建出

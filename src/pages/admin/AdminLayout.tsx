@@ -1,12 +1,11 @@
-import { useState, useEffect } from 'react';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
+import { useState } from 'react';
+import { Outlet, NavLink } from 'react-router-dom';
 import { adminLogin } from '../../lib/api';
 
 export function AdminLayout() {
   const [authed, setAuthed] = useState(!!sessionStorage.getItem('admin_token'));
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
-  const navigate = useNavigate();
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,6 +59,8 @@ export function AdminLayout() {
           <h1 className="font-bold text-gray-800">Coco Admin</h1>
           <nav className="flex gap-1">
             <NavLink to="/admin" end className={linkClass}>对话列表</NavLink>
+            <NavLink to="/admin/clients" className={linkClass}>客户</NavLink>
+            <NavLink to="/admin/coach-moves" className={linkClass}>手法库</NavLink>
             <NavLink to="/admin/create-link" className={linkClass}>生成链接</NavLink>
             <NavLink to="/admin/stats" className={linkClass}>统计面板</NavLink>
           </nav>

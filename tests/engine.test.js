@@ -640,7 +640,11 @@ test('reply 会去掉首尾空白', async () => {
 test('注入的上下文有总量上限，超出时明确标注被截断', async () => {
   // 逐值上限管不住条目数 —— 检索返回多少条不是我们决定的。
   // 超出总量闸门时必须标注，不能静默砍掉。
-  const knowledge = Array.from({ length: 30 }, (_, i) => ({
+  //
+  // ⚠️ 条目数要按**当前**的总量闸门（20000 字）算：30 条 × 200 字 ≈ 6000，
+  // 早就落在预算里了，闸门根本不会触发，标注也就不会出现 ——
+  // 那时这条测试「绿」不是因为对，是因为没测到东西。
+  const knowledge = Array.from({ length: 120 }, (_, i) => ({
     kind: 'case',
     title: `条目${i}`,
     content: 'w'.repeat(200),
@@ -648,7 +652,7 @@ test('注入的上下文有总量上限，超出时明确标注被截断', async
   const prompt = await captureSystemPrompt({ knowledge });
   assert.ok(prompt.includes('已截断'));
   // 被砍掉的部分不能整段留在 prompt 里
-  assert.ok(prompt.length < 6000);
+  assert.ok(prompt.length < 21000, `注入段长度 ${prompt.length} 超过了总量闸门`);
 });
 
 test('注入的上下文没超总量上限时不加截断标注', async () => {
@@ -813,7 +817,8 @@ test('注入组件自己抛的错不被包成引擎错误', async () => {
 // ---------------------------------------------------------------------------
 
 test('注入段超上限时，卡点段完整保留，被截断的是知识库那段', async () => {
-  const knowledge = Array.from({ length: 30 }, (_, i) => ({
+  // 120 条 × 200 字 ≈ 24000 > 总量闸门 20000 —— 闸门会真的触发。
+  const knowledge = Array.from({ length: 120 }, (_, i) => ({
     kind: 'case',
     title: `条目${i}`,
     content: 'w'.repeat(200),
@@ -822,14 +827,14 @@ test('注入段超上限时，卡点段完整保留，被截断的是知识库�
     stuckPoint: { title: '我不能停下来', belief: '停下来就会被抛弃', evidence_against: ['我上周完成了整周冥想'] },
     knowledge,
   });
-  // 卡点段在最前面，完整保留
+  // 卡点段排在知识库前面，完整保留
   assert.ok(prompt.includes('--- 这位来访者当前的卡点（已确认）---'));
   assert.ok(prompt.includes('卡点：我不能停下来'));
   assert.ok(prompt.includes('限制性信念：停下来就会被抛弃'));
   assert.ok(prompt.includes('已有的反向证据：我上周完成了整周冥想'));
   // 被砍掉的是知识库的尾巴
   assert.ok(prompt.includes('已截断'));
-  assert.ok(!prompt.includes('条目29'));
+  assert.ok(!prompt.includes('条目119'));
 });
 
 // ---------------------------------------------------------------------------

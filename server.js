@@ -17,6 +17,18 @@ import {
 import { statusForEngineError, errorBodyForStatus } from './server/errorStatus.js';
 import { asyncRoute } from './server/asyncRoute.js';
 import { createRequireAdmin, createRequireInternal } from './server/auth.js';
+// 交付模块（教练分析 + 用户端练习跟进）。
+//
+// ⚠️ **依赖方向只能是单向的**：server.js → delivery/*.js → auth.js / db.js。
+// delivery/* **绝不能**从 server.js import 任何东西 —— 反向 import 就是循环依赖。
+// 所以中间件（requireAdmin / requireInternal）在 server.js 里造好、当参数传进去。
+import { createClientStore } from './server/delivery/clients.js';
+import { createPlanStore } from './server/delivery/plans.js';
+import { createCoachMoveStore, SEED_MOVES } from './server/delivery/coachMoves.js';
+import { createAnalysisService, createDeliveryData } from './server/delivery/analysis.js';
+import { createAdminDeliveryRouter } from './server/delivery/adminRoutes.js';
+import { createUserDeliveryRouter } from './server/delivery/userRoutes.js';
+import { createInternalUserDeliveryRouter } from './server/delivery/internalUserRoutes.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -100,6 +112,34 @@ const cbtEngine = createCbtEngine({
   // 白名单也是 —— 三者不会漂。
   schemas: STRUCTURED_SCHEMAS,
 });
+
+// --- 交付模块的依赖装配 ---
+//
+// 放在 cbtEngine 之后：分析服务要调它。
+const clientStore = createClientStore({ db });
+const planStore = createPlanStore({ db });
+const coachMoveStore = createCoachMoveStore({ db });
+const deliveryData = createDeliveryData({ db });
+const analysisService = createAnalysisService({
+  callEngine: cbtEngine,
+  validators: STRUCTURED_VALIDATORS,
+});
+// 分析服务本身不碰数据库（它只跑模型），1v1 记录与卡点的存取属于
+// 「交付域的数据存取」—— 挂上去，adminRoutes 就只需要 analysis 一个依赖。
+analysisService.saveSession = deliveryData.saveSession;
+analysisService.getSession = deliveryData.getSession;
+analysisService.getLatestSession = deliveryData.getLatestSession;
+analysisService.listSessionsForClient = deliveryData.listSessionsForClient;
+analysisService.getLatestStuckPoint = deliveryData.getLatestStuckPoint;
+
+// 教练手法库的种子数据。
+//
+// **幂等**（按名字跳过已存在的），所以每次启动跑一遍是安全的 ——
+// 线上已经有的手法不会被种子覆盖，教练在后台改写过的也保得住。
+// 只在「库里一条都没有」时灌，避免每次启动都去查表。
+if (coachMoveStore.list({ activeOnly: false }).length === 0) {
+  coachMoveStore.seed(SEED_MOVES);
+}
 
 // Clean up expired admin sessions on startup
 db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(new Date().toISOString());
@@ -809,6 +849,31 @@ app.delete('/api/stories/:id', (req, res) => {
   db.prepare('DELETE FROM stories WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
+
+// --- 交付模块的路由（教练后台 + 用户端练习跟进）---
+//
+// ⚠️ **必须挂在 express.static 与 SPA 兜底（app.get('*')）之前** ——
+// 挂在后面的话，/api/admin/... 会被 SPA 兜底接走，回给前端一个 index.html
+// （前端拿到 HTML 而不是 JSON，错误信息还特别难查）。
+app.use('/api/admin', createAdminDeliveryRouter({
+  clients: clientStore,
+  plans: planStore,
+  analysis: analysisService,
+  moves: coachMoveStore,
+  requireAdmin,
+  db,
+}));
+
+// 公开层：链接即凭证（试点期网页走这条）。
+app.use(createUserDeliveryRouter({ db, plans: planStore }));
+
+// 内部层：Bearer service token（微信云函数 BFF 走这条）。
+// 鉴权中间件由 server.js 注入 —— 服务间密钥只有一个权威（server/auth.js）。
+app.use(createInternalUserDeliveryRouter({
+  db,
+  plans: planStore,
+  requireInternal,
+}));
 
 // Serve static files from the dist directory
 app.use(express.static(path.join(__dirname, 'dist')));
