@@ -286,6 +286,26 @@ const MAX_CLIENT_ID_LENGTH = 128;
 // 所以上限必须在**任何写库 / 调模型之前**生效。
 const MAX_CONVERSATION_ID_LENGTH = 128;
 
+// conversation_id 的**字符集**上限。
+//
+// 长度上限管不住「里面的字符」。conversation_id 会**原样**进
+// `X-Conversation-Id` 响应头，而 Node 的 setHeader 拒绝控制字符
+// （含 \n / \r / \0）—— 抛的是 ERR_INVALID_CHAR。
+//
+// 失败顺序很要命（本分支是「先落库、再吐流」）：
+//   校验 → 建会话 → 写用户消息 → **调模型（花钱）** → 落库 →
+//   streamReply 里 setHeader 才炸。
+// 所以一个 'a\nb' 会：用户拿到 500、库里留下孤儿会话与孤儿消息、
+// 模型的钱**已经付了**。而这个端点是公开的 —— 可以重复放大成本。
+//
+// 所以字符集必须在**任何写库 / 调模型之前**拒掉。
+//
+// 我们自己的会话 id 是 crypto.randomUUID()（36 字符，形如
+// xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx），只有十六进制与连字符；
+// 前端把服务端返回的 id 原样回传（src/lib/api.ts:39）。
+// 允许集因此取 URL / 响应头都安全的 ASCII：字母、数字、. _ ~ -。
+const CONVERSATION_ID_PATTERN = /^[A-Za-z0-9._~-]+$/;
+
 // --- client_id 与「会话归属」---
 //
 // client_id 是**客户端自报**的标识，**不是凭证**：
@@ -388,6 +408,17 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
       return res
         .status(400)
         .json({ error: `conversation_id 超过 ${MAX_CONVERSATION_ID_LENGTH} 字符上限` });
+    }
+    // 字符集检查：它会原样进 X-Conversation-Id 响应头，而 Node 拒绝
+    // 响应头里的控制字符（\n / \r / \0 …）—— setHeader 会抛
+    // ERR_INVALID_CHAR。而这一步发生在**模型调用之后**（本分支先落库、
+    // 再吐流），所以不挡在这里就是「模型已经计费、然后 500」。
+    // 详见 CONVERSATION_ID_PATTERN 的注释。
+    if (!CONVERSATION_ID_PATTERN.test(conversation_id)) {
+      return res.status(400).json({
+        error:
+          'conversation_id 含有非法字符（只允许字母、数字、. _ ~ -）',
+      });
     }
   }
 

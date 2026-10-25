@@ -115,6 +115,108 @@ test('migrateSchema 可以重复执行（启动时每次都会跑）', () => {
   }
 });
 
+// ---------------------------------------------------------------------------
+// 并发 ALTER 的竞态
+//
+// PRAGMA table_info → ALTER TABLE ADD COLUMN 是 check-then-act，
+// **不是**跨进程原子的。fly 的滚动部署可能短暂有两个机器同时对着
+// 同一个卷跑迁移：两边都看到「这列还没有」，都去 ADD COLUMN，
+// **输掉**的那一个拿到 SQLite 的 `duplicate column name: xxx`。
+//
+// 那恰恰是想要的结果（列已经被另一个进程加上了）。所以 migrateSchema
+// 必须把它当成成功继续 —— 否则 getDb() 抛错 → server.js 的模块级
+// `const db = getDb()` 在 listen 之前就抛 → 进程退出 → crash loop。
+// ---------------------------------------------------------------------------
+
+// 一个「只会把某一条 ALTER 打成 duplicate column name」的假 db。
+//
+// 用的错误对象是 better-sqlite3 真的从 SQLite 抛出来的那一个
+// （SqliteError，code === 'SQLITE_ERROR'），不是自己拼的字面量 ——
+// 判据必须对着真实错误对象成立。
+function withDuplicateColumnOn(db, table, column) {
+  const needle = `ALTER TABLE ${table} ADD COLUMN ${column}`;
+  const realExec = db.exec.bind(db);
+  db.exec = (sql) => {
+    if (typeof sql === 'string' && sql.includes(needle)) {
+      const err = new Error(`duplicate column name: ${column}`);
+      err.name = 'SqliteError';
+      err.code = 'SQLITE_ERROR';
+      throw err;
+    }
+    return realExec(sql);
+  };
+  return db;
+}
+
+test('并发 ALTER 撞车（duplicate column name）→ 当成成功，继续补剩下的列', () => {
+  const { db, file } = createLegacyDb();
+  try {
+    // 模拟：我们在 conversations.client_id 这一步输了竞态。
+    withDuplicateColumnOn(db, 'conversations', 'client_id');
+    assert.doesNotThrow(() => migrateSchema(db), 'duplicate column 不该让启动崩掉');
+    // 关键：不是「整段跳过」—— 后面的列照样补上了。
+    assert.deepEqual(columnNames(db, 'messages'), EXPECTED_MESSAGE_COLUMNS.slice().sort());
+    assert.deepEqual(columnNames(db, 'token_usage'), EXPECTED_TOKEN_USAGE_COLUMNS.slice().sort());
+    // conversations 里除了 client_id（我们输掉的那一步）之外都补齐了
+    assert.deepEqual(
+      columnNames(db, 'conversations').filter(c => c !== 'client_id'),
+      EXPECTED_CONVERSATION_COLUMNS.slice().sort().filter(c => c !== 'client_id')
+    );
+  } finally {
+    db.close();
+    try {
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch {
+      /* 清理失败不影响断言 */
+    }
+  }
+});
+
+test('ALTER 真的失败（不是 duplicate column）→ 照旧抛错，且带中文说明', () => {
+  // 两种「真的失败」，都要照旧抛出去：
+  //   1. code 是 SQLITE_READONLY（只读卷）—— code 就不是 SQLITE_ERROR；
+  //   2. code 是 SQLITE_ERROR，但 message 是别的东西（磁盘 I/O 之类）——
+  //      code 对上了，**message 对不上**。
+  // 第 2 种才是真正在钉「不能只看 code 就放行」。
+  const cases = [
+    { code: 'SQLITE_READONLY', message: 'attempt to write a readonly database' },
+    { code: 'SQLITE_ERROR', message: 'disk I/O error' },
+  ];
+  for (const { code, message } of cases) {
+    const { db, file } = createLegacyDb();
+    try {
+      const realExec = db.exec.bind(db);
+      db.exec = (sql) => {
+        if (typeof sql === 'string' && sql.includes('ALTER TABLE')) {
+          const err = new Error(message);
+          err.name = 'SqliteError';
+          err.code = code;
+          throw err;
+        }
+        return realExec(sql);
+      };
+      assert.throws(
+        () => migrateSchema(db),
+        (err) => {
+          assert.match(err.message, /migrateSchema/);
+          assert.match(err.message, /conversations/);
+          assert.match(err.message, /client_id/);
+          assert.match(err.message, new RegExp(message.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+          return true;
+        },
+        `${code} / ${message} 应当照旧抛错`
+      );
+    } finally {
+      db.close();
+      try {
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      } catch {
+        /* 清理失败不影响断言 */
+      }
+    }
+  }
+});
+
 test('老库补出来的列有正确的默认值（scenario 默认 chat）', () => {
   const { db, file } = createLegacyDb();
   try {

@@ -13,6 +13,7 @@ import './helpers/testEnv.js';
 import { test, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import { createServer } from './helpers/testServer.js';
 import { resetDb } from './helpers/testDb.js';
 import { getDb } from '../db.js';
@@ -615,6 +616,113 @@ test('conversation_id 是空串 → 400', { timeout: 15000 }, async () => {
   });
   assert.equal(res.status, 400);
   assert.equal(rows('SELECT * FROM conversations').length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// I-1：conversation_id 的**字符集**
+//
+// conversation_id 会**原样**进 `X-Conversation-Id` 响应头。Node 的
+// setHeader 拒绝控制字符（\n / \r / \0 …）—— 抛 ERR_INVALID_CHAR。
+//
+// 而本分支的顺序是「先落库、再吐流」：setHeader 发生在**模型调用之后**。
+// 所以一个 'a\nb' 会走完：建会话 → 写用户消息 → **调模型（花钱）** →
+// 落库 → setHeader 炸 → 500。用户拿到 500，库里留下孤儿会话与孤儿消息，
+// 模型的钱已经付了。而且这是公开端点 —— 可以重复放大成本。
+//
+// 所以字符集必须在**任何写库 / 调模型之前**拒掉：400，且模型没被叫醒。
+// ---------------------------------------------------------------------------
+
+test('conversation_id 含换行 → 400（不建会话、不写消息、**不调模型**）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      conversation_id: 'a\nb',
+    });
+    assert.equal(res.status, 400);
+    // 关键断言：模型不能被叫醒 —— 那一步是要花钱的。
+    assert.equal(modelCalled, false, '请求不合法却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '留下了孤儿会话');
+    assert.equal(countMessages(), 0, '留下了孤儿消息');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('conversation_id 含控制字符（\\r / \\0）→ 400（不调模型）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    for (const bad of ['a\rb', 'a\u0000b']) {
+      const { res } = await postChat({
+        messages: [{ role: 'user', content: '你好' }],
+        conversation_id: bad,
+      });
+      assert.equal(res.status, 400, `conversation_id=${JSON.stringify(bad)} 应该 400`);
+      assert.equal(modelCalled, false, '请求不合法却调了模型');
+      assert.equal(rows('SELECT * FROM conversations').length, 0);
+      assert.equal(countMessages(), 0);
+    }
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('conversation_id 含空格 → 400（不调模型）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    for (const bad of ['a b', ' abc', 'abc ']) {
+      const { res } = await postChat({
+        messages: [{ role: 'user', content: '你好' }],
+        conversation_id: bad,
+      });
+      assert.equal(res.status, 400, `conversation_id=${JSON.stringify(bad)} 应该 400`);
+      assert.equal(modelCalled, false, '请求不合法却调了模型');
+      assert.equal(rows('SELECT * FROM conversations').length, 0);
+      assert.equal(countMessages(), 0);
+    }
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('conversation_id 是合法 UUID → 正常走完（不是 400）', { timeout: 15000 }, async () => {
+  // 我们自己的会话 id 就是 crypto.randomUUID()（server.js 的 generateId），
+  // 前端把它原样回传（src/lib/api.ts:39）。所以 UUID **必须**能过 ——
+  // 字符集检查不是要把正常的会话挡在门外。
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('好的。');
+  };
+  try {
+    const uuid = crypto.randomUUID();
+    const { res } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+      conversation_id: uuid,
+    });
+    assert.notEqual(res.status, 400, `合法 UUID 被拒了：${uuid}`);
+    assert.equal(res.status, 200);
+    assert.equal(modelCalled, true, '合法 UUID 没有走到模型');
+    // 会话按这个 id 建出来了
+    assert.equal(rows('SELECT * FROM conversations').length, 1);
+    assert.equal(rows('SELECT * FROM conversations')[0].id, uuid);
+    // 响应头里也是同一个值（这就是 setHeader 能接受它的原因）
+    assert.equal(res.headers.get('x-conversation-id'), uuid);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
 });
 
 // ---------------------------------------------------------------------------

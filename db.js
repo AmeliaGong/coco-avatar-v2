@@ -146,6 +146,23 @@ export function migrateSchema(db) {
       try {
         db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
       } catch (err) {
+        // 并发 ALTER 的竞态：check-then-act 不是原子的。
+        //
+        // fly 的滚动部署可能短暂有两个机器同时对着同一个卷跑迁移：
+        // 两边都看到「这列还没有」，都去 ADD COLUMN，**输的那个**拿到
+        // SQLite 的 `duplicate column name: xxx`。
+        //
+        // 那恰恰是我们想要的结果（列已经存在了）—— 所以当成成功继续，
+        // 而不是抛错。抛错的话 getDb() 会抛，server.js 的模块级
+        // `const db = getDb()` 会在 listen 之前就抛 → 进程退出 →
+        // crash loop → 整站不可用。
+        //
+        // 判据用 better-sqlite3 抛出来的**错误对象**（code === 'SQLITE_ERROR'
+        // 且 message 含 'duplicate column name'），不是自己拼的字符串 ——
+        // 其它任何失败（磁盘满、只读卷、表损坏）都必须照旧抛出去。
+        if (isDuplicateColumnError(err)) {
+          continue;
+        }
         throw new Error(
           `migrateSchema：给 ${table} 补列 ${column} 失败（${
             err && err.message ? err.message : err
@@ -154,4 +171,24 @@ export function migrateSchema(db) {
       }
     }
   }
+}
+
+// 「这列已经存在了」—— 也就是并发 ALTER 时我们**输掉**的那一次。
+//
+// better-sqlite3 把 SQLite 的错误原样抛出来：一个 SqliteError，
+// `code === 'SQLITE_ERROR'`，`message` 形如
+// `duplicate column name: client_id`。
+//
+// 两个条件都要满足才认：
+//   - code === 'SQLITE_ERROR'：确认它真的是 SQLite 抛的，不是别处伪造的；
+//   - message 里含 'duplicate column name'：确认是「列已存在」这一种，
+//     而不是别的 SQLITE_ERROR（比如只读卷上的 "attempt to write a readonly database"）。
+//
+// 任何其它错误都必须照旧抛出 —— 把启动期的硬失败变成静默跳过，
+// 只会让「迁移没生效」这件事更难查。
+function isDuplicateColumnError(err) {
+  if (!err || typeof err !== 'object') return false;
+  if (err.code !== 'SQLITE_ERROR') return false;
+  const message = typeof err.message === 'string' ? err.message : '';
+  return message.includes('duplicate column name');
 }
