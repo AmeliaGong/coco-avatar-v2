@@ -2232,11 +2232,31 @@ feat(api): 交付模块后台接口 —— 客户/粘贴1v1/生成方案/编辑/
 
 **Files:**
 - Create: `server/delivery/progress.js`
-- Create: `server/delivery/userRoutes.js`
+- Create: `server/delivery/userService.js` ← **唯一的业务逻辑**
+- Create: `server/delivery/userRoutes.js` ← 公开路由（链接即凭证）
+- Create: `server/delivery/internalUserRoutes.js` ← BFF 路由（Bearer service token）
 - Modify: `server.js`（挂载路由）
 - Test: `tests/api.delivery-user.test.js`
 
 **权限模型：沿用现有的「链接即凭证」。** 用户打开 `/c/:id` 就能读到该会话所属客户的方案 —— 与现在「打开链接就能看聊天记录」是同一套信任模型。**但用户端接口永远不返回 `clients.notes`**（教练私有备注）。
+
+> **一套 service + 两层路由（这条是硬要求，不是建议）。**
+>
+> Coco 已定：WeStream 小程序是统一入口，游民纪元 + Coco Avatar 都在里面；而小程序**不能直连 Coco Avatar**（`fly.dev` 无法 ICP 备案，微信 request 合法域名要求已备案），只能走**微信云函数 BFF** → Coco Avatar 的 `/api/internal/*`。
+>
+> 所以用户端的四个动作 —— **读方案 / 今天做哪张卡 / 证据回填 / 进度计算** —— 必须这样组织：
+>
+> ```
+> server/delivery/userService.js   ← 唯一的业务逻辑（读方案、算进度、落证据）
+>        ├── userRoutes.js         ← 公开路由：链接即凭证，按 conversation_id
+>        └── internalUserRoutes.js ← BFF 路由：Bearer service token，按 client_id
+> ```
+>
+> **逻辑不许在路由层写第二遍。** 12 月小程序那条线如果自己算一遍进度，就会和试点期算出不一样的结果 —— 而"进度不一样"是用户直接看得见的错（今天显示第 3 天、教练那边显示第 4 天）。这一层的路由差异只有**「拿哪个 id 找人」**和**「用哪种鉴权」**两件事。
+>
+> **两条都要做的安全约束**：`clients.notes`（教练私有备注）**两条路由都不许返回** —— internal 那条尤其要小心：**小程序是给用户看的**，BFF 的 service token 只证明"这是 WeStream 的后端"，不证明"这个调用者有权看教练备注"。要传的字段要在 service 层就列成白名单，不是"先查全表再删掉几个字段"。
+>
+> **internal 那层的具体形状（路径、字段名）待 12 月契约 3 定稿**（契约 3 那两个端点的形态还没定）。但**这一轮的 service 拆分要一次做对** —— 12 月接 BFF 时只写路由适配层，不动业务逻辑。
 
 - [ ] **Step 1: 写失败的测试**
 
