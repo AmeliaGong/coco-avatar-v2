@@ -117,6 +117,18 @@ export function PlanPage() {
   const isActive = view?.status === 'active';
   const isAllDone = progress.total > 0 && progress.completed >= progress.total;
 
+  /**
+   * 「这一期只交付诊断」—— 练习列表是空的。
+   *
+   * 契约 2 允许 `worth_practicing: false`：模型判断这位来访者现在最需要的
+   * 不是长期练习。那种方案**不是坏数据**，但不能显示成「给你准备了一份
+   * 练习」再让人点「开始练习」—— 点了之后没有卡可做、也没法打卡，死路。
+   *
+   * 判断用两个信号（任一成立即是）：后端说 worth_practicing=false，
+   * 或者这张方案确实一张卡都没有。
+   */
+  const isDiagnosisOnly = view?.worth_practicing === false || cards.length === 0;
+
   // 展开状态：默认展开今天那张；用户手动点开别的卡时以用户为准。
   const expandedId = openId ?? currentCard?.id ?? null;
 
@@ -280,19 +292,31 @@ export function PlanPage() {
           {/* 还没开始 */}
           {isPending && (
             <section className="bg-white rounded-2xl shadow-sm border border-warm-grey/20 p-6 text-center space-y-4">
-              <p className="text-gray-700">给你准备了一份练习，随时可以开始。</p>
-              {view.diagnosis?.core_belief && (
-                <p className="text-sm text-gray-500">
-                  这次主要松动的是：{view.diagnosis.core_belief}
-                </p>
+              {isDiagnosisOnly ? (
+                <>
+                  <p className="text-gray-700">这一期先只做诊断，暂时不用打卡。</p>
+                  <p className="text-sm text-gray-500">
+                    教练会在对话里跟你一起过一遍这次看到的东西 ——
+                    等练习准备好了，这里会出现今天要做的卡。
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p className="text-gray-700">给你准备了一份练习，随时可以开始。</p>
+                  {view.diagnosis?.core_belief && (
+                    <p className="text-sm text-gray-500">
+                      这次主要松动的是：{view.diagnosis.core_belief}
+                    </p>
+                  )}
+                  <button
+                    onClick={handleStart}
+                    disabled={busy}
+                    className="px-6 py-2.5 bg-sage text-white rounded-xl text-sm disabled:opacity-40 hover:bg-olive-green transition"
+                  >
+                    开始练习
+                  </button>
+                </>
               )}
-              <button
-                onClick={handleStart}
-                disabled={busy}
-                className="px-6 py-2.5 bg-sage text-white rounded-xl text-sm disabled:opacity-40 hover:bg-olive-green transition"
-              >
-                开始练习
-              </button>
             </section>
           )}
 
@@ -300,6 +324,17 @@ export function PlanPage() {
             <section className="bg-white rounded-2xl shadow-sm border border-warm-grey/20 p-6">
               <p className="text-gray-700">
                 这一轮练习都做完了。你可以在对话里跟我说说它的感觉。
+              </p>
+            </section>
+          )}
+
+          {/* 已开始、但这一期没有练习可做 —— 说清楚，而不是留一个空页 */}
+          {isActive && isDiagnosisOnly && (
+            <section className="bg-white rounded-2xl shadow-sm border border-warm-grey/20 p-6">
+              <p className="text-gray-700">这一期先只做诊断，暂时不用打卡。</p>
+              <p className="text-sm text-gray-500 mt-2">
+                教练会在对话里跟你一起过一遍这次看到的东西 ——
+                等练习准备好了，这里会出现今天要做的卡。
               </p>
             </section>
           )}

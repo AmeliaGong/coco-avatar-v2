@@ -263,6 +263,15 @@ export interface CoachMove {
 export interface UserPlanResponse {
   has_plan: boolean;
   status?: string;
+  /**
+   * 这一轮**只交付诊断**（不生成练习）吗？
+   *
+   * 契约 2 里 `worth_practicing: false` = 「模型判断这位来访者现在
+   * 最需要的不是长期练习」—— 于是练习列表是空的。这种方案**不是坏数据**，
+   * 但用户端不能把它显示成「给你准备了一份练习」再让人点「开始练习」：
+   * 点了之后没有卡可做、也没法打卡 —— 那是死路。
+   */
+  worth_practicing?: boolean;
   vision?: { title: string; narrative: string; horizon: string };
   diagnosis?: any;
   practices?: Array<{

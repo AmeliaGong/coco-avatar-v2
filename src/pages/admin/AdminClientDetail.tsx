@@ -218,8 +218,22 @@ export function AdminClientDetail() {
     setError('');
     setMessage('');
     try {
-      await adminGeneratePlan(id!);
-      setMessage('方案草稿已生成，去「方案」一节确认后发布');
+      const r: any = await adminGeneratePlan(id!);
+      // 「这一期只交付诊断」是要说清楚的：契约 2 允许
+      // worth_practicing=false（模型判断现在不需要长期练习），
+      // 那时练习列表是空的 —— 教练不看到提示，会以为生成失败。
+      const payload =
+        typeof r?.plan?.payload === 'string'
+          ? JSON.parse(r.plan.payload)
+          : (r?.plan?.payload || {});
+      if (payload.worth_practicing === false) {
+        setMessage(
+          '方案草稿已生成，但模型判断「这一期只做诊断、暂时不用练习」—— 练习列表是空的。' +
+            '你可以在方案编辑器里手动补卡，也可以就这么发给他。'
+        );
+      } else {
+        setMessage('方案草稿已生成，去「方案」一节确认后发布');
+      }
       await load();
     } catch (e) {
       setError((e as Error).message);
