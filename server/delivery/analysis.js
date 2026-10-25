@@ -43,6 +43,13 @@ async function loadTranscriptModule() {
   return transcriptModule;
 }
 
+// 没有平台对话历史时补的那条 user 轮。
+//
+// **它不是素材** —— 只是把「现在要做什么」说清楚。具体要求在
+// prompts/scenario.analysis.md 里（不寒暄、诊断要具体、信念系统、…），
+// 这条只负责把任务指向那份材料。
+const ANALYSIS_TURN = '请阅读上面给出的材料（1v1 转写、卡点、教练手法），完成这一轮教练分析，并按系统消息里要求的 JSON 结构输出。';
+
 export function createAnalysisService({ callEngine, validators = {} }) {
   if (!callEngine) throw new Error('createAnalysisService 需要 callEngine');
 
@@ -101,7 +108,17 @@ export function createAnalysisService({ callEngine, validators = {} }) {
     try {
       return await callEngine({
         scenario: 'analysis',
-        history,
+        // ⚠️ **至少要有一条 user 消息。**
+        //
+        // 网关（MiniMax）拒绝「只有 system、没有 user」的请求：
+        // 2013 invalid params, chat content is empty。
+        // 分析场景的素材（1v1 转写、卡点、手法）走的是**注入通道**，
+        // 也就是进了 system prompt —— 于是「没有平台对话历史」时
+        // messages 就是空的，请求直接被网关拒。
+        //
+        // 所以这里补一条固定的**任务指令**当 user 轮：它不是素材，
+        // 只是把「现在要做什么」说清楚（分析要求本身在 scenario prompt 里）。
+        history: history.length ? history : [{ role: 'user', content: ANALYSIS_TURN }],
         clientContext: {
           transcript: fullTranscript,
           stuckPoint,

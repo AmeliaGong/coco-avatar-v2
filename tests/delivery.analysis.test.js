@@ -314,6 +314,36 @@ test('分析服务：1v1 转写走 clientContext.transcript', async () => {
   assert.equal(calls[0].structuredOutput, 'plan');
 });
 
+// ⚠️ **网关回归**：MiniMax 拒绝「只有 system、没有 user」的请求
+// （2013 invalid params, chat content is empty）。
+// 分析场景的素材走注入通道（进了 system prompt），没有平台对话时
+// messages 就是空的 —— 必须补一条 user 轮，否则线上生成方案直接 500。
+test('分析服务：没有平台对话时补一条 user 轮（网关不接受只有 system 的请求）', async () => {
+  const calls = [];
+  const analysis = createAnalysisService({
+    callEngine: fakeEngine({ structured: PLAN_PAYLOAD, structuredValidated: true }, calls),
+    validators: {},
+  });
+  await analysis.generateDraft({ transcript: '来访者：我一停下来就慌。' });
+  assert.ok(Array.isArray(calls[0].history) && calls[0].history.length >= 1, 'history 不能是空的');
+  assert.equal(calls[0].history[0].role, 'user');
+  assert.ok(calls[0].history[0].content.trim().length > 0, 'user 轮不能是空串');
+});
+
+test('分析服务：有平台对话时用对话当 history（不补指令轮）', async () => {
+  const calls = [];
+  const analysis = createAnalysisService({
+    callEngine: fakeEngine({ structured: PLAN_PAYLOAD, structuredValidated: true }, calls),
+    validators: {},
+  });
+  await analysis.generateDraft({
+    transcript: '来访者原话',
+    conversationMessages: [{ role: 'user', content: '我又加班到十一点' }],
+  });
+  assert.equal(calls[0].history.length, 1);
+  assert.equal(calls[0].history[0].content, '我又加班到十一点');
+});
+
 test('分析服务：教练手法库走 clientContext.coach_moves', async () => {
   const calls = [];
   const analysis = createAnalysisService({
@@ -382,7 +412,9 @@ test('二次分析：没有平台对话也能做（只有 1v1）', async () => {
   });
   const result = await analysis.generateSecondaryDraft({ transcript: '只有 1v1' });
   assert.equal(result.ok, true);
-  assert.equal(calls[0].history.length, 0);
+  // 没有平台对话 ⇒ history 里是补的那条任务指令（网关不接受空 messages）。
+  assert.equal(calls[0].history.length, 1);
+  assert.equal(calls[0].history[0].role, 'user');
 });
 
 test('二次分析：没有 1v1 也没有对话时直接失败，不调模型', async () => {
