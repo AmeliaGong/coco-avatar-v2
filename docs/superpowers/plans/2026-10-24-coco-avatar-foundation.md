@@ -2847,6 +2847,7 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 | 17 | 新增 `GET /api/internal/ping`（内部服务鉴权自检） | 没有这个端点 | `requireInternal` 保护 ⇒ 无 token 一律 **401**；服务端没配 token ⇒ **503** | 计划 2 的内部接口要有「服务间鉴权可用」的探针，否则上线后第一件事就是「鉴权到底通没通」没人知道 | `tests/auth.test.js`「内部接口：没带 token → 401」「内部接口：token 正确 → 200 + { ok: true }」 |
 | 18 | `token_usage` 多两列（`scenario` / `prompt_version`） | 只有 (id, conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at) | 多两列 ⇒ 后台会话详情接口吐出的 `token_usage` 行**多了两个字段** | 成本要能**按场景**归集、要能追到**具体版本的 prompt**（两段内容哈希） | `tests/api.chat.test.js`「token_usage 记下 scenario 与 prompt_version（两段内容哈希，不是 0.0）」 |
 | 19 | async 路由的异常**被兜住** | `/api/chat` 是**裸的** async handler ⇒ handler 里任何 throw（包括那几处**在 try 之外**的读库/写库）⇒ Express 4 不接 ⇒ unhandled rejection ⇒ **进程退出** | async 路由都过 `asyncRoute`（`server/asyncRoute.js`）⇒ 记日志 +（**响应还没发出去时**）**500** + JSON；已经发出去就只 `res.end()`（本分支的 `server.js` 里目前只有 `/api/chat` 这一个 async 路由） | 这是「修好的 1–4」能成立的前提：崩溃点从「进程退出」降级成「一个 500」。它是一条**规矩**（所有 async 路由都得包），所以单独成文件而不是塞在某一份路由代码里 | `tests/api.chat.test.js`「建会话失败时回 500，进程不崩（async handler 的兜底）」、`tests/asyncRoute.test.js` |
+| 20 | **多轮请求的模型上下文来自「库里已有的对话」**，不再用客户端重发的那份 | 前端每轮把整段对话重发上来，服务端**原样**把它当上下文发给网关；库里那份反而不参与 ⇒ 客户端**可以伪造**历史（拿着一个 `conversation_id` 就能往模型上下文里塞假的助手回复），且同一条历史可能出现两次 | 上下文一律由 `server/chatHistory.js` 从**库里已有的对话**重建；请求里带来的那份**只用于**「校验」与「取出这一轮新说的话」⇒ 伪造的历史进不去模型上下文，同一条也不会出现两次 | 库里那份才是事实（每轮的 user 与 assistant 都落库，前端刷新后也是从库里拉回来显示的），而且**不能被伪造**。⚠️ 代价是**逐字节不同**：首屏问候语从来没落过库（只活在前端状态里）⇒ **从第二轮起模型上下文里没有它了**。第一轮（库里还没有历史）仍然用请求里那份 ⇒ 首轮请求体与从前**逐字节相同** | `tests/api.chat.test.js`「多轮：发给模型的是**库里重建的整段对话**，不是客户端重发的那份」+「客户端重发的历史里有伪造的助手回复 → 不进模型上下文」 |
 
 > 这张表里**没有**「请求体逐字节相同」那一条 —— 那不是差异，是**限定条件**，
 > 见下面「仍然成立的『零行为变化』保证」一节。
@@ -2983,10 +2984,15 @@ status（`main` 里做这个副作用的是它的 GET 会话接口）—— 这�
   而不是线上 bug；但这个端点**公开、无鉴权**，所以别把它当成「不可能发生」。
   将来收紧判据（比如「最后一条必须是 user」）会让这类请求变成 400 —— 那是
   **有意为之**的行为变更，要写进差异表。
-- **history 没有长度上限**：`MAX_CONTEXT_CHARS = 4000` 只约束注入的
-  `clientContext`，不约束 history。每一条 user 轮都**完整**发给网关。唯一的
-  上限是 `express.json()` 的 100kb 请求体上限。这是**既有**问题，不是这一轮
-  引入的。
+- ~~**history 没有长度上限**~~ —— **已处理（2026-10-25 热修 `ef44713`，线上 v71/v72）**。
+  上下文改为从**库里**重建（不再信任客户端重发的那份），并加
+  `MAX_HISTORY_CHARS = 120000`（约 67k tokens）上限；超限时丢**最旧**的轮次，
+  **最后一条 user 消息永远保留**。触发原因：那道 100kb 请求体闸门被移除后，
+  history 再没有兜底 ⇒ 不另设一道就会一直涨到模型不吃为止。
+  触发事故：一位来访者的会话涨到 98 条 / 42,006 字符，前端每轮重发整段对话
+  ⇒ 请求体 103,192 字节 > 100kb ⇒ **在解析阶段**被挡掉（路由都没进不去），
+  她从 2026-10-24 15:37 起发不出任何消息。
+  教练分析那条路（`server/delivery/adminRoutes.js`）读整段对话，**不受影响**。
 - **首轮请求里，模型第一眼看到的是 assistant 而不是 user**：`useChat` 的
   初始 state 是那条首屏问候语（`{role:'assistant', content:WELCOME_MESSAGE}`），
   它会被当「上一轮」一起发给网关，而服务端**不**把它落库（不是 user 轮）。
@@ -3165,7 +3171,7 @@ Docker 匹配规则判 —— 那份规则的每个分支都对着**真的 Docke
 - [ ] `npm test` 全绿，且**不引入任何 npm 依赖**（`git diff package.json` 只多**两行**脚本：`test` 与 `prompt:split`；依赖没动）
 - [ ] `registry.getPrompt('chat')` 与 `tests/fixtures/legacy-chat-prompt.txt` 逐字节相同 —— **这是"部署后行为零变化"的唯一保证**
 - [ ] **发给网关的请求体**（不只是 prompt 拼装）与 `main` 逐字节相同 —— 见 `tests/api.prompt.test.js`「发往网关的请求体与 main 逐字节一致」
-- [ ] 「有意为之的行为变更」一节里列的每一条差异都有对应的回归测试（差异 1–4、7、8 在 `tests/api.livepath.test.js`；差异 5 在 `tests/api.chat.test.js`；差异 6 在 `tests/db.schema.test.js`）
+- [ ] 「有意为之的行为变更」一节里列的每一条差异都有对应的回归测试（差异 1–4、7、8 在 `tests/api.livepath.test.js`；差异 5 在 `tests/api.chat.test.js`；差异 6 在 `tests/db.schema.test.js`；差异 20 在 `tests/api.chat.test.js`）
 - [ ] **干净 clone 之后** `npm ci && npm run build && npm test` 都过（`src/data/stories.ts` 在仓库里；`.gitignore` 的 `data/` 已改成 `/data/`；`.dockerignore` 用 `/data/` + `**/*.db` 把本地库挡在镜像外 —— **实测**镜像里没有 `data/coco.db`，而 `src/data/stories.ts` 还在；这两条由 `tests/ignoreFiles.test.js` 钉住）
 - [ ] `src/constants/systemPrompt.ts` 已删除，仓库里不再有两份 prompt
 - [ ] `/api/chat` handler 里**没有**模型调用逻辑（全部在 `server/engine/`）—— ⚠️ **行数这条没达成**：main 108 行 / 本分支 248 行（去注释与空行：85 / 135），比 `main` 长了一倍多（多出来的是守卫、校验与事务）。原来写的「从 110 行降到 60 行以内」**不成立**，改成「handler 里没有模型调用逻辑」这一条
