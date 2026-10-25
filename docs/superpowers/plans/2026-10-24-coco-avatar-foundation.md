@@ -2830,20 +2830,28 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 
 | # | 差异 | `main` 上是什么 | 本分支是什么 | 为什么 | 测试 |
 |---|---|---|---|---|---|
-| 9 | 失败的一轮（上游 200 但**没有正文**）**照记账** | 回 **200** + 空气泡（正文为空），**有 usage 就照记 token 账** | 回 **502**（见「差异 2」），**也照记 token 账** —— 有 user 行、有 token 账、**没有** assistant 行（没有正文可存） | 「没拿到正文」不是「没付钱」：请求已经跑完了、tokens 已经被扣了。`server.js` 里本来就写着「token 账：**任何情况下都要记**」—— 502 那一档不记账就与这句话自相矛盾 | `tests/api.chat.test.js`「上游 200 但没有正文 → 502，这一轮的钱**照样记账**」 |
-| 10 | 网关返回**无法解析的响应体**（HTTP 200 + HTML / 被截断） | `await response.json()` 抛原生 `SyntaxError`，落在 try 里 ⇒ 被 catch ⇒ 回 **500** `{"error":"Internal server error"}` | `modelClient` 把解析失败包成 `ModelError` ⇒ 回 **502** `{"error":"AI Gateway error"}` | 500 的语义是「我们自己的代码错了」；真相是「模型侧返回了坏东西」。502 才是「可以重试/该找模型侧」的那一档 | `tests/api.chat.test.js`「网关回 200 但响应体**不是 JSON** → 502（不是 500：那不是我们自己的错）」、`tests/engine.structured.test.js`「网关返回无法解析的响应时抛 ModelError 而不是原生 SyntaxError」 |
-| 11 | 请求体**不是合法 JSON** ⇒ **400 + 简短 JSON**（永不给堆栈） | 交给 Express 的默认错误处理器 ⇒ 回 **HTML** 错误页（非 production 下还**带堆栈**） | 自建的错误中间件 ⇒ **400** + `{"error":"Invalid request body"}`，**任何时候都不给堆栈** | 堆栈是内部细节（路径、依赖版本、源码片段），与「500 不泄露内部细节」的目标一致 | `tests/api.chat.test.js`「请求体不是合法 JSON → 400 + 简短 JSON（不给堆栈）」 |
-| 12 | 请求体**超过 100KB** ⇒ **400**（`main` 是 413） | body-parser 抛 `entity.too.large` ⇒ 默认处理器回 **413**（HTML） | 同一个错误中间件把它映射成 **400** + JSON | 请求体太大是**请求本身**的问题 ⇒ 4xx。413 在这里没有信息量（调用方并不需要知道上限是多少） | `tests/api.chat.test.js`「请求体超过 100KB → 400 + 简短 JSON（不给堆栈）」 |
+| 9 | 失败的一轮（上游 200 但**没有正文**）**照记账** | 回 **200** + 空气泡（正文为空），**有 usage 就照记 token 账** —— **实测**：`token_usage` 有一行（total 40），`messages` 里只有 user 行 | 回 **502**（见「差异 2」），**也照记 token 账** —— 有 user 行、有 token 账、**没有** assistant 行（没有正文可存）—— **实测**：同样有 `token_usage` 一行（total 40、`scenario='chat'`、`prompt_version` 有值） | 「没拿到正文」不是「没付钱」：请求已经跑完了、tokens 已经被扣了。`server.js` 里本来就写着「token 账：**任何情况下都要记**」—— 502 那一档不记账就与这句话自相矛盾 | `tests/api.chat.test.js`「上游 200 但没有正文 → 502，这一轮的钱**照样记账**」 |
+| 10 | 网关返回**无法解析的响应体**（HTTP 200 + HTML / 被截断） | `await response.json()` 抛原生 `SyntaxError`，落在 try 里 ⇒ 被 catch ⇒ 回 **500** `{"error":"Internal server error"}` —— **实测** | `modelClient` 把解析失败包成 `ModelError` ⇒ 回 **502** `{"error":"AI Gateway error"}` —— **实测** | 500 的语义是「我们自己的代码错了」；真相是「模型侧返回了坏东西」。502 才是「可以重试/该找模型侧」的那一档 | `tests/api.chat.test.js`「网关回 200 但响应体**不是 JSON** → 502（不是 500：那不是我们自己的错）」、`tests/engine.structured.test.js`「网关返回无法解析的响应时抛 ModelError 而不是原生 SyntaxError」 |
+| 11 | 请求体**不是合法 JSON** ⇒ **400 + 简短 JSON**（永不给堆栈） | 交给 Express 的默认错误处理器 ⇒ 回 **HTML** 错误页（**实测**：development 下那页里带完整堆栈和**绝对路径** —— `/Users/…/node_modules/body-parser/…`；production 下那页里只有 `Bad Request`） | 自建的错误中间件 ⇒ **400** + `{"error":"Invalid request body"}`，**任何时候都不给堆栈** | 堆栈是内部细节（路径、依赖版本、源码片段），与「500 不泄露内部细节」的目标一致 | `tests/api.chat.test.js`「请求体不是合法 JSON → 400 + 简短 JSON（不给堆栈）」 |
+| 12 | 请求体**超过 100KB** ⇒ **400**（`main` 是 413） | body-parser 抛 `entity.too.large` ⇒ 默认处理器回 **413** + HTML（**实测**） | 同一个错误中间件把它映射成 **400** + JSON（**实测**） | 请求体太大是**请求本身**的问题 ⇒ 4xx。413 在这里没有信息量（调用方并不需要知道上限是多少） | `tests/api.chat.test.js`「请求体超过 100KB → 400 + 简短 JSON（不给堆栈）」 |
 | 13 | `client_id` / `conversation_id` **长度上限 128** | 没有任何长度上限 | 超过 128 ⇒ **400**（在**任何写库 / 调模型之前**） | `conversation_id` 会当**主键**写进库，还会原样进 `X-Conversation-Id` 响应头 —— 几万个字符会把响应头撑爆（Node 默认 16KB 上限），客户端拿到的是「连接被掐」（`UND_ERR_HEADERS_OVERFLOW`），**不是** 500；而那时库里已经落了行、模型的钱也已经付过了。`client_id` 会原样进库并进后台列表 | `tests/api.chat.test.js`「client_id 超过长度上限 → 400」「conversation_id 超过长度上限 → 400」 |
 | 14 | `client_id` 与 `scenario` **被记进会话行** | `main` 的 `conversations` 表里**没有这两列**，`main` 的 `/api/chat` 也只解构了 `messages` 与 `conversation_id` ⇒ 传了也**被丢掉** | 两列都记下来 ⇒ `GET /api/conversations/:id` 与后台接口的响应体**多了两个字段** | 交付线要按 client 归集会话；`scenario` 是 prompt 的一部分，不记下来就查不出「这条会话用的是哪个 prompt」 | `tests/api.chat.test.js`「client_id 是字符串 → 原样记进会话」「scenario 也记进会话行（不记就查不出「这条会话用的是哪个 prompt」）」 |
 | 15 | 会话过期时，POST **顺手把 `status` 置成 `expired`** | `main` 的 POST **只**回 410、**不**置 status（`main` 里做这个副作用的是它的 **GET** 会话接口） | POST 里顺手置了 | 那个会话确实过期了；「状态」与「事实」对不上会让后台的会话列表失真 | `tests/api.chat.test.js`「过期会话 → 410，会话状态被置为 expired」 |
 | 16 | **先落库、再吐流** | 先 `res.write`/`res.end` 把回复**发出去**，**之后**才插 assistant 消息与 token 账 ⇒ 落库失败时**用户已经看到了回复、库里却没有这一轮、账也丢了** | 助手消息 + token 账 + 标题在**一个事务**里落完；落库失败就回 500、**一个字都不发** | 「用户看到了回复、库里却没有」是补不回来的残缺回合。顺序反过来之后，「库里有了、用户没看到」（用户刷新一下就能看到）就变成了可接受的失败 | `tests/api.chat.test.js`「落库发生在响应体写出去之前」「token 账写不进去时，助手消息也跟着回滚（同一个事务）」 |
 | 17 | 新增 `GET /api/internal/ping`（内部服务鉴权自检） | 没有这个端点 | `requireInternal` 保护 ⇒ 无 token 一律 **401**；服务端没配 token ⇒ **503** | 计划 2 的内部接口要有「服务间鉴权可用」的探针，否则上线后第一件事就是「鉴权到底通没通」没人知道 | `tests/auth.test.js`「内部接口：没带 token → 401」「内部接口：token 正确 → 200 + { ok: true }」 |
 | 18 | `token_usage` 多两列（`scenario` / `prompt_version`） | 只有 (id, conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at) | 多两列 ⇒ 后台会话详情接口吐出的 `token_usage` 行**多了两个字段** | 成本要能**按场景**归集、要能追到**具体版本的 prompt**（两段内容哈希） | `tests/api.chat.test.js`「token_usage 记下 scenario 与 prompt_version（两段内容哈希，不是 0.0）」 |
-| 19 | async 路由的异常**被兜住** | `/api/chat` 是**裸的** async handler ⇒ handler 里任何 throw（包括那几处**在 try 之外**的读库/写库）⇒ Express 4 不接 ⇒ unhandled rejection ⇒ **进程退出** | 所有 async 路由都过 `asyncRoute`（`server/asyncRoute.js`）⇒ 记日志 + **500** + JSON | 这是「修好的 1–4」能成立的前提：崩溃点从「进程退出」降级成「一个 500」。它是一条**规矩**（所有 async 路由都得包），所以单独成文件而不是塞在某一份路由代码里 | `tests/api.chat.test.js`「建会话失败时回 500，进程不崩（async handler 的兜底）」、`tests/asyncRoute.test.js` |
+| 19 | async 路由的异常**被兜住** | `/api/chat` 是**裸的** async handler ⇒ handler 里任何 throw（包括那几处**在 try 之外**的读库/写库）⇒ Express 4 不接 ⇒ unhandled rejection ⇒ **进程退出** | async 路由都过 `asyncRoute`（`server/asyncRoute.js`）⇒ 记日志 + **500** + JSON（本分支的 `server.js` 里目前只有 `/api/chat` 这一个 async 路由） | 这是「修好的 1–4」能成立的前提：崩溃点从「进程退出」降级成「一个 500」。它是一条**规矩**（所有 async 路由都得包），所以单独成文件而不是塞在某一份路由代码里 | `tests/api.chat.test.js`「建会话失败时回 500，进程不崩（async handler 的兜底）」、`tests/asyncRoute.test.js` |
 
 > 这张表里**没有**「请求体逐字节相同」那一条 —— 那不是差异，是**限定条件**，
 > 见下面「仍然成立的『零行为变化』保证」一节。
+
+**「实测」是怎么做的**（可复现）：把 `main` 的 `server.js` 拷到 `/tmp`，把里面
+硬编码的网关地址换成 `http://127.0.0.1:8299/gateway`，另起一个假网关按需回
+「200 + 空正文 + usage」或「200 + HTML」；两边各起一个服务，同一个请求打过去，
+比状态码、比响应体、再直接查各自的 SQLite（`token_usage` / `messages`）。
+`main` 那份的网关 URL 是**硬编码**的（不是环境变量），所以只能拷贝改；
+本分支那边直接给 `MINIMAX_API_URL` 指过去即可。
+⇒ 全程**一个包都没发给真实网关**。
 
 #### 「差异 8」的两道防线
 
@@ -2984,20 +2992,34 @@ status（`main` 里做这个副作用的是它的 GET 会话接口）—— 这�
 `main` 的 `/api/chat` 有**四个**请求形状会**杀掉整个进程**。fly.io 跑的是**单进程**，
 所以这四个输入每一个都等于「整站不可用」（Node 20 默认 `unhandledRejection = throw` → 进程退出）：
 
-| 输入 | `main` 上发生了什么 | 本分支 |
-|---|---|---|
-| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | **400**（`messages 里至少要有一条有内容的用户或助手消息`）⇒ 不建会话、不调模型、进程不崩 |
-| `{"messages":[{"role":"user","content":null}]}` | 同上（NULL 写进 `NOT NULL` 的 `content` 列） | **400**（同上） |
-| `{"messages":[null]}` | `m.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | **400**（同上） |
-| `{"messages":"不是数组"}` | `messages.filter` 不是一个函数 → `TypeError` → 同样 unhandled rejection → **进程退出** | **400**（`messages 必须是数组`） |
+| 输入 | `main` 上发生了什么 | 本分支 | 测试 |
+|---|---|---|---|
+| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | **400**（`messages 里至少要有一条有内容的用户或助手消息`）⇒ 不建会话、不调模型、进程不崩 | 「修好的 1」 |
+| `{"messages":[{"role":"user","content":null}]}` | 同上（NULL 写进 `NOT NULL` 的 `content` 列） | **400**（同上） | 「修好的 4」 |
+| `{"messages":[null]}` | `m.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | **400**（同上） | 「修好的 2」 |
+| `{"messages":"不是数组"}` | `messages.filter` 不是一个函数 → `TypeError` → 同样 unhandled rejection → **进程退出** | **400**（`messages 必须是数组`） | 「修好的 3」 |
 
 ⚠️ 四个崩溃点**全都在 `main` 的 try 之外**（那个 try 从 `fetch` 那行才开始），
 所以 `main` 的 `catch` 接不住它们 —— 这就是为什么它们是「进程退出」而不是「500」。
 
+**实测（2026-10-25，本地跑 `main` 的 `server.js`，每个输入起一个新进程）**：
+
+| 输入 | 客户端收到 | 进程 | 日志里的第一行 |
+|---|---|---|---|
+| `{"messages":[{"role":"user"}]}` | `http=000`（空回复） | **退出** | `SQLITE_CONSTRAINT_NOTNULL` |
+| `{"messages":[{"role":"user","content":null}]}` | `http=000` | **退出** | `SQLITE_CONSTRAINT_NOTNULL` |
+| `{"messages":[null]}` | `http=000` | **退出** | `TypeError: Cannot read properties of null (reading 'role')` |
+| `{"messages":"不是数组"}` | `http=000` | **退出** | `TypeError: messages.filter is not a function` |
+
+（`http=000` + 进程没了 = 客户端一个响应都收不到，站点直接不可用 —— 这就是
+「整站下线」的字面意思。fly.io 是**单进程**，所以这不是「一个请求失败」，
+是**整站没了**。）
+
 **这是本分支最重要的正面差异**，也是「零行为变化」这句话必须读成
 「对**格式正确**的请求零行为变化」的原因。
 
-四条都有测试：`tests/api.livepath.test.js`「修好的 1」…「修好的 4」。
+四条都有测试：`tests/api.livepath.test.js`「修好的 1」…「修好的 4」
+（上表的「测试」列给的是**编号**；全名在那个文件里）。
 
 ### 本分支**修好**的（`main` 上**根本构建不起来**）
 
