@@ -180,6 +180,11 @@ app.post('/api/conversations', (req, res) => {
 // 它比 /api/chat 更容易滥用（不花钱、不限速、还把历史全吐出来），
 // 而且早于本轮改造就存在。
 //
+// **当前的状态：零鉴权，但只吐来访者该看的字段。** 会话 id 本身是凭证
+// （链接即凭证，没有账号体系），所以「读到消息」是有意为之；
+// 但教练内部的归属标签（client_id / link_kind）不跟着出去 ——
+// 见下面那段注释。
+//
 // 什么时候必须收口：见 /api/chat 上方「client_id 与『会话归属』」那段
 // 注释（clients 表成立 / 对外开放 / 会话里出现可识别个人的信息）——
 // 届时**读写两条路径要一起**做归属校验。
@@ -199,7 +204,27 @@ app.get('/api/conversations/:id', (req, res) => {
   const messages = db.prepare(
     'SELECT role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC'
   ).all(req.params.id);
-  res.json({ ...conv, messages });
+  // **逐字段挑出来**，不是「查全行再删字段」—— 与用户端方案页同一套做法
+  // （见 server/delivery/userService.js 的「字段白名单」）。
+  //
+  // ⚠️ **client_id 与 link_kind 绝不能进公开响应。**
+  //
+  // client_id 泄露 ⇒ 拿着它就能去读**同一个客户的其它会话**的方案：
+  // 公开的 /api/conversations/:id/plan 靠 conversation_id 找人，
+  // 找到会话再按「link_kind='client' 且 client_id 非空」取方案。
+  // 所以只要 client_id 落到别人手里，别的会话 id 一旦也泄露，
+  // 那个客户的诊断与信念系统就一起出去了。
+  //
+  // 链接即凭证是**这一层的**设计（会话 id 本身就是凭证，没有账号体系），
+  // 但「凭证」不等于「把教练内部的归属标签也一起交出去」。
+  res.json({
+    id: conv.id,
+    title: conv.title,
+    created_at: conv.created_at,
+    expires_at: conv.expires_at,
+    status: conv.status,
+    messages,
+  });
 });
 
 // --- /api/chat 的薄路由 ---

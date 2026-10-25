@@ -3,6 +3,7 @@ import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from './helpers/testServer.js';
 import { resetDb } from './helpers/testDb.js';
+import { getDb } from '../db.js';
 
 let base;
 let server;
@@ -35,6 +36,28 @@ test('GET /api/conversations/:id 返回该会话与消息', async () => {
   const body = await res.json();
   assert.equal(body.id, created.id);
   assert.deepEqual(body.messages, []);
+});
+
+// 公开的会话响应**不能**带教练内部的归属标签。
+//
+// 这不是洁癖：client_id 一旦泄露，别人就能拿着它去读**同一个客户的
+// 其它会话**的方案 —— 公开的 /api/conversations/:id/plan 靠
+// conversation_id 找人，找到会话再按「link_kind='client' 且 client_id
+// 非空」取方案。归属标签不外泄，这条链才断在源头。
+test('公开的会话响应里没有 client_id 与 link_kind', async () => {
+  const db = getDb();
+  const created = await (await fetch(`${base}/api/conversations`, { method: 'POST' })).json();
+  // 模拟教练在后台把这个会话挂到某个客户名下（link_kind='client'）。
+  db.prepare("UPDATE conversations SET client_id = ?, link_kind = 'client' WHERE id = ?")
+    .run('客户代号-x', created.id);
+
+  const body = await (await fetch(`${base}/api/conversations/${created.id}`)).json();
+  assert.equal('client_id' in body, false, 'client_id 不能进公开响应');
+  assert.equal('link_kind' in body, false, 'link_kind 不能进公开响应');
+  assert.equal(JSON.stringify(body).includes('客户代号-x'), false, '归属标签的值不能出现在公开响应里');
+  // 来访者该看的字段照旧。
+  assert.equal(body.id, created.id);
+  assert.equal(body.status, 'active');
 });
 
 test('管理接口未带 token 时返回 401', async () => {
