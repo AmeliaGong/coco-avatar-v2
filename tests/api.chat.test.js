@@ -21,6 +21,7 @@ import { getDb } from '../db.js';
 import { createCbtEngine, CbtEngineError } from '../server/engine/cbtEngine.js';
 import { STUCK_POINT_SCHEMA } from '../server/contracts/stuckPoint.js';
 import { STRUCTURED_OUTPUT_TYPE_NAMES, structuredJsonToPersist } from '../server/structuredTypes.js';
+import { MAX_HISTORY_CHARS } from '../server/chatHistory.js';
 
 let base;
 let server;
@@ -1398,17 +1399,339 @@ test('请求体不是合法 JSON → 400 + 简短 JSON（不给堆栈）', { tim
   assert.ok(!text.includes('node_modules'), `响应体里出现了内部路径：${text}`);
 });
 
-test('请求体超过 100KB → 400 + 简短 JSON（不给堆栈）', { timeout: 15000 }, async () => {
+test('请求体超过上限 → 400 + 简短 JSON（不给堆栈）', { timeout: 15000 }, async () => {
   const res = await fetch(`${base}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(200000) }] }),
+    body: JSON.stringify({ messages: [{ role: 'user', content: 'x'.repeat(1200000) }] }),
   });
   const text = await res.text();
 
   assert.equal(res.status, 400);
   assert.deepEqual(JSON.parse(text), { error: 'Invalid request body' });
   assert.ok(!text.includes('at '), `响应体里出现了堆栈：${text}`);
+});
+
+// ---------------------------------------------------------------------------
+// 线上事故：请求体把整段对话重发，涨到 103KB 就被**解析阶段**挡掉了
+//
+// 线上事故（2026-10-25）：那个来访者的会话累计到 98 条消息、
+// 42,006 个字符；浏览器那一轮发出来的请求体是 103,192 字节 ——
+// 比 express.json() 的默认上限（102,400 字节 = 100kb）多 792 字节。
+// 于是 body-parser 在**解析阶段**抛 entity.too.large，路由根本没进不去，
+// 错误中间件把它映射成 400 {"error":"Invalid request body"}，
+// 前端只能显示「抱歉，我现在遇到了一些技术问题。」
+//
+// ⚠️ 关键：**上限是在解析时生效的**，不是路由里的判据 ⇒ 只在路由里
+// 加判断没用，必须把闸门本身挪走。
+// ---------------------------------------------------------------------------
+
+test('请求体 103KB（线上那个会话的实际大小）→ 200，不再被挡在解析阶段', { timeout: 20000 }, async () => {
+  // 先确认这个用例**有意义**：body 必须真的超过旧的默认上限。
+  const body = JSON.stringify({
+    messages: [{ role: 'user', content: 'x'.repeat(103000) }],
+  });
+  assert.ok(
+    Buffer.byteLength(body) > 102400,
+    `这个用例自己就失效了：body 只有 ${Buffer.byteLength(body)} 字节`
+  );
+  assert.ok(Buffer.byteLength(body) < 1048576, 'body 不该超过新上限');
+
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const res = await fetch(`${base}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body,
+    });
+    const text = await res.text();
+
+    assert.equal(res.status, 200, `103KB 的请求体被挡住了：${text}`);
+    assert.ok(!text.includes('Invalid request body'));
+    assert.equal(calls.length, 1, '请求应该真的到了模型');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('103KB 的请求体被解析后，落到模型手里的是完整的那句话', { timeout: 20000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const content = 'x'.repeat(103000);
+    await postChat({ messages: [{ role: 'user', content }] });
+    const sent = calls[0].messages;
+    assert.deepEqual(sent[sent.length - 1], { role: 'user', content });
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 多轮：模型看到的上下文来自**库**，不是客户端重发的那份
+//
+// 客户端以前每轮都把整段对话重发（src/hooks/useChat.ts）。那份重发是
+// 冗余的（库里已经存着完整的对话），而且是**调用方可以伪造**的 ——
+// 拿一个 conversation_id 就能往模型上下文里塞假的历史。
+//
+// 修法：库里已有的对话是模型上下文的唯一来源。第一轮（库里还没有
+// 历史）仍然用请求里那份 ⇒ 首屏问候语那一轮的请求体与从前逐字节相同。
+// ---------------------------------------------------------------------------
+
+test('多轮：发给模型的是**库里重建的整段对话**，不是客户端重发的那份', { timeout: 20000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    // 第一轮
+    const first = await postChat({ messages: [{ role: 'user', content: '第一句' }] });
+    assert.equal(first.res.status, 200);
+    const convId = first.res.headers.get('X-Conversation-Id');
+    assert.ok(convId, '第一轮应该带回 X-Conversation-Id');
+
+    // 第二轮：客户端把整段对话重发上来（老前端的行为）
+    const second = await postChat({
+      conversation_id: convId,
+      messages: [
+        { role: 'user', content: '第一句' },
+        { role: 'assistant', content: '收到。' },
+        { role: 'user', content: '第二句' },
+      ],
+    });
+    assert.equal(second.res.status, 200);
+
+    // 发给网关的：system + 第一句 + 库里的回复 + 第二句（**没有重复**）
+    const sent = calls[1].messages;
+    assert.equal(sent.length, 4, `上下文不对：${JSON.stringify(sent)}`);
+    assert.deepEqual(sent.slice(1), [
+      { role: 'user', content: '第一句' },
+      { role: 'assistant', content: '收到。' },
+      { role: 'user', content: '第二句' },
+    ]);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('客户端重发的历史里有伪造的助手回复 → 不进模型上下文', { timeout: 20000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const first = await postChat({ messages: [{ role: 'user', content: '第一句' }] });
+    const convId = first.res.headers.get('X-Conversation-Id');
+
+    const second = await postChat({
+      conversation_id: convId,
+      messages: [
+        { role: 'user', content: '第一句' },
+        { role: 'assistant', content: '伪造的助手回复' },
+        { role: 'user', content: '第二句' },
+      ],
+    });
+    assert.equal(second.res.status, 200);
+
+    const sent = calls[1].messages;
+    assert.ok(
+      !sent.some(m => m.content === '伪造的助手回复'),
+      `伪造的历史进了模型上下文：${JSON.stringify(sent)}`
+    );
+    assert.deepEqual(sent.slice(1), [
+      { role: 'user', content: '第一句' },
+      { role: 'assistant', content: '收到。' },
+      { role: 'user', content: '第二句' },
+    ]);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('多轮：库里已有的对话**一条不少**地交给模型（教练要看得见全程）', { timeout: 20000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    let convId = null;
+    for (const text of ['第一句', '第二句', '第三句']) {
+      const r = await postChat({
+        conversation_id: convId || undefined,
+        messages: convId
+          ? [
+              { role: 'user', content: '第一句' },
+              { role: 'assistant', content: '收到。' },
+              { role: 'user', content: '第二句' },
+              { role: 'assistant', content: '收到。' },
+              { role: 'user', content: text },
+            ]
+          : [{ role: 'user', content: text }],
+      });
+      assert.equal(r.res.status, 200);
+      convId = r.res.headers.get('X-Conversation-Id');
+    }
+
+    // 第三轮发给模型的：system + 5 条历史
+    //（第三句之后的那条回复是**这一次**才生成的，不在上下文里）
+    const sent = calls[2].messages;
+    assert.equal(sent.length, 6, `上下文条数不对：${sent.length}`);
+    assert.deepEqual(
+      sent.slice(1).map(m => m.content),
+      ['第一句', '收到。', '第二句', '收到。', '第三句']
+    );
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 上下文的**长度上限**：history 以前没有闸门（计划文档里的已知残留）
+//
+// 前端不再重发整段对话之后，请求体那道 100kb 的闸门就管不到模型上下文了
+// —— 所以必须另设一道，否则历史会一直涨到模型不吃为止。
+// ---------------------------------------------------------------------------
+
+test('超长的历史被裁到上限：丢最旧的，最后一条用户消息一定留着', { timeout: 20000 }, async () => {
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+  db.prepare(
+    'INSERT INTO conversations (id, title, created_at, status, scenario) VALUES (?, ?, ?, ?, ?)'
+  ).run('conv-long', '很长的会话', nowIso, 'active', 'chat');
+
+  // 40 条 × 5000 字符 = 200,000 字符（超过 120,000 的上限）
+  const insert = db.prepare(
+    'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+  );
+  for (let i = 0; i < 40; i++) {
+    insert.run(
+      'conv-long',
+      i % 2 === 0 ? 'user' : 'assistant',
+      `第${i}条` + '字'.repeat(4997),
+      nowIso
+    );
+  }
+
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const r = await postChat({
+      conversation_id: 'conv-long',
+      messages: [{ role: 'user', content: '最新的一句' }],
+    });
+    assert.equal(r.res.status, 200);
+
+    const sent = calls[0].messages;
+    assert.ok(sent.length > 2, '应该把库里的历史交给模型，而不是只发这一句');
+    const total = sent.slice(1).reduce((n, m) => n + m.content.length, 0);
+    assert.ok(
+      total <= MAX_HISTORY_CHARS,
+      `裁到 ${total} 字符，超了上限 ${MAX_HISTORY_CHARS}`
+    );
+    // 最后一条用户消息必须在（模型得听见这一轮刚说的话）
+    assert.deepEqual(sent[sent.length - 1], { role: 'user', content: '最新的一句' });
+    // 丢的是**最旧的**：保留下来的第一条不是库里最早那条
+    assert.ok(
+      !sent[1].content.startsWith('第0条'),
+      `丢的不是最旧的：${sent[1].content.slice(0, 10)}`
+    );
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('历史没超上限时，一条都不许丢', { timeout: 20000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const first = await postChat({ messages: [{ role: 'user', content: '第一句' }] });
+    const convId = first.res.headers.get('X-Conversation-Id');
+    await postChat({
+      conversation_id: convId,
+      messages: [{ role: 'user', content: '第二句' }],
+    });
+    const sent = calls[1].messages;
+    assert.deepEqual(sent.slice(1), [
+      { role: 'user', content: '第一句' },
+      { role: 'assistant', content: '收到。' },
+      { role: 'user', content: '第二句' },
+    ]);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 事故回归：线上那个会话（2026-10-25）
+//
+// 那个会话：98 条消息、42,006 个字符。
+// 浏览器那一轮发出来的请求体是 103,192 字节 —— 比 100kb 上限多 792 字节
+// ⇒ 解析阶段就被挡掉 ⇒ 她从 2026-10-24 15:37 起就发不出任何消息。
+//
+// 这条测试照着她的形状造一个会话，两种客户端都试：
+//   - **老前端**（整段重发，103KB 的请求体）：必须能进路由，而且模型
+//     看到的上下文仍然是库里那 98 条（不能重复、不能丢）；
+//   - **新前端**（只发这一轮）：模型看到的上下文仍然是那 98 条。
+// ---------------------------------------------------------------------------
+
+test('事故回归：线上那个形状的会话（98 条 / 103KB 请求体）能继续聊', { timeout: 30000 }, async () => {
+  const db = getDb();
+  const nowIso = new Date().toISOString();
+  db.prepare(
+    'INSERT INTO conversations (id, title, created_at, status, scenario) VALUES (?, ?, ?, ?, ?)'
+  ).run('conv-incident', '线上事故那个会话', nowIso, 'active', 'chat');
+
+  // 98 条消息 ≈ 42,006 个字符（照着她那个会话的规模）
+  const insert = db.prepare(
+    'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
+  );
+  const history = [];
+  for (let i = 0; i < 49; i++) {
+    const u = `第${i}轮我说的`.padEnd(400, '…');
+    const a = `第${i}轮你回的`.padEnd(400, '…');
+    insert.run('conv-incident', 'user', u, nowIso);
+    insert.run('conv-incident', 'assistant', a, nowIso);
+    history.push({ role: 'user', content: u }, { role: 'assistant', content: a });
+  }
+
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    // --- 老前端：整段重发（请求体 103KB+）---
+    const oldBody = JSON.stringify({
+      conversation_id: 'conv-incident',
+      messages: [...history, { role: 'user', content: '我今天还是很累' }],
+    });
+    assert.ok(
+      Buffer.byteLength(oldBody) > 102400,
+      `这个用例自己就失效了：body 只有 ${Buffer.byteLength(oldBody)} 字节`
+    );
+    const oldRes = await fetch(`${base}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: oldBody,
+    });
+    assert.equal(oldRes.status, 200, '103KB 的请求体应该能走通');
+
+    // 模型看到的：库里那 98 条 + 这一轮新说的话（不多不少）
+    const sent = calls[0].messages;
+    assert.equal(sent.length, 100, `上下文条数不对：${sent.length}`);
+    assert.deepEqual(sent[sent.length - 1], { role: 'user', content: '我今天还是很累' });
+    assert.equal(
+      sent.filter(m => m.content === history[0].content).length,
+      1,
+      '客户端重发的那份不能被当成上下文（否则同一条会出现两次）'
+    );
+
+    // --- 新前端：只发这一轮 ---
+    const newRes = await postChat({
+      conversation_id: 'conv-incident',
+      messages: [{ role: 'user', content: '今天好一点了' }],
+    });
+    assert.equal(newRes.res.status, 200);
+    const sent2 = calls[1].messages;
+    // 库里现在有 100 条（98 + 上一轮的用户消息与回复），
+    // 加上这一轮刚说的话 ⇒ 上下文 = system + 101
+    assert.equal(sent2.length, 102, `上下文条数不对：${sent2.length}`);
+    assert.deepEqual(sent2[sent2.length - 1], { role: 'user', content: '今天好一点了' });
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
 });
 
 // ---------------------------------------------------------------------------

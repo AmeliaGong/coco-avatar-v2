@@ -16,6 +16,7 @@ import {
 } from './server/structuredTypes.js';
 import { statusForEngineError, errorBodyForStatus } from './server/errorStatus.js';
 import { asyncRoute } from './server/asyncRoute.js';
+import { capHistory, historyFromRows, MAX_HISTORY_CHARS } from './server/chatHistory.js';
 import { createRequireAdmin, createRequireInternal } from './server/auth.js';
 // 交付模块（教练分析 + 用户端练习跟进）。
 //
@@ -145,6 +146,30 @@ if (coachMoveStore.list({ activeOnly: false }).length === 0) {
 db.prepare('DELETE FROM admin_sessions WHERE expires_at < ?').run(new Date().toISOString());
 
 app.use(cors());
+
+// /api/chat 的请求体上限单独放宽（**其余端点仍是 100kb**）。
+//
+// 为什么单独放宽：前端以前每轮都把**整段对话**重发一遍，所以请求体
+// 的大小 ≈ 对话长度。线上事故（2026-10-25）：那个来访者的会话涨到 103,192
+// 字节，比 express.json() 的默认上限（102,400 字节 = 100kb）多 792
+// 字节 ⇒ body-parser 在**解析阶段**抛 entity.too.large ⇒ 路由根本没
+// 进不去 ⇒ 前端只能显示「抱歉，我现在遇到了一些技术问题。」
+//
+// ⚠️ **上限是在解析时生效的**，不是路由里的判据 —— 只在路由里加判断
+// 一点用都没有，必须把闸门本身挪走。
+//
+// 上限放宽后的**语义不变**：超限仍然是 400 + {"error":"Invalid request body"}
+// （错误中间件把 entity.too.large 映射成 400，不给堆栈）。
+//
+// 为什么是 1mb：
+//   - 现在前端只发「这一轮新说的话」⇒ 请求体是几百字节，1mb 是**过渡期**
+//     的余量（浏览器里还缓存着旧 bundle 的用户仍会发整段对话）；
+//   - 这是一个**公开**端点，上限不能无限放宽 —— 1mb 已经是单进程
+//     256mb 内存机器上能安全吃下的量级。
+const MAX_CHAT_BODY_LIMIT = '1mb';
+app.use('/api/chat', express.json({ limit: MAX_CHAT_BODY_LIMIT }));
+// 全局的那份仍然生效（100kb）：body-parser 见到 req._body 已经解析过
+// 就跳过（body-parser/lib/types/json.js），所以 /api/chat 不会被解析两次。
 app.use(express.json());
 
 // --- Helper functions ---
@@ -556,6 +581,33 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     return res.status(410).json({ error: 'Conversation expired', expired: true });
   }
 
+  // --- 上下文从哪来 ---
+  //
+  // 客户端以前每轮都把**整段对话**重发一遍（src/hooks/useChat.ts 的行为）。
+  // 那份重发有两个问题：
+  //
+  //   1. **冗余**：库里已经存着完整的对话 —— 每一轮的 user 与 assistant
+  //      都落库，前端刷新后也是从 `GET /api/conversations/:id` 把对话
+  //      拉回来显示的。库才是事实，客户端那份是副本。
+  //
+  //   2. **可以伪造**：谁拿到 conversation_id，谁就能往模型上下文里塞
+  //      假的历史（假的助手回复、假的用户发言）。而 conversation_id
+  //      只是链接里的一段 id（「链接即凭证」）。
+  //
+  // 所以：**库里已有的对话是模型上下文的唯一来源**。请求里带来的那份
+  // 只用来「校验」与「取出这一轮新说的话」。
+  //
+  // ⚠️ 第一轮（库里还没有历史）仍然用请求里那份 —— 这样「首屏问候语」
+  // 那一轮的请求体与从前**逐字节相同**（首屏问候语从来没落过库，
+  // 它只活在��端的状态里）。
+  const priorRows = existing
+    ? db
+        .prepare(
+          'SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id ASC'
+        )
+        .all(convId)
+    : [];
+
   // messages 里至少要有一条**能发给网关**的消息。
   //
   // 空数组 [] 是数组，但里面没有内容 —— 这样的请求发到网关会被拒
@@ -619,12 +671,33 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     ).run(convId, 'user', userContent, now());
   }
 
+  // --- 交给模型的 history ---
+  //
+  // 两条规则（都在 server/chatHistory.js 里）：
+  //   1. **来源**：库里已有的对话（priorRows）+ 这一轮刚说的话。
+  //      库里没有历史时（第一轮）用请求里那份 —— 首屏问候语那一轮
+  //      与从前逐字节相同。
+  //   2. **长度**：history 以前**没有长度上限**（计划文档里的已知残留）。
+  //      前端不再重发整段对话之后，请求体那道 100kb 的闸门就管不到
+  //      模型上下文了 ⇒ 必须另设一道，否则历史会一直涨到模型不吃为止。
+  //      丢的是最旧的轮次，**最后一条用户消息永远留着**。
+  const rawHistory =
+    priorRows.length > 0 ? historyFromRows(priorRows, userContent) : messages;
+  const history = capHistory(rawHistory, MAX_HISTORY_CHARS);
+  if (history.length < rawHistory.length) {
+    // 静默丢掉的话，教练会以为模型看到了全部对话 —— 说出来。
+    console.warn(
+      `chat history 已截断：${rawHistory.length} 条 → ${history.length} 条` +
+        `（上限 ${MAX_HISTORY_CHARS} 字符，conversation_id=${convId}）`
+    );
+  }
+
   // --- 调引擎 ---
   let turn;
   try {
     const result = await cbtEngine({
       scenario,
-      history: messages,
+      history,
       structuredOutput: structuredType,
       // 契约层的校验函数：签名正好是 (payload) => ({ok, errors, value})。
       // 模型复述格式时抄的占位串会被 parseStuckPoint 拒掉 —— 这正是
