@@ -290,7 +290,13 @@ test('200 且业务错误码非零但有内容时不误伤，正常返回', asyn
     }),
   });
   const client = createModelClient({ fetchImpl: fakeFetch, apiKey: 'k' });
-  const result = await client({ systemPrompt: 'S', messages: [] });
+  // messages 给一条正常的 user 消息：这一条测的是「有内容就不误伤」，
+  // **不是**「没有内容也行」—— 那种请求在生产上会被网关回 2013，
+  // 断言在 tests/modelClient.test.js 里。
+  const result = await client({
+    systemPrompt: 'S',
+    messages: [{ role: 'user', content: 'hi' }],
+  });
   assert.equal(result.content, '你好');
 });
 

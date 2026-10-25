@@ -2815,7 +2815,7 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 | 5 | `conversation_id` **字符集**受限 → **400** | 只允许 `A-Za-z0-9._~-`（我们自己的 id 是 `crypto.randomUUID()`）。`main` 不限字符，于是 `conversation_id: "a\nb"` 会一路走到 `res.setHeader('X-Conversation-Id', ...)` 抛 `ERR_INVALID_CHAR`。 | 那个 id 会**原样进响应头**。在本分支的「先落库、再吐流」顺序下，它抛的时候**模型已经计费、库里已经留下孤儿会话与孤儿消息**了 —— 而这是公开端点，可以重复放大成本。所以字符集必须在**任何写库 / 调模型之前**拒掉。 | `tests/api.chat.test.js`「conversation_id 含换行 / 控制字符 / 空格 → 400」 |
 | 6 | `migrateSchema` 把 `duplicate column name` 当成**成功** | 之前任何 ALTER 失败都抛错 → `getDb()` 抛 → `server.js` 模块级 `const db = getDb()` 在 `listen()` 之前就抛 → 进程退出 → crash loop。 | `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` 是 check-then-act，**不是**跨进程原子的。fly 滚动部署可能短暂有两个机器对着同一个卷跑迁移，输的那一个拿到的 `duplicate column name` 恰恰是**想要的结果**（列已经存在了）。别的 ALTER 失败照旧抛。 | `tests/db.schema.test.js`「并发 ALTER 撞车」 |
 | 7 | 400 响应体里回显的用户输入**限长 40 + 去控制字符** | `Unknown scenario: ${scenario}` / `Unknown structured_output: ${structured_output}` 改成先过 `echoForError()`。合法取值**不变**（`'foo'` 还是 `'foo'`），只有超长 / 带控制字符的输入被改写。 | 这两个字段用户可控，而 `express.json()` 默认上限 100kb ⇒ 100kb 请求换来 100kb 响应（**响应放大**），而这个端点公开、可无限重复调用。控制字符还会污染日志与任何把错误体渲染成文本的地方。 | `tests/api.livepath.test.js`「差异 7」（两条） |
-| 8 | 没有「**可发消息**」的请求 → **400**（本地拒掉，不建会话、不调模型）；本平台不存在的角色被**剔掉** | 判据：**至少要有一条 user/assistant 的、content 非空的消息**。`{"messages":[]}`、只有 system 消息、消息的 content 是空的 —— 这些请求**一条能发给网关的消息都没有**。网关只接受带 user/assistant 消息的请求（2013 `invalid params, chat content is empty`），所以这类请求注定被拒。本分支在**本地**就说清楚：`400` + `{"error":"messages 里至少要有一条有内容的用户或助手消息"}`，**不建会话、不调模型**。<br>另一面：`tool` / `developer` 这类本平台**不存在**的角色（网关也不认：2013 `invalid role`）现在被**剔掉**，而不是原样发给网关换一个说不清的 502。<br>`main` 是把请求照发给网关、由网关来拒：网关回非 2xx ⇒ 原样回 400 + `'AI Gateway error'`；网关以 HTTP 200 + `base_resp{status_code:2013}` 回（老接口的形状）⇒ `data.choices?.[0]?.message?.content \|\| ''` 拿到空串 ⇒ 客户端收到一个**空气泡**（200，正文为空）。两种都不是「明确拒绝这个请求」，而且 `main` 这时**已经建了会话**（一个没人说话的会话行）。<br>（`content` 缺失 / `null` 元素这两种形状在 `main` 上更早就崩了 —— 见下面的「修好的」表。） | ①**可归因**：502「AI Gateway error」的语义是「AI 侧挂了」，会让调用方以为要重试或换模型；真相是「你压根没说要聊什么」，那是 400。②**不花钱**：这个端点公开且可重复调用，不该为「没内容」的请求花一次网关往返。③**不留垃圾**：`main` 那种「建了会话却没人说话」的行会一直堆在库里。 | `tests/api.livepath.test.js`「差异 8」（两条） |
+| 8 | 没有「**可发消息**」的请求 → **400**（本地拒掉，不建会话、不调模型）；本平台不存在的角色被**剔掉** | 判据：**至少要有一条 user/assistant 的、content 非空的消息**。`{"messages":[]}`、只有 system 消息、消息的 content 是空的 —— 这些请求**一条能发给网关的消息都没有**。网关只接受带 user/assistant 消息的请求（2013 `invalid params, chat content is empty`），所以这类请求注定被拒。本分支在**本地**就说清楚：`400` + `{"error":"messages 里至少要有一条有内容的用户或助手消息"}`，**不建会话、不调模型**。<br>另一面：`tool` / `developer` 这类本平台**不存在**的角色现在被**剔掉**（本平台自己的判据只认 user/assistant），而不是原样发给网关换一个说不清的 502。⚠️ 这里要说准确：这两个 400 是**本平台**给的，**不是**网关回的 2013 —— 网关的规则是「至少有一条非 system 的非空消息」，它对 role 的要求比这更宽（线上验过：只有 assistant 的请求网关是**接受**的）。<br>`main` 是把请求照发给网关、由网关来拒：网关回非 2xx（429/401/500）⇒ **原样回网关的状态码** + `'AI Gateway error'`（**不是**固定 400；见「差异 2」）；网关以 HTTP 200 + `base_resp{status_code:2013}` 回（老接口的形状）⇒ `data.choices?.[0]?.message?.content \|\| ''` 拿到空串 ⇒ 客户端收到一个**空气泡**（200，正文为空）。两种都不是「明确拒绝这个请求」，而且 `main` 这时**已经建了会话**（一个没人说话的会话行）。<br>（`content` 缺失 / `null` 元素这两种形状在 `main` 上更早就崩了 —— 见下面的「修好的」表。） | ①**可归因**：502「AI Gateway error」的语义是「AI 侧挂了」，会让调用方以为要重试或换模型；真相是「你压根没说要聊什么」，那是 400。②**不花钱**：这个端点公开且可重复调用，不该为「没内容」的请求花一次网关往返。③**不留垃圾**：`main` 那种「建了会话却没人说话」的行会一直堆在库里。 | `tests/api.livepath.test.js`「差异 8」（两条） |
 
 > 表里的编号与测试名里的编号一一对应（「差异 1」…「差异 8」）。
 > 第 5、6 两条的测试在**别的文件**里，所以没有用「差异 N」开头 ——
@@ -2828,8 +2828,8 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 
 | 层 | 位置 | 作用 |
 |---|---|---|
-| 第一道 | `server.js` 的 `/api/chat` 路由 | 在**建会话之前**就拒掉 ⇒ 不留孤儿会话、不白调一次模型。回 **400**。 |
-| 第二道 | `server/engine/cbtEngine.js`（`empty_history`） | 所有**直接调引擎**的调用方的收口点 —— `server/delivery/*` 与将来的游民纪元 BFF。回 **400**（`server/errorStatus.js` 的 `ENGINE_ERROR_STATUS` 里新增了一条）。 |
+| 第一道 | `server.js` 的 `/api/chat` 路由 | 在**所有参数校验之后**、**会话过期检查之后**、**建会话之前**就拒掉 ⇒ 不留孤儿会话、不白调一次模型。回 **400**。<br>位置是有讲究的：抢在参数校验前面，会把「scenario 写错了」报成「messages 没内容」—— 更具体的错被更笼统的错盖住（引擎那边 `empty_history` 也是**最后**一道，顺序要一致）。 |
+| 第二道 | `server/engine/cbtEngine.js`（`empty_history`） | 所有**直接调引擎**的调用方的收口点 —— `server/delivery/*` 与将来的游民纪元 BFF。回 **400**（`server/errorStatus.js` 的 `ENGINE_ERROR_STATUS` 里新增了一条）。<br>⚠️ **在底座这条分支上，这道防线从 HTTP 路由走不到**：`server/delivery/` 只有 `identity.js` 与 `progress.js`，都不调引擎。它的证据是单元测试 + 错误码表；它是给**将来**的调用方准备的契约。交付线那条（`server/delivery/analysis.js` 的 `ANALYSIS_TURN`）在**自己的分支**上已经补了 —— 那是**调用方该补的**任务轮，引擎补不了。 |
 
 为什么引擎不能替调用方补上那条消息：引擎**不知道「现在要做什么」**。
 素材全走注入通道的调用方（1v1 转写、卡点、教练手法都进了 system prompt）
@@ -2847,6 +2847,54 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 这一类 bug 在测试里根本看不见）。现在多了一个**按网关规则行事**的假
 fetch（`tests/helpers/gatewayRule.js`）：它按网关的真实形状回
 （2013 / `base_resp`），所以这类 bug 再也藏不住。
+
+⚠️ 但要说清楚**两个 400 的来源不同**，别混成一句话：
+网关会回 2013 的形状是「**没有一条非 system 的非空消息**」；
+而 `tool` / `developer` 那种形状是**本平台自己**挡的（判据只认 user/assistant）——
+真发到网关的话，网关按它自己的规则是**接受**的（线上验过：只有 assistant 的
+请求网关回 200）。所以测试里分开两组写：网关也会拒的 / 本平台更严的。
+假 fetch 的规则也据此写（`tests/helpers/gatewayRule.js` 的注释里钉着）。
+
+#### 三条判据不能各写各的
+
+同一个「这句话能不能发给网关」的判断，在这套代码里有过**三份**。前两份共用
+同一份 `usableMessages`（`server/engine/cbtEngine.js` 导出就是为了这个）：
+
+| 判据 | 在哪 | 管什么 |
+|---|---|---|
+| `usableMessages` | `server/engine/cbtEngine.js` | 哪些消息**能发给网关**（user/assistant + content 非空） |
+| 路由的守卫 | `server.js` | 请求**一条都发不出去** ⇒ 400（不建会话、不调模型） |
+| 落库的挑法 | `server.js` | 哪条 user 消息**进库** |
+
+**第三份曾经是另一套**：`messages.filter(m => m && m.role === 'user').pop()` ——
+取的是**最后一条** user 消息，不管它的 content 有没有内容。于是
+
+    [{"role":"user","content":"第一条"},{"role":"user","content":""}]
+
+这种请求：引擎剔掉空的那条、发给网关的是「第一条」，但落库时 `pop()` 拿到的是
+**空的那条** ⇒ 「模型听见了的那句话」**没进库**，会话里只剩 assistant 的一条
+回话 —— 一个「模型听见了、库里没有」的回合。现在落库也走 `usableMessages`
+⇒ **发出去的 = 存下来的**。（钉在 `tests/api.chat.test.js`「落库的用户消息 =
+真正发给模型的那一条」。）
+
+#### 错误优先级：更具体的错先报出来
+
+`{"messages":[],"scenario":"no_such_scenario"}` 报哪个？**Unknown scenario**。
+「没内容」是最笼统的错，不该盖住「你把场景名写错了」这种一看就能改的错。
+路由里的守卫因此排在**所有参数校验之后**、**会话过期检查之后**（过期 410 比
+没内容 400 更具体，而且 `main` 也是这个顺序）、**建会话之前**。
+
+#### 已知残留（这一轮不修，写下来）
+
+- **只有 assistant 消息的请求**：判据允许（网关也接受 —— 线上验过），但会话里会
+  留下一条**没有 user 消息**的 assistant 消息。前端不会这么发（`useChat` 总会
+  附一条非空的 user 轮），所以这是**契约缺口**而不是线上 bug。将来收紧判据
+  （比如「最后一条必须是 user」）会让这类请求变成 400 —— 那是**有意为之**的
+  行为变更，要写进差异表。
+- **history 没有长度上限**：`MAX_CONTEXT_CHARS = 4000` 只约束注入的
+  `clientContext`，不约束 history。每一条 user 轮都**完整**发给网关。唯一的
+  上限是 `express.json()` 的 100kb 请求体上限。这是**既有**问题，不是这一轮
+  引入的。
 
 ### 本分支**修好**的（`main` 上会整站下线）—— 正面的差异
 

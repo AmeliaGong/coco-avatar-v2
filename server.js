@@ -377,22 +377,6 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   }
   const messages = rawMessages;
 
-  // messages 里至少要有一条**能发给网关**的消息。
-  //
-  // 空数组 [] 是数组，但里面没有内容 —— 这样的请求发到网关会被拒
-  // （2013 invalid params, chat content is empty），回 502 只会让调用方
-  // 以为「AI 挂了」。同样的道理适用于「只有 system 消息」「消息的 content
-  // 是空的」「消息里有 null 元素」这几种形状。
-  //
-  // 判据用的是引擎的同一份（usableMessages，见 cbtEngine.js）—— 两处各写
-  // 一遍，迟早会漂。引擎那边还有第二道防线（empty_history），这里是第一道：
-  // 在**建会话之前**就拒掉 ⇒ 不留孤儿会话、不白调一次模型。
-  if (usableMessages(messages).length === 0) {
-    return res.status(400).json({
-      error: 'messages 里至少要有一条有内容的用户或助手消息',
-    });
-  }
-
   if (!SCENARIO_IDS.includes(scenario)) {
     return res
       .status(400)
@@ -471,6 +455,31 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     }
     return res.status(410).json({ error: 'Conversation expired', expired: true });
   }
+
+  // messages 里至少要有一条**能发给网关**的消息。
+  //
+  // 空数组 [] 是数组，但里面没有内容 —— 这样的请求发到网关会被拒
+  // （2013 invalid params, chat content is empty），回 502 只会让调用方
+  // 以为「AI 挂了」。同样的道理适用于「只有 system 消息」「消息的 content
+  // 是空的」「消息里有 null 元素」这几种形状。
+  //
+  // 判据用的是引擎的同一份（usableMessages，见 cbtEngine.js）—— 两处各写
+  // 一遍，迟早会漂。引擎那边还有第二道防线（empty_history），这里是第一道。
+  //
+  // **位置很讲究**，三个理由：
+  //   - 在**所有参数校验之后**：和引擎的顺序一致 —— 引擎那边 empty_history
+  //     是**最后**一道（invalid_schema / unknown_structured_output 这些
+  //     更具体的错要先报出来）。路由要是抢在前面，就会把「scenario 写错了」
+  //     报成「messages 没内容」—— 更具体的错被更笼统的错盖住了。
+  //   - 在**会话过期检查之后**：过期（410）比「没内容」（400）更具体，
+  //     而且 410 那条会把会话状态置成 expired（main 也是这个顺序）。
+  //   - 在**建会话之前**：不留孤儿会话、不白调一次模型（模型调用是花钱的）。
+  if (usableMessages(messages).length === 0) {
+    return res.status(400).json({
+      error: 'messages 里至少要有一条有内容的用户或助手消息',
+    });
+  }
+
   if (!existing) {
     // 会话不存在就建一个。
     //
@@ -486,13 +495,22 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   }
 
   // --- 用户消息 ---
-  const userMsg = messages.filter(m => m && m.role === 'user').pop();
-  // content 不是非空字符串的消息不进库 —— 引擎本来也会把它从上下文里
-  // 剔掉，存进去只会留下一条模型压根没看见的消息。
-  const userContent =
-    userMsg && typeof userMsg.content === 'string' && userMsg.content.trim() !== ''
-      ? userMsg.content
-      : null;
+  //
+  // 落库的判据必须和**发给模型的判据**是同一份（usableMessages）——
+  // 否则会出现「模型看见的那句话」和「存进库的那句话」不是同一句。
+  //
+  // 之前这里是另一套：`messages.filter(m => m && m.role === 'user').pop()`
+  // 取的是**最后一条 user 消息**，不管它的 content 有没有内容。于是
+  //
+  //     [{"role":"user","content":"第一条"},{"role":"user","content":""}]
+  //
+  // 这种请求：引擎剔掉空的那条，发给网关的是「第一条」；但落库时 pop()
+  // 拿到的是**空的那条** ⇒ 用户说的话没进库，会话里只剩 assistant 的一条
+  // 回话 —— 一个「模型听见了、库里没有」的回合。
+  const userMsg = usableMessages(messages).filter(m => m.role === 'user').pop();
+  // usableMessages 已经保证了 content 是非空字符串；没有可发的 user 消息
+  // 就不进库（引擎本来也不会把它发给模型）。
+  const userContent = userMsg ? userMsg.content : null;
   if (userContent !== null) {
     db.prepare(
       'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'

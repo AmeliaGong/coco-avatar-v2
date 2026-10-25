@@ -465,7 +465,8 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     // 为什么引擎来挡（而不是指望调用方）：素材可能**全走注入通道** ——
     // 也就是进了 system prompt（1v1 转写、卡点、教练手法都是这样进来的）。
     // 那种调用方手上没有对话，history 就是空的。这正是同伴在交付线上
-    // 踩到的那个坑（server/delivery/analysis.js 的 ANALYSIS_TURN）。
+    // 踩到的那个坑（那条线的 server/delivery/analysis.js 在 history 为空时
+    // 补一条 ANALYSIS_TURN —— 交付线的代码不在这条分支上）。
     //
     // 引擎**替不了**它补这一条：引擎不知道「现在要做什么」，补出来的
     // 只能是空话。所以这条只能由调用方补（补一条说清任务的用户轮），
@@ -474,9 +475,13 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     // 为什么排在**调模型之前**的最后一步：更具体的错（配置写坏了、
     // 结构化输出类型不对）应该先报出去 —— 它们要人改代码，而这一条
     // 只是这个请求没内容。
+    //
+    // 措辞上只说「要什么」，不说「网关为什么这样」：这条错有可能是被
+    // 直接透给终端用户的（将来的内部接口/BFF），别把网关的实现细节
+    // 抖出去。网关那边的细节写在这里的注释里。
     if (messages.length === 0) {
       throw new CbtEngineError(
-        'history 里至少要有一条有内容的用户或助手消息（网关不接受只有 system 的请求）',
+        'history 里至少要有一条有内容的用户或助手消息',
         { code: 'empty_history' }
       );
     }
