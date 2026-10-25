@@ -5,9 +5,11 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createCbtEngine, usableMessages } from '../server/engine/cbtEngine.js';
 
-// 引擎现在要求「**至少有一条能发给网关的消息**」—— 网关只接受带
-// user/assistant 消息的请求（只有 system 的请求会被拒：
-// 2013 invalid params, chat content is empty）。
+// 引擎现在要求「**至少有一条能发给网关的消息**」—— 网关的底线是
+// 「至少一条非 system 的非空消息」（只有 system 的请求会被拒：
+// 2013 invalid params, chat content is empty，这一点线上验过；
+// 只有 assistant 的请求网关是**接受**的）。本平台比网关更严：
+// 只认 user/assistant。
 //
 // 所以这个文件里的 history 一律带一条 user 轮。
 // **别把它改回 []**：那不是「更简洁的写法」，而是引擎现在会拒绝的输入
@@ -553,8 +555,9 @@ test('content 缺失或为空的消息被跳过', async () => {
 // ---------------------------------------------------------------------------
 // 至少要有一条能发给网关的消息
 //
-// 网关（MiniMax）只接受带 user/assistant 消息的请求：只有 system 的请求
-// 会被拒（2013 invalid params, chat content is empty）。
+// 网关（MiniMax）的底线是「至少一条非 system 的非空消息」：只有 system
+// 的请求会被拒（2013 invalid params, chat content is empty）—— 线上验过。
+// 本平台比它严：只认 user/assistant。
 //
 // **素材全走注入通道的调用方**（1v1 转写、卡点、教练手法都进了 system
 // prompt）手上没有对话，history 就是空的 —— 同伴在交付线上踩到的就是这个。

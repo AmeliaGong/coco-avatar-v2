@@ -281,17 +281,17 @@ test('messages 传空数组 → 400（没有内容可发：不建会话、不调
 //      user 消息 —— 守卫没有把正常路径也堵掉。
 // ---------------------------------------------------------------------------
 
-test('网关规则：没有可发消息的请求不会被发到网关（网关会回 2013）', { timeout: 15000 }, async () => {
+test('网关规则：网关自己也会拒的形状，本地就挡掉，请求根本没发出去', { timeout: 15000 }, async () => {
   const { fetchImpl, calls } = createGatewayRuleFetch();
   globalThis.__cocoFetchImpl = fetchImpl;
   try {
+    // 这一组是**网关也会拒**的（线上验过：只有 system / 没有非空内容 ⇒ 2013）。
     for (const bad of [
       [], // 空数组
       [{ role: 'system', content: '客户端塞的 system' }], // 只有 system
       [{ role: 'user' }], // content 缺失
       [{ role: 'user', content: '   ' }], // content 是空白
       [null], // null 元素
-      [{ role: 'tool', content: '工具结果' }], // 本平台不存在的角色
     ]) {
       const { res } = await postChat({ messages: bad });
       assert.equal(res.status, 400, `messages=${JSON.stringify(bad)} 应该 400`);
@@ -301,6 +301,189 @@ test('网关规则：没有可发消息的请求不会被发到网关（网关�
   } finally {
     globalThis.__cocoFetchImpl = undefined;
   }
+});
+
+test('本平台更严：tool/developer 这些角色本平台不认（**不是**网关会 2013）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch();
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    // 措辞要准确：这两个 400 是**本平台**给的（usableMessages 只认
+    // user/assistant），不是网关回的 2013 —— 假 fetch 的规则比这宽
+    // （它只看「非 system 且 content 非空」），所以它压根没被调用。
+    for (const bad of [
+      [{ role: 'tool', content: '工具结果' }],
+      [{ role: 'developer', content: '开发者消息' }],
+    ]) {
+      const { res } = await postChat({ messages: bad });
+      assert.equal(res.status, 400, `messages=${JSON.stringify(bad)} 应该 400`);
+    }
+    assert.equal(calls.length, 0, '根本没发到网关');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('tool / developer 消息被剔掉：不进网关、不进库（判据与发模型的那份是同一份）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const { res } = await postChat({
+      messages: [
+        { role: 'user', content: '你好' },
+        { role: 'tool', content: '工具结果' },
+        { role: 'developer', content: '开发者消息' },
+      ],
+    });
+    assert.equal(res.status, 200);
+    const sent = calls[0].messages;
+    // **边界断言放在最前面**：发出去的请求体里只允许出现这三种 role。
+    //
+    // 为什么要有这条、为什么放最前面：假 fetch（gatewayRule）的 role 维度
+    // 是**宽松**的（它只看「非 system 且 content 非空」），所以它抓不住
+    // 「哪天有人把判据放宽成 role !== 'system'，于是 tool 被原样发到网关」
+    // 这类回归。网关在 tool/developer 上的态度**我们没验过** ⇒ 只能靠这条
+    // 自己守住。放在 length/deepEqual 之后的话，那两条会先红，这条永远
+    // 轮不到失败 —— 它就不是一道**有效**的守卫了。
+    for (const m of sent) {
+      assert.ok(
+        ['system', 'user', 'assistant'].includes(m.role),
+        `请求体里出现了不该发的 role：${m.role}`
+      );
+    }
+    // 发给网关的请求体里没有 tool / developer 消息
+    assert.equal(sent.length, 2, '只有 system + user');
+    assert.deepEqual(sent[1], { role: 'user', content: '你好' });
+    // 库里也没有 tool / developer 消息
+    assert.equal(countMessages('user'), 1);
+    assert.equal(countMessages('tool'), 0);
+    assert.equal(countMessages('developer'), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('空 content 的 assistant 不发给网关；非空的 assistant 会发（首屏问候语）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    // 前端在生成回复时会先插一条 content 为空的 assistant 占位
+    //（`useChat` 的 setMessages），那条**不能**发到网关。
+    const { res } = await postChat({
+      messages: [
+        { role: 'assistant', content: '' },
+        { role: 'user', content: '你好' },
+      ],
+    });
+    assert.equal(res.status, 200);
+    const sent = calls[0].messages;
+    assert.equal(sent.length, 2, '空的 assistant 被剔掉了');
+    assert.deepEqual(sent[1], { role: 'user', content: '你好' });
+    for (const m of sent) {
+      assert.ok(
+        typeof m.content === 'string' && m.content.trim() !== '',
+        `发出去了一条空消息：${JSON.stringify(m)}`
+      );
+    }
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('落库的用户消息 = 真正发给模型的那一条（不是「最后一条 user」）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const { res } = await postChat({
+      messages: [
+        { role: 'user', content: '第一条' },
+        { role: 'user', content: '' }, // 空的：引擎会剔掉
+      ],
+    });
+    assert.equal(res.status, 200);
+    // 引擎把空的那条剔掉了 —— 发给网关的是「第一条」
+    const sent = calls[0].messages;
+    assert.equal(sent.length, 2, '只有 system + 第一条');
+    assert.deepEqual(sent[1], { role: 'user', content: '第一条' });
+    // 落库也必须是「第一条」：模型听见了的那句话不能丢。
+    // （之前这里是另一套判据：取「最后一条 user」⇒ pop() 拿到空的那条 ⇒
+    //   「第一条」模型听见了、库里却没有。）
+    const userRows = rows("SELECT * FROM messages WHERE role = 'user'");
+    assert.equal(userRows.length, 1);
+    assert.equal(userRows[0].content, '第一条');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('错误优先级：更具体的错先报出来（空消息不盖住配置错）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  const cases = [
+    [{ messages: [], scenario: 'no_such_scenario' }, 'Unknown scenario'],
+    [{ messages: [], structured_output: 'no_such_type' }, 'Unknown structured_output'],
+    [{ messages: [], client_id: { evil: true } }, 'client_id 必须是字符串'],
+    [{ messages: [], conversation_id: '' }, 'conversation_id 必须是非空字符串'],
+  ];
+  for (const [body, expected] of cases) {
+    const { res, text } = await postChat(body);
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.ok(text.includes(expected), `期望包含「${expected}」，实际：${text}`);
+  }
+  assert.equal(modelCalled, false, '参数就不对的请求不该调模型');
+  assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+});
+
+test('会话过期优先于「消息没内容」（410 先报）', { timeout: 15000 }, async () => {
+  getDb()
+    .prepare(
+      'INSERT INTO conversations (id, title, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?)'
+    )
+    .run(
+      'conv-expired-empty',
+      null,
+      new Date().toISOString(),
+      new Date(Date.now() - 60_000).toISOString(),
+      'active'
+    );
+  installFetch('不该被调用');
+  const { res, text } = await postChat({
+    messages: [],
+    conversation_id: 'conv-expired-empty',
+  });
+  assert.equal(res.status, 410);
+  assert.ok(text.includes('expired'), text);
+  // 过期检查在守卫之前 ⇒ 副作用先发生：会话状态被置成 expired
+  const conv = rows('SELECT * FROM conversations WHERE id = ?', 'conv-expired-empty')[0];
+  assert.equal(conv.status, 'expired');
+});
+
+test('过期会话 + 别的参数也写错了 → 400（参数错先报；与 main 的顺序不同）', { timeout: 15000 }, async () => {
+  // main 压根没有 scenario 校验，过期检查在最前 ⇒ 同样这个请求 main 是 410。
+  // 我们先校验参数 ⇒ 400 Unknown scenario。方向上是「更具体的错先报」，
+  // 但顺序与 main 不一致 —— 写下来，别装作一致。
+  getDb()
+    .prepare(
+      'INSERT INTO conversations (id, title, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?)'
+    )
+    .run(
+      'conv-expired-badparam',
+      null,
+      new Date().toISOString(),
+      new Date(Date.now() - 60_000).toISOString(),
+      'active'
+    );
+  installFetch('不该被调用');
+  const { res, text } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    conversation_id: 'conv-expired-badparam',
+    scenario: 'no_such_scenario',
+  });
+  assert.equal(res.status, 400);
+  assert.ok(text.includes('Unknown scenario'), text);
 });
 
 test('网关规则：正常请求照发到网关，且请求体里带着那条 user 消息', { timeout: 15000 }, async () => {
@@ -536,6 +719,9 @@ test('模型网关返回 500 → 502，且没有任何 assistant 消息落库', 
 
   assert.equal(res.status, 502);
   assert.equal(countMessages('assistant'), 0);
+  // 非 2xx ⇒ 网关没给 usage ⇒ 没有这一行。
+  // （下面「失败的一轮也要记账」那一组里有更完整的同名断言，
+  //   这里保留这条是因为它是「网关直接报错」这条路径的最小回归。）
   assert.equal(rows('SELECT * FROM token_usage').length, 0);
 });
 
@@ -557,6 +743,92 @@ test('模型返回空内容 → 502，且没有任何 assistant 消息落库', {
 
   assert.equal(res.status, 502);
   assert.equal(countMessages('assistant'), 0);
+});
+
+// ---------------------------------------------------------------------------
+// 失败的一轮也要记账（差异 9）
+//
+// 「没拿到正文」不是「没付钱」。上游 200 但没有正文时，请求照样跑完了、
+// tokens 照样被扣 —— 这一轮的钱必须记进 token_usage。
+//
+// `main` 在这一档是回 200 + 空气泡并且照记账；本分支回 502（更可归因），
+// 但**不记账就是漏账**。
+// ---------------------------------------------------------------------------
+
+test('上游 200 但没有正文 → 502，这一轮的钱**照样记账**（有账、无 assistant 行）', { timeout: 15000 }, async () => {
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [{ message: { content: '' } }],
+        usage: { prompt_tokens: 40, completion_tokens: 0, total_tokens: 40 },
+      };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '我最近总是失眠' }],
+  });
+
+  assert.equal(res.status, 502);
+  // 没有正文 ⇒ 没有 assistant 行。
+  assert.equal(countMessages('assistant'), 0);
+  // 但「用户说了什么」是事实，不因为模型这一轮没给出正文而消失。
+  assert.equal(countMessages('user'), 1);
+
+  // 账在。
+  const usage = rows('SELECT * FROM token_usage');
+  assert.equal(usage.length, 1, '失败的一轮没有记账');
+  assert.equal(usage[0].total_tokens, 40);
+  assert.equal(usage[0].prompt_tokens, 40);
+  assert.equal(usage[0].completion_tokens, 0);
+  assert.equal(usage[0].scenario, 'chat');
+  assert.ok(usage[0].prompt_version, '没有记 prompt_version');
+  assert.equal(usage[0].conversation_id, rows('SELECT id FROM conversations')[0].id);
+});
+
+test('失败路径上 token_usage 写不进去时，仍然回 502（记账失败不能让请求崩溃）', { timeout: 15000 }, async () => {
+  const db = getDb();
+  db.exec(`
+    CREATE TRIGGER block_token_usage_insert
+    BEFORE INSERT ON token_usage
+    BEGIN
+      SELECT RAISE(ABORT, 'token usage insert blocked by test');
+    END;
+  `);
+
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return {
+        choices: [{ message: { content: '' } }],
+        usage: { prompt_tokens: 40, completion_tokens: 0, total_tokens: 40 },
+      };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  try {
+    const { res, text } = await postChat({
+      messages: [{ role: 'user', content: '你好' }],
+    });
+
+    // ⚠️ 这一条是「进程不许崩」的守卫：
+    // Express 4 不接 async handler 的 rejection ⇒ 未捕获 ⇒ 进程退出 ⇒
+    // 整站下线。记账失败必须被兜住，代价是「少记一笔」而不是「站点没了」。
+    assert.equal(res.status, 502);
+    assert.ok(!text.includes('data: '), '响应体里出现了流式内容');
+    assert.equal(rows('SELECT * FROM token_usage').length, 0);
+  } finally {
+    db.exec('DROP TRIGGER IF EXISTS block_token_usage_insert');
+  }
 });
 
 // ---------------------------------------------------------------------------

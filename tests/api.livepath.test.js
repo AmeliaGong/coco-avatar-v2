@@ -309,8 +309,9 @@ test('修好的 2：{"messages":[null]} → 400，进程不崩（main 上会整�
 // ---------------------------------------------------------------------------
 // 差异 8：没有「可发消息」的请求 → **本地 400**（不建会话、不调模型）
 //
-// 网关（MiniMax）只接受带 user/assistant 消息的请求：只有 system 的请求
-// 会被拒（2013 invalid params, chat content is empty）。
+// 网关（MiniMax）的底线是「至少带一条**非 system 的非空**消息」：只有
+// system 的请求会被拒（2013 invalid params, chat content is empty）——
+// 这一点线上验过；只有 assistant 的请求网关是**接受**的。
 //
 // main：这种请求**照发到网关**，由网关来拒 —— 网关回什么形状，客户端就
 // 收到什么形状：

@@ -284,6 +284,41 @@ function persistTurn({ convId, scenario, turn }) {
   }
 }
 
+// 失败的一轮也要**记账**。
+//
+// 「这一轮已经付过钱了」是硬事实：网关回 200 但**没有正文**（2013 / 空
+// choices / content 不是字符串），请求照样跑完了、tokens 照样被扣。
+// `main` 在这一档是回 200 + 空气泡，并且**照记 token 账**（有 usage 就记）。
+// 本分支把这一档判成 502（更可归因：不是「AI 挂了」而是「这一轮没正文」），
+// 但**不能**因此不记账 —— 上面 persistTurn 里那句「token 账：**任何情况下
+// 都要记**」说的就是这件事。
+//
+// 落库的形状与 `main` 一致：有 user 行、有 token 账、**没有** assistant 行
+// （没有正文可存）。会话标题这一轮不生成（它由成功路径的事务顺手设置；
+// 下一轮成功时会补上）。
+//
+// ⚠️ 记账失败**不能**让请求变成崩溃：Express 4 不接 async handler 的
+// rejection ⇒ 未捕获 ⇒ 进程退出 ⇒ 整站下线。所以这里 try/catch 兜住，只记日志。
+// 账丢了是「少记一笔」，进程退出是「整站没了」—— 两者不能比。
+function recordFailedTurnUsage({ convId, scenario, error }) {
+  if (!error || !error.usage) return; // 没有用量可记（请求压根没发出去 / 上游没给 usage）
+  try {
+    const promptTokens = error.usage.prompt_tokens || 0;
+    const completionTokens = error.usage.completion_tokens || 0;
+    const total = error.usage.total_tokens || promptTokens + completionTokens;
+    // prompt_version 与成功路径同一份算法（引擎那边也是
+    // `${baseVersion}.${scenarioVersion}`），否则同一个会话里两轮的行
+    // 会指向不同的版本串。
+    const meta = promptRegistry.getPromptMeta(scenario);
+    const promptVersion = meta ? `${meta.baseVersion}.${meta.scenarioVersion}` : null;
+    db.prepare(
+      'INSERT INTO token_usage (conversation_id, prompt_tokens, completion_tokens, total_tokens, created_at, scenario, prompt_version) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(convId, promptTokens, completionTokens, total, now(), scenario, promptVersion);
+  } catch (err) {
+    console.error('Failed to record token usage for a failed turn:', err);
+  }
+}
+
 // 伪 SSE：前端按 `data: ` 行读，结尾是 `data: [DONE]`。
 function streamReply(res, convId, text) {
   res.setHeader('Content-Type', 'application/json');
@@ -417,22 +452,6 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   }
   const messages = rawMessages;
 
-  // messages 里至少要有一条**能发给网关**的消息。
-  //
-  // 空数组 [] 是数组，但里面没有内容 —— 这样的请求发到网关会被拒
-  // （2013 invalid params, chat content is empty），回 502 只会让调用方
-  // 以为「AI 挂了」。同样的道理适用于「只有 system 消息」「消息的 content
-  // 是空的」「消息里有 null 元素」这几种形状。
-  //
-  // 判据用的是引擎的同一份（usableMessages，见 cbtEngine.js）—— 两处各写
-  // 一遍，迟早会漂。引擎那边还有第二道防线（empty_history），这里是第一道：
-  // 在**建会话之前**就拒掉 ⇒ 不留孤儿会话、不白调一次模型。
-  if (usableMessages(messages).length === 0) {
-    return res.status(400).json({
-      error: 'messages 里至少要有一条有内容的用户或助手消息',
-    });
-  }
-
   if (!SCENARIO_IDS.includes(scenario)) {
     return res
       .status(400)
@@ -511,6 +530,33 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     }
     return res.status(410).json({ error: 'Conversation expired', expired: true });
   }
+
+  // messages 里至少要有一条**能发给网关**的消息。
+  //
+  // 空数组 [] 是数组，但里面没有内容 —— 这样的请求发到网关会被拒
+  // （2013 invalid params, chat content is empty），回 502 只会让调用方
+  // 以为「AI 挂了」。同样的道理适用于「只有 system 消息」「消息的 content
+  // 是空的」「消息里有 null 元素」这几种形状。
+  //
+  // 判据用的是引擎的同一份（usableMessages，见 cbtEngine.js）—— 两处各写
+  // 一遍，迟早会漂。引擎那边还有第二道防线（empty_history），这里是第一道。
+  //
+  // **位置很讲究**，三个理由：
+  //   - 在**所有参数校验之后**：和引擎的顺序一致 —— 引擎那边 empty_history
+  //     是**最后**一道（invalid_schema / unknown_structured_output 这些
+  //     更具体的错要先报出来）。路由要是抢在前面，就会把「scenario 写错了」
+  //     报成「messages 没内容」—— 更具体的错被更笼统的错盖住了。
+  //   - 在**会话过期检查之后**：过期（410）比「没内容」（400）更具体。
+  //     （`main` 也是这个顺序 —— 但注意 `main` 的 POST **只**回 410、
+  //     **不**置 status；置 expired 的那个副作用是 `main` 的 GET 会话接口
+  //     做的。本分支在 POST 里顺手置了。）
+  //   - 在**建会话之前**：不留孤儿会话、不白调一次模型（模型调用是花钱的）。
+  if (usableMessages(messages).length === 0) {
+    return res.status(400).json({
+      error: 'messages 里至少要有一条有内容的用户或助手消息',
+    });
+  }
+
   if (!existing) {
     // 会话不存在就建一个。
     //
@@ -526,13 +572,22 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   }
 
   // --- 用户消息 ---
-  const userMsg = messages.filter(m => m && m.role === 'user').pop();
-  // content 不是非空字符串的消息不进库 —— 引擎本来也会把它从上下文里
-  // 剔掉，存进去只会留下一条模型压根没看见的消息。
-  const userContent =
-    userMsg && typeof userMsg.content === 'string' && userMsg.content.trim() !== ''
-      ? userMsg.content
-      : null;
+  //
+  // 落库的判据必须和**发给模型的判据**是同一份（usableMessages）——
+  // 否则会出现「模型看见的那句话」和「存进库的那句话」不是同一句。
+  //
+  // 之前这里是另一套：`messages.filter(m => m && m.role === 'user').pop()`
+  // 取的是**最后一条 user 消息**，不管它的 content 有没有内容。于是
+  //
+  //     [{"role":"user","content":"第一条"},{"role":"user","content":""}]
+  //
+  // 这种请求：引擎剔掉空的那条，发给网关的是「第一条」；但落库时 pop()
+  // 拿到的是**空的那条** ⇒ 用户说的话没进库，会话里只剩 assistant 的一条
+  // 回话 —— 一个「模型听见了、库里没有」的回合。
+  const userMsg = usableMessages(messages).filter(m => m.role === 'user').pop();
+  // usableMessages 已经保证了 content 是非空字符串；没有可发的 user 消息
+  // 就不进库（引擎本来也不会把它发给模型）。
+  const userContent = userMsg ? userMsg.content : null;
   if (userContent !== null) {
     db.prepare(
       'INSERT INTO messages (conversation_id, role, content, created_at) VALUES (?, ?, ?, ?)'
@@ -578,6 +633,17 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
         promptVersion: error.promptVersion,
       };
     } else {
+      // 失败的一轮也要**记账**（见 recordFailedTurnUsage 的注释）。
+      //
+      // 这一档的形态与成功路径不同：
+      //   - user 行**已经**落了库（上面 persistUserMessage 那一步）——
+      //     「用户说了什么」是事实，不会因为模型这一轮没给出正文而消失；
+      //   - assistant 行**没有**（没有正文可存）；
+      //   - token 账要记（网关给了 usage 的话）。
+      //
+      // `main` 在这一档是回 200 + 空气泡并且照记 token 账；本分支回 502
+      // （更可归因），但**不记账就是漏账**。
+      recordFailedTurnUsage({ convId, scenario, error });
       return respondWithEngineError(res, error);
     }
   }
