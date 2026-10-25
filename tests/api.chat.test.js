@@ -336,26 +336,55 @@ test('tool / developer 消息被剔掉：不进网关、不进库（判据与发
       ],
     });
     assert.equal(res.status, 200);
-    // 发给网关的请求体里没有 tool / developer 消息
     const sent = calls[0].messages;
-    assert.equal(sent.length, 2, '只有 system + user');
-    assert.deepEqual(sent[1], { role: 'user', content: '你好' });
-    // **边界断言**：发出去的请求体里只允许出现这三种 role。
+    // **边界断言放在最前面**：发出去的请求体里只允许出现这三种 role。
     //
-    // 为什么要有这条：假 fetch（gatewayRule）的 role 维度是**宽松**的
-    // （它只看「非 system 且 content 非空」），所以它抓不住「哪天有人把
-    // 判据放宽成 role !== 'system'，于是 tool 被原样发到网关」这类回归。
-    // 网关在 tool/developer 上的态度**我们没验过** ⇒ 只能靠这条自己守住。
+    // 为什么要有这条、为什么放最前面：假 fetch（gatewayRule）的 role 维度
+    // 是**宽松**的（它只看「非 system 且 content 非空」），所以它抓不住
+    // 「哪天有人把判据放宽成 role !== 'system'，于是 tool 被原样发到网关」
+    // 这类回归。网关在 tool/developer 上的态度**我们没验过** ⇒ 只能靠这条
+    // 自己守住。放在 length/deepEqual 之后的话，那两条会先红，这条永远
+    // 轮不到失败 —— 它就不是一道**有效**的守卫了。
     for (const m of sent) {
       assert.ok(
         ['system', 'user', 'assistant'].includes(m.role),
         `请求体里出现了不该发的 role：${m.role}`
       );
     }
+    // 发给网关的请求体里没有 tool / developer 消息
+    assert.equal(sent.length, 2, '只有 system + user');
+    assert.deepEqual(sent[1], { role: 'user', content: '你好' });
     // 库里也没有 tool / developer 消息
     assert.equal(countMessages('user'), 1);
     assert.equal(countMessages('tool'), 0);
     assert.equal(countMessages('developer'), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('空 content 的 assistant 不发给网关；非空的 assistant 会发（首屏问候语）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch({ content: '收到。' });
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    // 前端在生成回复时会先插一条 content 为空的 assistant 占位
+    //（`useChat` 的 setMessages），那条**不能**发到网关。
+    const { res } = await postChat({
+      messages: [
+        { role: 'assistant', content: '' },
+        { role: 'user', content: '你好' },
+      ],
+    });
+    assert.equal(res.status, 200);
+    const sent = calls[0].messages;
+    assert.equal(sent.length, 2, '空的 assistant 被剔掉了');
+    assert.deepEqual(sent[1], { role: 'user', content: '你好' });
+    for (const m of sent) {
+      assert.ok(
+        typeof m.content === 'string' && m.content.trim() !== '',
+        `发出去了一条空消息：${JSON.stringify(m)}`
+      );
+    }
   } finally {
     globalThis.__cocoFetchImpl = undefined;
   }

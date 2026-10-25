@@ -471,8 +471,10 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   //     是**最后**一道（invalid_schema / unknown_structured_output 这些
   //     更具体的错要先报出来）。路由要是抢在前面，就会把「scenario 写错了」
   //     报成「messages 没内容」—— 更具体的错被更笼统的错盖住了。
-  //   - 在**会话过期检查之后**：过期（410）比「没内容」（400）更具体，
-  //     而且 410 那条会把会话状态置成 expired（main 也是这个顺序）。
+  //   - 在**会话过期检查之后**：过期（410）比「没内容」（400）更具体。
+  //     （`main` 也是这个顺序 —— 但注意 `main` 的 POST **只**回 410、
+  //     **不**置 status；置 expired 的那个副作用是 `main` 的 GET 会话接口
+  //     做的。本分支在 POST 里顺手置了。）
   //   - 在**建会话之前**：不留孤儿会话、不白调一次模型（模型调用是花钱的）。
   if (usableMessages(messages).length === 0) {
     return res.status(400).json({

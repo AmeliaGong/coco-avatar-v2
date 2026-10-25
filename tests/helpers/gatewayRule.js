@@ -29,7 +29,7 @@
 //   - 这个假 fetch 的 role 维度是**宽松**的 ⇒ 它**不会**替我们抓「发出去
 //     才发现网关不认 tool」这一类回归。要抓那个，靠的是**边界断言**：
 //     发出去的请求体里只允许出现 system/user/assistant 三种 role
-//     （见 tests/api.chat.test.js「tool 消息被剔掉」那条）。
+//     （见 tests/api.chat.test.js「tool / developer 消息被剔掉」那条）。
 //
 // 写测试时别把两件事混成一句话（曾经混过：测试名说「网关会回 2013」，
 // 实际那个 400 是本平台自己给的）。

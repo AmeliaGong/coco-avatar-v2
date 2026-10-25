@@ -459,8 +459,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
 
     // 至少要有一条**能发给网关**的消息。
     //
-    // 网关（MiniMax）拒绝「只有 system、没有 user/assistant」的请求：
-    // 2013 invalid params, chat content is empty。
+    // 网关（MiniMax）拒绝「**没有一条非 system 的非空消息**」的请求：
+    // 2013 invalid params, chat content is empty（这一档线上验过；
+    // role 那一维没验过，见上面 usableMessages 的注释）。
     // 与其花一次网关往返换一个说不清的 502，不如在本地就说清楚是
     // 「这个请求没有内容」。
     //
