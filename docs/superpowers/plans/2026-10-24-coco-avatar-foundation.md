@@ -2815,10 +2815,38 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 | 5 | `conversation_id` **字符集**受限 → **400** | 只允许 `A-Za-z0-9._~-`（我们自己的 id 是 `crypto.randomUUID()`）。`main` 不限字符，于是 `conversation_id: "a\nb"` 会一路走到 `res.setHeader('X-Conversation-Id', ...)` 抛 `ERR_INVALID_CHAR`。 | 那个 id 会**原样进响应头**。在本分支的「先落库、再吐流」顺序下，它抛的时候**模型已经计费、库里已经留下孤儿会话与孤儿消息**了 —— 而这是公开端点，可以重复放大成本。所以字符集必须在**任何写库 / 调模型之前**拒掉。 | `tests/api.chat.test.js`「conversation_id 含换行 / 控制字符 / 空格 → 400」 |
 | 6 | `migrateSchema` 把 `duplicate column name` 当成**成功** | 之前任何 ALTER 失败都抛错 → `getDb()` 抛 → `server.js` 模块级 `const db = getDb()` 在 `listen()` 之前就抛 → 进程退出 → crash loop。 | `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` 是 check-then-act，**不是**跨进程原子的。fly 滚动部署可能短暂有两个机器对着同一个卷跑迁移，输的那一个拿到的 `duplicate column name` 恰恰是**想要的结果**（列已经存在了）。别的 ALTER 失败照旧抛。 | `tests/db.schema.test.js`「并发 ALTER 撞车」 |
 | 7 | 400 响应体里回显的用户输入**限长 40 + 去控制字符** | `Unknown scenario: ${scenario}` / `Unknown structured_output: ${structured_output}` 改成先过 `echoForError()`。合法取值**不变**（`'foo'` 还是 `'foo'`），只有超长 / 带控制字符的输入被改写。 | 这两个字段用户可控，而 `express.json()` 默认上限 100kb ⇒ 100kb 请求换来 100kb 响应（**响应放大**），而这个端点公开、可无限重复调用。控制字符还会污染日志与任何把错误体渲染成文本的地方。 | `tests/api.livepath.test.js`「差异 7」（两条） |
+| 8 | 没有「**可发消息**」的请求 → **400**（本地拒掉，不建会话、不调模型）；本平台不存在的角色被**剔掉** | 判据：**至少要有一条 user/assistant 的、content 非空的消息**。`{"messages":[]}`、只有 system 消息、消息的 content 是空的 —— 这些请求**一条能发给网关的消息都没有**。网关只接受带 user/assistant 消息的请求（2013 `invalid params, chat content is empty`），所以这类请求注定被拒。本分支在**本地**就说清楚：`400` + `{"error":"messages 里至少要有一条有内容的用户或助手消息"}`，**不建会话、不调模型**。<br>另一面：`tool` / `developer` 这类本平台**不存在**的角色（网关也不认：2013 `invalid role`）现在被**剔掉**，而不是原样发给网关换一个说不清的 502。<br>`main` 是把请求照发给网关、由网关来拒：网关回非 2xx ⇒ 原样回 400 + `'AI Gateway error'`；网关以 HTTP 200 + `base_resp{status_code:2013}` 回（老接口的形状）⇒ `data.choices?.[0]?.message?.content \|\| ''` 拿到空串 ⇒ 客户端收到一个**空气泡**（200，正文为空）。两种都不是「明确拒绝这个请求」，而且 `main` 这时**已经建了会话**（一个没人说话的会话行）。<br>（`content` 缺失 / `null` 元素这两种形状在 `main` 上更早就崩了 —— 见下面的「修好的」表。） | ①**可归因**：502「AI Gateway error」的语义是「AI 侧挂了」，会让调用方以为要重试或换模型；真相是「你压根没说要聊什么」，那是 400。②**不花钱**：这个端点公开且可重复调用，不该为「没内容」的请求花一次网关往返。③**不留垃圾**：`main` 那种「建了会话却没人说话」的行会一直堆在库里。 | `tests/api.livepath.test.js`「差异 8」（两条） |
 
-> 表里的编号与测试名里的编号一一对应（「差异 1」…「差异 7」）。
+> 表里的编号与测试名里的编号一一对应（「差异 1」…「差异 8」）。
 > 第 5、6 两条的测试在**别的文件**里，所以没有用「差异 N」开头 ——
 > 按「测试」列给出的文件与用例名去找即可。
+
+#### 「差异 8」的两道防线
+
+「至少要有一条能发给网关的消息」这条规则在**两个层次**上成立，判据只有
+**一份**（`server/engine/cbtEngine.js` 导出的 `usableMessages`）：
+
+| 层 | 位置 | 作用 |
+|---|---|---|
+| 第一道 | `server.js` 的 `/api/chat` 路由 | 在**建会话之前**就拒掉 ⇒ 不留孤儿会话、不白调一次模型。回 **400**。 |
+| 第二道 | `server/engine/cbtEngine.js`（`empty_history`） | 所有**直接调引擎**的调用方的收口点 —— `server/delivery/*` 与将来的游民纪元 BFF。回 **400**（`server/errorStatus.js` 的 `ENGINE_ERROR_STATUS` 里新增了一条）。 |
+
+为什么引擎不能替调用方补上那条消息：引擎**不知道「现在要做什么」**。
+素材全走注入通道的调用方（1v1 转写、卡点、教练手法都进了 system prompt）
+手上没有对话，history 就是空的 —— 那条「任务轮」只能由调用方自己补
+（交付线的 `server/delivery/analysis.js` 里的 `ANALYSIS_TURN` 就是这么做的：
+它不是素材，只是把「现在要做什么」说清楚）。
+
+引擎这一层挡的是**没补**的那一种：它不知道任务，但它知道「网关不收这种
+请求」—— 与其花一次网关往返换一个说不清的 502，不如在本地就说清楚是
+「这个请求没有内容」。
+
+**为什么这条值得单列一条差异**：它同时暴露了一个更老的问题 ——
+`tests/api.chat.test.js` 与 `tests/api.livepath.test.js` 里原先有几条
+断言钉的是**虚构**（假 fetch 对任何请求都回 200，于是「请求体形状不对」
+这一类 bug 在测试里根本看不见）。现在多了一个**按网关规则行事**的假
+fetch（`tests/helpers/gatewayRule.js`）：它按网关的真实形状回
+（2013 / `base_resp`），所以这类 bug 再也藏不住。
 
 ### 本分支**修好**的（`main` 上会整站下线）—— 正面的差异
 
@@ -2827,13 +2855,26 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 
 | 输入 | `main` 上发生了什么 | 本分支 |
 |---|---|---|
-| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | `server.js` 的用户消息提取处做了类型/空值检查：content 不是非空字符串的消息**不进库**（模型本来也看不见它）→ 200 |
-| `{"messages":[null]}` | `m.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | null 元素被跳过 → 200 |
+| `{"messages":[{"role":"user"}]}` | `userMsg.content` 是 `undefined` → 被当成 NULL 写进 `NOT NULL` 列 → `SqliteError` 抛在 try **之外** → unhandled rejection → **进程退出** | **400**（`messages 里至少要有一条有内容的用户或助手消息`）⇒ 不建会话、不调模型、进程不崩 |
+| `{"messages":[null]}` | `m.filter(m => m.role === 'user')` → `TypeError`（读 `null.role`）→ 同样 unhandled rejection → **进程退出** | **400**（同上） |
 
 **这是本分支最重要的正面差异**，也是「零行为变化」这句话必须读成
 「对**格式正确**的请求零行为变化」的原因。
 
 两条都有测试：`tests/api.livepath.test.js`「修好的 1」「修好的 2」。
+
+> ⚠️ 这两条以前写的是「→ 200」，那是**虚构**。
+>
+> 当时的断言是「content 不是非空字符串的消息不进库 → 200」+「null 元素被
+> 跳过 → 200」，靠的是**假 fetch 对任何请求都回 200**。生产上这两种请求
+> 会被发到网关（请求体里只有一条 system），而网关拒绝这种请求
+> （2013 `chat content is empty`）⇒ 回 **502**。也就是说「200 + 一条助手
+> 消息」只在测试里发生过。
+>
+> 现在回 400：这两个请求确实**一条能发的话都没有**（`{"role":"user"}` 的
+> content 是 `undefined`；`[null]` 整个元素就是空的），说清楚比假装回了一轮
+> 对话好。判据与「差异 8」是同一条：**至少要有一条有内容的 user/assistant
+> 消息**。
 
 ### 仍然成立的「零行为变化」保证
 

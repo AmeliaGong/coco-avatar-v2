@@ -3,7 +3,16 @@
 import './helpers/testEnv.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createCbtEngine } from '../server/engine/cbtEngine.js';
+import { createCbtEngine, usableMessages } from '../server/engine/cbtEngine.js';
+
+// 引擎现在要求「**至少有一条能发给网关的消息**」—— 网关只接受带
+// user/assistant 消息的请求（只有 system 的请求会被拒：
+// 2013 invalid params, chat content is empty）。
+//
+// 所以这个文件里的 history 一律带一条 user 轮。
+// **别把它改回 []**：那不是「更简洁的写法」，而是引擎现在会拒绝的输入
+// （见下面「没有能发的消息 → empty_history」那几条）。
+const USER_TURN = [{ role: 'user', content: '你好' }];
 
 function makeEngine({ reply = '好的', structured = null, promptText = 'SYSTEM PROMPT' } = {}) {
   const calls = [];
@@ -53,7 +62,7 @@ test('引擎把 schema 提示拼进 system prompt', async () => {
   const { engine, calls } = makeEngine();
   await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
   });
   assert.ok(calls[0].systemPrompt.includes('__structured__'));
@@ -76,7 +85,7 @@ test('schemas 传 { schema, notes } 时字段说明也进 system prompt', async 
       },
     },
   });
-  await engine({ scenario: 'analysis', history: [], structuredOutput: 'plan' });
+  await engine({ scenario: 'analysis', history: USER_TURN, structuredOutput: 'plan' });
   assert.ok(calls[0].systemPrompt.includes('__structured__'));
   assert.ok(calls[0].systemPrompt.includes('false 表示这一轮只交付诊断'));
   // 说明只进「字段说明」段，绝不能混进 JSON 骨架 —— 混进去模型会照抄成输出的一部分。
@@ -89,7 +98,7 @@ test('引擎把卡点与知识库注入 system prompt', async () => {
   const { engine, calls } = makeEngine();
   await engine({
     scenario: 'cbt_delivery',
-    history: [],
+    history: USER_TURN,
     clientContext: {
       stuckPoint: { title: '我不能停下来', belief: '停下来就会被抛弃' },
       knowledge: [{ kind: 'case', title: '一个案例', content: '案例正文' }],
@@ -101,7 +110,7 @@ test('引擎把卡点与知识库注入 system prompt', async () => {
 
 test('没有请求结构化输出时不追加 schema 指令', async () => {
   const { engine, calls } = makeEngine();
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.ok(!calls[0].systemPrompt.includes('__structured__'));
   assert.equal(result.structured, null);
 });
@@ -110,14 +119,14 @@ test('没请求结构化输出时即便模型自己吐了结构化块，structur
   // 模型偶尔会自作主张多吐一个结构化块。这轮没要结构化输出，
   // 就不该凭空多出一个 structured 对象（下游会当成业务数据存库）。
   const { engine } = makeEngine({ reply: '好的', structured: { title: '多余' } });
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.equal(result.structured, null);
   assert.equal(result.reply, '好的');
 });
 
 test('引擎返回 usage 与场景标识', async () => {
   const { engine } = makeEngine();
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.equal(result.usage.total_tokens, 3);
   assert.equal(result.scenario, 'chat');
 });
@@ -134,13 +143,13 @@ test('promptVersion 是 base 与 scenario 两个内容哈希用点连接', async
     }),
     callModel: async () => ({ content: 'ok', usage: { total_tokens: 1 } }),
   });
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.equal(result.promptVersion, 'a1b2c3d4.e5f60718');
 });
 
 test('没有 getPromptMeta 时 promptVersion 为 null', async () => {
   const { engine } = makeEngine();
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.equal(result.promptVersion, null);
 });
 
@@ -155,7 +164,7 @@ test('未知结构化输出类型直接报错且不调用模型', async () => {
     schemas: { stuck_point: { title: '卡点标题' } },
   });
   await assert.rejects(
-    () => engine({ scenario: 'chat', history: [], structuredOutput: 'nope' }),
+    () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: 'nope' }),
     /未知的结构化输出类型：nope/
   );
   assert.equal(calls.length, 0);
@@ -176,7 +185,7 @@ test('原型链上的键名不是合法的结构化输出类型', async () => {
       schemas: { stuck_point: { title: '卡点标题' } },
     });
     await assert.rejects(
-      () => engine({ scenario: 'chat', history: [], structuredOutput: key }),
+      () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: key }),
       new RegExp(`未知的结构化输出类型：${key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
     );
     assert.equal(calls.length, 0, `结构化输出类型 ${key} 不该调用模型`);
@@ -199,7 +208,7 @@ test('schema 存在但无效时报错且不调用模型', async () => {
     },
   });
   await assert.rejects(
-    () => engine({ scenario: 'analysis', history: [], structuredOutput: 'plan' }),
+    () => engine({ scenario: 'analysis', history: USER_TURN, structuredOutput: 'plan' }),
     (err) => {
       // 错误要说清楚是哪个类型的 schema 不对，而不是把 notes 当成 schema 拼进去。
       assert.match(err.message, /schema/);
@@ -221,7 +230,7 @@ test('schema 是字符串时同样报错且不调用模型', async () => {
     schemas: { plan: { schema: 'worth_practicing' } },
   });
   await assert.rejects(
-    () => engine({ scenario: 'analysis', history: [], structuredOutput: 'plan' }),
+    () => engine({ scenario: 'analysis', history: USER_TURN, structuredOutput: 'plan' }),
     /schema/
   );
   assert.equal(calls.length, 0);
@@ -245,7 +254,7 @@ test('模型复述格式再给真块时，正文里不留任何 marker 块', asy
   });
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
   });
   assert.ok(!result.reply.includes('__structured__'));
@@ -270,7 +279,7 @@ test('剥掉结构化块后正文为空时抛错，但错误对象上带着 stru
     schemas: { stuck_point: { title: '卡点标题' } },
   });
   await assert.rejects(
-    () => engine({ scenario: 'cbt_quick', history: [], structuredOutput: 'stuck_point' }),
+    () => engine({ scenario: 'cbt_quick', history: USER_TURN, structuredOutput: 'stuck_point' }),
     (err) => {
       assert.match(err.message, /剥掉结构化块后正文为空/);
       // 模型交付的结构化内容必须还在错误对象上
@@ -295,7 +304,7 @@ test('剥掉结构化块后正文为空时，正文被包进 JSON 的情况也�
     schemas: { stuck_point: { title: '卡点标题' } },
   });
   await assert.rejects(
-    () => engine({ scenario: 'cbt_quick', history: [], structuredOutput: 'stuck_point' }),
+    () => engine({ scenario: 'cbt_quick', history: USER_TURN, structuredOutput: 'stuck_point' }),
     (err) => {
       assert.deepEqual(err.structured, { title: 'x' });
       assert.equal(err.usage.total_tokens, 7);
@@ -312,7 +321,7 @@ test('本轮没请求结构化输出时，空正文的文案换一种说法', as
     schemas: { stuck_point: { title: '卡点标题' } },
   });
   await assert.rejects(
-    () => engine({ scenario: 'chat', history: [] }),
+    () => engine({ scenario: 'chat', history: USER_TURN }),
     (err) => {
       assert.match(err.message, /剥掉结构化块后正文为空/);
       assert.match(err.message, /没有请求结构化输出/);
@@ -329,7 +338,7 @@ test('模型没有返回任何内容时抛错', async () => {
     getPrompt: () => 'SYSTEM',
     callModel: async () => ({ content: '', usage: { total_tokens: 1 } }),
   });
-  await assert.rejects(() => engine({ scenario: 'chat', history: [] }), /没有返回任何内容/);
+  await assert.rejects(() => engine({ scenario: 'chat', history: USER_TURN }), /没有返回任何内容/);
 });
 
 // ---------------------------------------------------------------------------
@@ -345,7 +354,7 @@ function captureSystemPrompt(clientContext) {
       return { content: '好的', usage: { total_tokens: 1 } };
     },
   });
-  return engine({ scenario: 'cbt_delivery', history: [], clientContext }).then(
+  return engine({ scenario: 'cbt_delivery', history: USER_TURN, clientContext }).then(
     () => calls[0].systemPrompt
   );
 }
@@ -420,7 +429,7 @@ test('callModel 抛错时引擎把错误抛出去', async () => {
       throw new Error('网关炸了');
     },
   });
-  await assert.rejects(() => engine({ scenario: 'chat', history: [] }), /网关炸了/);
+  await assert.rejects(() => engine({ scenario: 'chat', history: USER_TURN }), /网关炸了/);
 });
 
 test('getPrompt 抛错时引擎把错误抛出去', async () => {
@@ -430,7 +439,7 @@ test('getPrompt 抛错时引擎把错误抛出去', async () => {
     },
     callModel: async () => ({ content: 'ok', usage: { total_tokens: 1 } }),
   });
-  await assert.rejects(() => engine({ scenario: 'nope', history: [] }), /未知的 prompt 场景/);
+  await assert.rejects(() => engine({ scenario: 'nope', history: USER_TURN }), /未知的 prompt 场景/);
 });
 
 test('getPromptMeta 抛错时不会先把模型调了', async () => {
@@ -447,7 +456,7 @@ test('getPromptMeta 抛错时不会先把模型调了', async () => {
       return { content: 'ok', usage: { total_tokens: 1 } };
     },
   });
-  await assert.rejects(() => engine({ scenario: 'chat', history: [] }), /meta 坏了/);
+  await assert.rejects(() => engine({ scenario: 'chat', history: USER_TURN }), /meta 坏了/);
   assert.equal(calls.length, 0);
 });
 
@@ -465,7 +474,7 @@ test('结构化指令排在上下文段之后', async () => {
   });
   await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     clientContext: { stuckPoint: { title: '我不能停下来' } },
   });
@@ -542,6 +551,88 @@ test('content 缺失或为空的消息被跳过', async () => {
 });
 
 // ---------------------------------------------------------------------------
+// 至少要有一条能发给网关的消息
+//
+// 网关（MiniMax）只接受带 user/assistant 消息的请求：只有 system 的请求
+// 会被拒（2013 invalid params, chat content is empty）。
+//
+// **素材全走注入通道的调用方**（1v1 转写、卡点、教练手法都进了 system
+// prompt）手上没有对话，history 就是空的 —— 同伴在交付线上踩到的就是这个。
+// 引擎替不了它补一条（引擎不知道「现在要做什么」），所以引擎负责的是：
+// **没人补 ⇒ 不发这个请求**，并且说清楚是请求没内容（400），而不是
+// 让网关回一个说不清的 502。
+// ---------------------------------------------------------------------------
+
+test('history 里没有能发的消息 → 抛 empty_history，且不调用模型', async () => {
+  const calls = [];
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => {
+      calls.push(1);
+      return { content: 'ok', usage: { total_tokens: 1 } };
+    },
+  });
+
+  // 这几种形状在网关那里是同一种失败：请求里没有非 system 的非空消息。
+  for (const history of [
+    [],
+    [{ role: 'system', content: '客户端塞的 system' }],
+    [{ role: 'user' }],
+    [{ role: 'user', content: '   ' }],
+    [null],
+    [{ role: 'tool', content: '工具结果' }],
+  ]) {
+    await assert.rejects(
+      () => engine({ scenario: 'chat', history }),
+      (err) => {
+        assert.equal(err.code, 'empty_history', `history=${JSON.stringify(history)}`);
+        assert.match(err.message, /至少要有一条/);
+        return true;
+      }
+    );
+  }
+  assert.equal(calls.length, 0, '没有内容就不该去调模型');
+});
+
+test('更具体的错先报出来：schema 写坏了时是 invalid_schema，不是 empty_history', async () => {
+  // 错误优先级：配置错（要人改代码）比「这个请求没内容」更该先说。
+  const engine = createCbtEngine({
+    getPrompt: () => 'SYSTEM',
+    callModel: async () => ({ content: 'ok', usage: { total_tokens: 1 } }),
+    schemas: { plan: { schema: undefined, notes: {} } },
+  });
+  await assert.rejects(
+    () => engine({ scenario: 'analysis', history: [], structuredOutput: 'plan' }),
+    (err) => {
+      assert.equal(err.code, 'invalid_schema');
+      return true;
+    }
+  );
+});
+
+test('usableMessages：只认 user/assistant 且 content 非空', () => {
+  assert.deepEqual(
+    usableMessages([
+      { role: 'user', content: '你好' },
+      { role: 'assistant', content: '在' },
+      { role: 'system', content: 'system' },
+      { role: 'tool', content: '工具结果' },
+      { role: 'developer', content: '开发者' },
+      { role: 'user', content: '' },
+      { role: 'user' },
+      null,
+      '不是对象',
+    ]),
+    [
+      { role: 'user', content: '你好' },
+      { role: 'assistant', content: '在' },
+    ]
+  );
+  assert.deepEqual(usableMessages('不是数组'), []);
+  assert.deepEqual(usableMessages([]), []);
+});
+
+// ---------------------------------------------------------------------------
 // structuredOutput 的类型校验
 // ---------------------------------------------------------------------------
 
@@ -563,11 +654,11 @@ test('structuredOutput 不是字符串时报错且不调用模型', async () => 
     return true;
   };
   await assert.rejects(
-    () => engine({ scenario: 'chat', history: [], structuredOutput: ['stuck_point'] }),
+    () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: ['stuck_point'] }),
     checkMessage
   );
   await assert.rejects(
-    () => engine({ scenario: 'chat', history: [], structuredOutput: 0 }),
+    () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: 0 }),
     checkMessage
   );
   assert.equal(calls.length, 0);
@@ -584,7 +675,7 @@ test('structuredOutput 是空字符串时报错（不要结构化输出请传 nu
     schemas: { stuck_point: { title: '卡点标题' } },
   });
   await assert.rejects(
-    () => engine({ scenario: 'chat', history: [], structuredOutput: '' }),
+    () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: '' }),
     /structuredOutput/
   );
   assert.equal(calls.length, 0);
@@ -633,7 +724,7 @@ test('reply 会去掉首尾空白', async () => {
     getPrompt: () => 'SYSTEM',
     callModel: async () => ({ content: '  这是正文。  \n', usage: { total_tokens: 1 } }),
   });
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.equal(result.reply, '这是正文。');
 });
 
@@ -668,7 +759,7 @@ test('模型返回的内容不是字符串时，报类型不对而不是没有�
     callModel: async () => ({ content: { text: '不是字符串' }, usage: { total_tokens: 1 } }),
   });
   await assert.rejects(
-    () => engine({ scenario: 'chat', history: [] }),
+    () => engine({ scenario: 'chat', history: USER_TURN }),
     (err) => {
       assert.match(err.message, /不是字符串/);
       assert.equal(err.code, 'invalid_content_type');
@@ -687,7 +778,7 @@ test('正文里嵌在别的对象中的 marker 不会被剥成破碎的 JSON', a
       usage: { total_tokens: 1 },
     }),
   });
-  const result = await engine({ scenario: 'chat', history: [] });
+  const result = await engine({ scenario: 'chat', history: USER_TURN });
   assert.ok(result.reply.includes('参考这个'));
   assert.ok(!result.reply.includes('"data":,'));
 });
@@ -710,7 +801,7 @@ test('复述被截断时，真卡点仍然拿得到，残骸不进 reply', async
   });
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
   });
   assert.deepEqual(result.structured, { title: '我不能停下来' });
@@ -727,7 +818,7 @@ test('正文里有个没闭合的 { 时，后面的真卡点仍然拿得到', as
   });
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
   });
   assert.deepEqual(result.structured, { title: '我不能停下来' });
@@ -751,15 +842,15 @@ test('引擎抛出的错都带 code，调用方靠它分流', async () => {
   const cases = [
     {
       code: 'invalid_structured_output',
-      run: () => engine({ scenario: 'chat', history: [], structuredOutput: ['stuck_point'] }),
+      run: () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: ['stuck_point'] }),
     },
     {
       code: 'invalid_structured_output',
-      run: () => engine({ scenario: 'chat', history: [], structuredOutput: '' }),
+      run: () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: '' }),
     },
     {
       code: 'unknown_structured_output',
-      run: () => engine({ scenario: 'chat', history: [], structuredOutput: 'nope' }),
+      run: () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: 'nope' }),
     },
     {
       code: 'invalid_history',
@@ -767,7 +858,7 @@ test('引擎抛出的错都带 code，调用方靠它分流', async () => {
     },
     {
       code: 'invalid_schema',
-      run: () => engine({ scenario: 'chat', history: [], structuredOutput: 'plan' }),
+      run: () => engine({ scenario: 'chat', history: USER_TURN, structuredOutput: 'plan' }),
     },
   ];
   for (const c of cases) {
@@ -803,7 +894,7 @@ test('注入组件自己抛的错不被包成引擎错误', async () => {
     callModel: async () => ({ content: 'ok', usage: { total_tokens: 1 } }),
   });
   await assert.rejects(
-    () => engine({ scenario: 'nope', history: [] }),
+    () => engine({ scenario: 'nope', history: USER_TURN }),
     (err) => {
       assert.notEqual(err.name, 'CbtEngineError');
       assert.match(err.message, /未知的 prompt 场景/);
@@ -873,7 +964,7 @@ test('给了 validators 时，取第一个通过契约校验的候选', async ()
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     validators: { stuck_point: titleValidator },
   });
@@ -896,7 +987,7 @@ test('两个候选都通过校验时，取的是最新的那个', async () => {
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     validators: { stuck_point: titleValidator },
   });
@@ -915,7 +1006,7 @@ test('最新的那个校验不过时，跳过它，取那个通过校验的（�
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     validators: { stuck_point: titleValidator },
   });
@@ -934,7 +1025,7 @@ test('全部候选都校验不过时，回退到最新的那个合法块（不�
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     validators: { stuck_point: titleValidator },
   });
@@ -953,7 +1044,7 @@ test('全部候选都校验不过时：退回最后一个合法块，并标记 s
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     validators: { stuck_point: titleValidator },
   });
@@ -973,7 +1064,7 @@ test('没给 validators 时：取最新的那个带值块（不校验，validate
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
   });
   assert.deepEqual(result.structured, { title: '最后一份' });
@@ -990,7 +1081,7 @@ test('校验器自己抛错时，那一份候选算没过（不把整轮带崩�
   const engine = engineWith(content);
   const result = await engine({
     scenario: 'cbt_quick',
-    history: [],
+    history: USER_TURN,
     structuredOutput: 'stuck_point',
     validators: {
       stuck_point: (value) => {
@@ -1014,7 +1105,7 @@ test('empty_reply 时错误对象上带着 structured、structuredValidated 与 
   await assert.rejects(
     () => engine({
       scenario: 'cbt_quick',
-      history: [],
+      history: USER_TURN,
       structuredOutput: 'stuck_point',
       validators: { stuck_point: titleValidator },
     }),

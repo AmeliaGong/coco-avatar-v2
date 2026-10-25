@@ -15,6 +15,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { createServer } from './helpers/testServer.js';
+import { createGatewayRuleFetch } from './helpers/gatewayRule.js';
 import { resetDb } from './helpers/testDb.js';
 import { getDb } from '../db.js';
 import { createCbtEngine, CbtEngineError } from '../server/engine/cbtEngine.js';
@@ -243,13 +244,78 @@ test('messages 传 null → 400，同样不留会话、不调模型', { timeout:
   }
 });
 
-test('messages 传空数组 → 允许（它确实是数组）', { timeout: 15000 }, async () => {
-  installFetch('你好。');
-  const { res } = await postChat({ messages: [] });
-  assert.equal(res.status, 200);
-  // 没有用户消息，但会话与助手消息都该在
-  assert.equal(countMessages('user'), 0);
-  assert.equal(countMessages('assistant'), 1);
+test('messages 传空数组 → 400（没有内容可发：不建会话、不调模型）', { timeout: 15000 }, async () => {
+  // ⚠️ 这条测试以前钉的是 **200**（"允许（它确实是数组）"）—— 那是**虚构**。
+  //
+  // 空数组是数组，但里面没有内容：这样的请求发到网关会被拒
+  // （2013 invalid params, chat content is empty）⇒ 生产上回 502。
+  // 之所以在测试里看不出来，是因为**别的**假 fetch 对任何请求都回 200。
+  // 现在回 400：请求本身没内容，不是「AI 挂了」。
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({ messages: [] });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求没内容却调了模型');
+    // 也不能留下一个没人说话的孤儿会话
+    assert.equal(rows('SELECT * FROM conversations').length, 0);
+    assert.equal(countMessages(), 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 网关的规则必须**在本地**就被挡住
+//
+// 这一段用**按网关规则行事**的假 fetch（tests/helpers/gatewayRule.js）：
+// 请求里没有「非 system 的非空消息」时，它按网关的真实形状回
+// 200 + base_resp{status_code:2013} —— 也就是生产上会看到的东西。
+//
+// 它证明两件事：
+//   1. 这种请求**根本没发出去**（调用次数为 0）—— 不是「发出去被拒」；
+//   2. 正常请求**照发**（调用次数为 1），且发出去的请求体里确实带着那条
+//      user 消息 —— 守卫没有把正常路径也堵掉。
+// ---------------------------------------------------------------------------
+
+test('网关规则：没有可发消息的请求不会被发到网关（网关会回 2013）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch();
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    for (const bad of [
+      [], // 空数组
+      [{ role: 'system', content: '客户端塞的 system' }], // 只有 system
+      [{ role: 'user' }], // content 缺失
+      [{ role: 'user', content: '   ' }], // content 是空白
+      [null], // null 元素
+      [{ role: 'tool', content: '工具结果' }], // 本平台不存在的角色
+    ]) {
+      const { res } = await postChat({ messages: bad });
+      assert.equal(res.status, 400, `messages=${JSON.stringify(bad)} 应该 400`);
+    }
+    assert.equal(calls.length, 0, '这种请求根本没发到网关');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('网关规则：正常请求照发到网关，且请求体里带着那条 user 消息', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch();
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const { res } = await postChat({ messages: [{ role: 'user', content: '你好' }] });
+    assert.equal(res.status, 200);
+    assert.equal(calls.length, 1, '正常请求必须照发');
+    const sent = calls[0].messages;
+    assert.equal(sent[0].role, 'system');
+    assert.deepEqual(sent[1], { role: 'user', content: '你好' });
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -511,7 +577,7 @@ test('E7-1：schemas 里的 notes 类型不对时，引擎抛 CbtEngineError 且
   });
 
   await assert.rejects(
-    () => engine({ scenario: 'analysis', history: [], structuredOutput: 'plan' }),
+    () => engine({ scenario: 'analysis', history: [{ role: 'user', content: '你好' }], structuredOutput: 'plan' }),
     (err) => {
       assert.ok(err instanceof CbtEngineError, `不是 CbtEngineError：${err && err.name}`);
       assert.equal(err.code, 'invalid_schema');
@@ -978,7 +1044,7 @@ test('没做契约校验的结构化内容（validated === null）不落库', { 
   });
   const result = await engine({
     scenario: 'chat',
-    history: [],
+    history: [{ role: 'user', content: '你好' }],
     structuredOutput: 'stuck_point',
   });
 

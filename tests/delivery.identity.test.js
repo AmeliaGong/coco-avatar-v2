@@ -9,10 +9,12 @@
 // 所以这个测试在底座分支与交付线分支上都能跑（表已存在时 CREATE TABLE
 // IF NOT EXISTS 是空操作）。
 
-// ⚠️ 必须先 import testEnv：它把 DB_PATH 指到临时目录。
-// 不 import 的话，getDb() 会连到**真实的开发库**（data/coco.db）——
-// 这个测试里有 DELETE FROM clients，在真实库上跑会撞外键、也会把
-// 真实数据删掉。
+// ⚠️ 必须**第一个** import —— 它把 process.env.DB_PATH 指到临时库。
+//
+// 漏掉这一行的后果：`getDb()` 会连上**真实的 `data/coco.db`**，
+// 而本文件会 `DELETE FROM clients` ⇒ 真的把开发库里的客户行删掉。
+// （同伴在交付线分支上就撞到了这个：那边 clients 表被别的表外键引用，
+// DELETE 直接报外键错误才暴露出来。这里是空库所以没炸，但同样在写真实库。）
 import './helpers/testEnv.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';

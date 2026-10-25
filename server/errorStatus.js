@@ -33,6 +33,19 @@ export const ENGINE_ERROR_STATUS = {
   // history 不是消息数组。路由已经保证了 messages 是数组（否则 400），
   // 所以从 /api/chat 走不到这里。
   invalid_history: 400,
+  // history 里**没有任何一条能发给网关的消息**（只有 system / 空内容 /
+  // 本平台不存在的角色）。
+  //
+  // 网关只接受「至少带一条 user/assistant 消息」的请求
+  // （2013 invalid params, chat content is empty）—— 素材全走注入通道的
+  // 调用方（进 system prompt）手上没有对话时就会落到这里。
+  //
+  // 映射成 400 而不是 502：502 的语义是「AI 侧挂了」，而这里的事实是
+  // **请求本身没有内容**。回 502 会让调用方以为要重试或换模型。
+  //
+  // 从 /api/chat 走不到这里 —— 路由在调引擎之前就挡掉了（第一道防线）。
+  // 这条是给直接调引擎的调用方用的（server/delivery/* 与将来的 BFF）。
+  empty_history: 400,
   // 引擎构造参数不对（编程错误）。构造发生在模块加载时 —— 真出错了
   // 进程根本起不来，不会有请求跑到这里。
   invalid_config: 500,

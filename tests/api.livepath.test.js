@@ -13,6 +13,7 @@ import './helpers/testEnv.js';
 import { test, before, after, beforeEach, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from './helpers/testServer.js';
+import { createGatewayRuleFetch } from './helpers/gatewayRule.js';
 import { resetDb } from './helpers/testDb.js';
 import { getDb } from '../db.js';
 
@@ -254,31 +255,111 @@ test('差异 4：conversation_id 不是字符串 → 400（main 会抛 RangeErro
 //   - {"messages":[null]} —— `m.filter(m => m.role === 'user')` → TypeError → 同样退出。
 //
 // fly.io 跑的是**单进程**，所以这两个输入等于「整站下线」。本分支两个都修好了
-// （server.js 的用户消息提取处对 content 做了类型/空值检查，null 元素被跳过）。
+// —— 现在回的是 **400**（这个请求没有一条有内容的消息可发），不建会话、
+// 不调模型，进程当然也不崩。
+//
+// ⚠️ 这里以前钉的是 200（"content 不是非空字符串的消息不进库 → 200"）。
+// 那是**虚构**：生产上这两种请求会被发到网关，而网关拒绝「没有非 system
+// 消息」的请求（2013 chat content is empty）⇒ 回 502。也就是说，
+// 「200 + 一条助手消息」只在**假 fetch** 里发生过（假 fetch 对任何请求都
+// 回 200）。400 才是真的：请求没内容，说清楚，别假装回了一轮对话。
 //
 // 这条是本分支最重要的**正面**差异 —— 「零行为变化」这句话必须读成
 // 「对格式正确的请求零行为变化」。
 // ---------------------------------------------------------------------------
 
-test('修好的 1：{"messages":[{"role":"user"}]}（content 缺失）→ 200，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
-  installFetch('好的。');
-  const { res } = await postChat({
-    messages: [{ role: 'user' }],
-  });
-  assert.equal(res.status, 200);
-  // content 不是非空字符串的消息**不进库**（模型压根没看见它）。
-  assert.equal(rows("SELECT * FROM messages WHERE role = 'user'").length, 0);
-  assert.equal(rows("SELECT * FROM messages WHERE role = 'assistant'").length, 1);
+test('修好的 1：{"messages":[{"role":"user"}]}（content 缺失）→ 400，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [{ role: 'user' }],
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求没内容却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+    assert.equal(rows('SELECT * FROM messages').length, 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
 });
 
-test('修好的 2：{"messages":[null]} → 200，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
-  installFetch('好的。');
-  const { res } = await postChat({
-    messages: [null],
-  });
-  assert.equal(res.status, 200);
-  assert.equal(rows("SELECT * FROM messages WHERE role = 'user'").length, 0);
-  assert.equal(rows("SELECT * FROM messages WHERE role = 'assistant'").length, 1);
+test('修好的 2：{"messages":[null]} → 400，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
+  let modelCalled = false;
+  globalThis.__cocoFetchImpl = async () => {
+    modelCalled = true;
+    return miniMaxResponse('不该被调用');
+  };
+  try {
+    const { res } = await postChat({
+      messages: [null],
+    });
+    assert.equal(res.status, 400);
+    assert.equal(modelCalled, false, '请求没内容却调了模型');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+    assert.equal(rows('SELECT * FROM messages').length, 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 差异 8：没有「可发消息」的请求 → **本地 400**（不建会话、不调模型）
+//
+// 网关（MiniMax）只接受带 user/assistant 消息的请求：只有 system 的请求
+// 会被拒（2013 invalid params, chat content is empty）。
+//
+// main：这种请求**照发到网关**，由网关来拒 —— 网关回什么形状，客户端就
+// 收到什么形状：
+//   - 网关回非 2xx → main 原样回 `res.status(response.status)` + 'AI Gateway error'；
+//   - 网关以 HTTP 200 + base_resp{status_code:2013} 回（老接口的形状）→
+//     main 的 `data.choices?.[0]?.message?.content || ''` 拿到空串 → 客户端
+//     收到一个**空气泡**（200，正文为空）。
+// 两种都不是「明确拒绝这个请求」。而且 main 这时**已经建了会话**（留下一个
+// 没人说话的会话行）。
+//
+// 本分支：在本地就说清楚「这个请求没有内容」，**不建会话、不调模型**。
+//
+// 这条差异的价值不在于"更好看"，而在于**可归因**：502「AI Gateway error」
+// 会让调用方以为要重试或换模型，而真相是「你压根没说要聊什么」。
+// ---------------------------------------------------------------------------
+
+test('差异 8：没有可发消息的请求 → 400，且不建会话、不调模型（main 是发给网关去撞）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch();
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    for (const bad of [
+      [], // 空数组
+      [{ role: 'system', content: '客户端塞的 system' }], // 只有 system
+      [{ role: 'user', content: '' }], // 空内容
+    ]) {
+      const { res } = await postChat({ messages: bad });
+      assert.equal(res.status, 400, `messages=${JSON.stringify(bad)} 应该 400`);
+    }
+    // 关键：这种请求**根本没发出去**（不是「发出去被网关拒」）。
+    assert.equal(calls.length, 0, '请求发到网关了');
+    assert.equal(rows('SELECT * FROM conversations').length, 0, '不留孤儿会话');
+    assert.equal(rows('SELECT * FROM messages').length, 0);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
+});
+
+test('差异 8：正常请求照发到网关（守卫没有把正常路径也堵掉）', { timeout: 15000 }, async () => {
+  const { fetchImpl, calls } = createGatewayRuleFetch();
+  globalThis.__cocoFetchImpl = fetchImpl;
+  try {
+    const { res } = await postChat({ messages: [{ role: 'user', content: '你好' }] });
+    assert.equal(res.status, 200);
+    assert.equal(calls.length, 1, '正常请求必须照发');
+    assert.deepEqual(calls[0].messages[1], { role: 'user', content: '你好' });
+    assert.equal(rows("SELECT * FROM messages WHERE role = 'assistant'").length, 1);
+  } finally {
+    globalThis.__cocoFetchImpl = undefined;
+  }
 });
 // ---------------------------------------------------------------------------
 // 差异 7（本次总评审新增）：400 响应体里回显用户输入时必须**限长 + 去控制字符**

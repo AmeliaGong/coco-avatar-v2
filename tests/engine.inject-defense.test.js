@@ -21,7 +21,7 @@ function captureSystemPrompt(clientContext) {
       return { content: '好的', usage: { total_tokens: 1 } };
     },
   });
-  return engine({ scenario: 'cbt_delivery', history: [], clientContext }).then(
+  return engine({ scenario: 'cbt_delivery', history: [{ role: 'user', content: '来访者原话' }], clientContext }).then(
     () => calls[0].systemPrompt
   );
 }

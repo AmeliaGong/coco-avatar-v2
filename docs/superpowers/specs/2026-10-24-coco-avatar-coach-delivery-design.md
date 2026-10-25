@@ -127,9 +127,18 @@ draft ──publish──▶ pending_activation ──客户确认──▶ acti
 ┌──────────────────────────────────────────────────────────────┐
 │ 游民纪元 Supabase（PostgreSQL）                                │
 │  users / relationships / daily_cards / feed_actions           │
-│  + client_id 映射字段                                          │
+│  （**不存** Coco Avatar 的 client_id —— 见契约 4）              │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+> **2026-10-25 修订**：这一行原本写的是「+ client_id 映射字段」，即让游民纪元
+> 的 `users` 表存一份 Coco Avatar 的内部主键。契约 4 定稿后**去掉了这一列** ——
+> 内部接口改用 `external_id`（游民纪元 `users.id`，本来就是那一行的主键）
+> 定位客户，映射由 Coco Avatar 侧的 `clients.external_id` 唯一索引解析。
+> 理由：同一映射两份真相要同步要对账，还把 ToC 侧的表绑到了另一个产品的主键上；
+> 而用 `external_id` 时 BFF **零新增列、零新增 join**（用户行自己的主键就是它）。
+> 契约 3 的建档响应里仍会带 `client_id`（供建档方确认），但**不要把它落进
+> 游民纪元的 users 表**。
 
 ### 3.2 为什么小程序必须新建（而不是扩展 Coco Avatar 的壳）
 
@@ -155,7 +164,7 @@ draft ──publish──▶ pending_activation ──客户确认──▶ acti
 
 ## 4. 跨产品契约（跨产品不可改错的部分）
 
-M1（12.01–12.14）的 PM 交付物包含「编写 CBT Prompt」。**以下三个契约必须在 M1 之前定稿**，否则 Prompt 写完即返工。
+M1（12.01–12.14）的 PM 交付物包含「编写 CBT Prompt」。**以下四个契约必须在 M1 之前定稿**，否则 Prompt 写完即返工。
 
 ### 契约 1：`stuck_point` 结构（游民纪元产出 → 教练交付消费）
 
@@ -217,6 +226,73 @@ M1（12.01–12.14）的 PM 交付物包含「编写 CBT Prompt」。**以下三
 ```
 
 **幂等**：同一 `nomad_user_id` 重复调用返回既有 `client_id` 与新签发的链接，不重复建档。
+
+> **字段名统一（2026-10-25，契约 4 附带的修正）**：本契约里写的 `nomad_user_id`
+> 与 `clients.external_id`、契约 4、`POST /api/internal/sync/nomad` 的
+> `external_id` **是同一个东西**（游民纪元 `users.id`）。
+> **内部接口一律叫 `external_id`** —— 实现已经按 `external_id` 写，
+> 本契约的 `nomad_user_id` 是旧名，以 `external_id` 为准。
+
+---
+
+### 契约 4：内部接口的主体标识 —— `external_id`（2026-10-25 定）
+
+内部接口上表示「**这是谁**」的唯一标识是 **`external_id`**（游民纪元 `users.id`），
+**不是** Coco Avatar 内部的 `client_id`。
+
+```
+小程序用户（已登录）
+  → 云函数 BFF：openid →（从已认证会话推导）→ external_id
+  → GET /api/internal/clients/by-external/:externalId/plan
+      Authorization: Bearer <INTERNAL_SERVICE_TOKEN>
+  ← 200 { ...该客户的方案 / 打卡 / 进度... }
+```
+
+**归属校验在 Coco Avatar 侧执行。** 规则：
+
+1. **BFF 负责「你是谁」，Coco Avatar 负责「你能看谁」。**
+   - BFF 唯一能做的事是**认证**：把小程序会话换成 openid，再换成 `users.id`。
+     `external_id` **必须**从已认证会话推导，**不得**取自请求参数、请求体，
+     或小程序传入的任何字段。
+   - Coco Avatar 收到 `external_id` 后，用 `clients.external_id` 的唯一索引
+     解析出 `client_id`，并据此限定全部查询作用域。
+2. **内部读接口不接受 `client_id`。** Coco Avatar 的内部 UUID 不出 Coco Avatar。
+   把 `client_id` 塞进 `by-external` 槽位解析不到人（fail-closed，404）。
+3. **service token 证明的是「调用方是 BFF」，不是「这个终端用户有权看这份数据」。**
+   后者由第 1 条里 Coco Avatar 侧的解析保证。
+4. **查不到就是「尚无交付」，不是错误。** `external_id` 为 NULL
+   （`source='manual'` 的教练手工建档）或该用户还没有客户档案时，
+   内部读接口返回 `404 {"error":"还没有交付记录"}`，不返回 500。
+5. **教练要把一个游民纪元用户接进交付线，必须填 `external_id`。**
+   唯一性由 `idx_clients_external`（`WHERE external_id IS NOT NULL`）保证。
+
+**为什么归属校验不放在 BFF 侧**（这一条最容易被质疑，所以把理由写清楚）：
+
+§5.3 的数据主权表把「映射」明确划给 Coco Avatar
+（`coco_avatar.clients.external_id ↔ nomad_era.users.id`）。若归属校验放在 BFF 侧，
+BFF 就必须自己持有一份 `external_id → client_id` 的映射 —— 也就是游民纪元的
+users 表里要存一份 Coco Avatar 的内部主键。**同一个映射两份真相**，要同步、
+要对账，还把 Coco Avatar 的内部主键泄进了 ToC 侧的库。
+放在 Coco Avatar 侧则：映射只有一份（`clients` 表 + 唯一索引，本来就有），
+游民纪元侧不需要知道 Coco Avatar 的主键长什么样。
+
+顺带解决了另一个问题：**内部接口的主体标识统一了。**
+`POST /api/internal/sync/nomad` 的请求体本来就用 `external_id`；
+现在读接口也用它 ⇒ 整个 `/api/internal/*` 只有一种「这是谁」的写法，
+BFF 那边只有一条规则要记。
+
+**代价**：内部路由层要把「路径里是 `client_id`」换成「路径里是 `external_id`，
+路由层解析出 `client_id`」。**service 层一行都不用改** —— 它只认 `client_id`，
+解析出来的 `client_id` 直接喂给它。解析器见 `server/delivery/identity.js`。
+
+**遗留风险（写在这里，不要假装没有）**：如果 BFF 实现时把 `external_id`
+从请求参数里取（而不是从已认证会话推导），小程序用户就能传别人的 `external_id`。
+这条风险**无法在 Coco Avatar 侧彻底消除** —— Coco Avatar 不认识微信会话，
+它无法自己证明「这个 openid 是这个人」。控制手段是第 1 条
+（只能从会话推导）+ BFF 代码评审时盯这一条。
+缓解条件：用户**无法绕过 BFF 直连 Coco Avatar**（`fly.dev` 无法 ICP 备案，
+微信 request 合法域名过不了），所以这不是「人人可打」的公开漏洞，
+而是「BFF 实现是否照契约做」的内部风险。
 
 ---
 
@@ -347,7 +423,7 @@ CREATE TABLE prompt_scenarios (
 |---|---|---|
 | 身份、领养关系、每日卡片、投喂记录 | 游民纪元 `users` 等 | ToC 主数据 |
 | 1v1 记录、方案全文、教练私有备注、练习成果 | Coco Avatar | **私有教务数据，本就不该在 ToC 端** |
-| 映射 | `coco_avatar.clients.external_id ↔ nomad_era.users.id` | 一个用户一个主 ID |
+| 映射 | `coco_avatar.clients.external_id ↔ nomad_era.users.id` | 一个用户一个主 ID；**解析在 Coco Avatar 侧**（契约 4），游民纪元侧不存 `client_id` |
 
 **同步只走一个方向：Coco Avatar → 游民纪元**，且只回写三项摘要：
 
@@ -522,11 +598,23 @@ Coco Avatar 用户端目前是**单页聊天**（`ChatPage` + `useChat` + `ChatA
 
 ### 9.3 服务间（`Authorization: Bearer <INTERNAL_SERVICE_TOKEN>`）
 
+主体标识统一为 **`external_id`**（游民纪元 `users.id`）—— 见契约 4。
+内部**读**接口按 `external_id` 定位，**不接受 `client_id`**（Coco Avatar 的
+内部 UUID 不出 Coco Avatar）；`by-external` 槽位收到 `client_id` 会解析不到人
+（fail-closed，404）。
+
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | POST | `/api/internal/clients` | 契约 3：建客户 + 签发链接（幂等） |
 | POST | `/api/internal/sync/nomad` | 单向同步三项摘要 |
 | POST | `/api/internal/cbt/run` | 云函数 BFF 调用的引擎入口（服务端 token） |
+| GET | `/api/internal/clients/by-external/:externalId/plan` | 取该用户的当前方案（契约 4） |
+| POST | `/api/internal/clients/by-external/:externalId/plan/start` | 确认开始今天这张卡（契约 4） |
+| POST | `/api/internal/clients/by-external/:externalId/plan/evidence` | 证据回填 / 打卡（契约 4） |
+
+**BFF 侧的硬规则（写给 12 月写 BFF 的人）**：`external_id` **只能**从已认证会话
+推导（openid → `users.id`），**不得**取自请求参数、请求体或小程序传入的字段。
+Coco Avatar 无法自己验证微信会话，它只能相信 BFF 的这个断言。
 
 ---
 
