@@ -29,6 +29,15 @@ export function createModelClient({
     if (!Array.isArray(messages)) {
       throw new Error('messages 必须是数组');
     }
+    // ⚠️ 这一层**不**再检查「messages 里至少有一条非 system 消息」——
+    // 那条保证在**引擎**（server/engine/cbtEngine.js 的 usableMessages +
+    // empty_history）：引擎是所有调用方的收口点，路由层是它的第一道防线。
+    //
+    // 为什么不在这里再挡一道：这里的错只能是**编程错误**（引擎已经保证
+    // 过了），而它抛出的错会被回成 500 —— 对「请求没内容」这件事来说，
+    // 500 是错的语义（那是 400，见 server/errorStatus.js 的 empty_history）。
+    // 规则本身：网关只接受带 user/assistant 消息的请求，只有 system 的请求
+    // 会被拒（2013 invalid params, chat content is empty）。
 
     const res = await fetchImpl(baseUrl, {
       method: 'POST',

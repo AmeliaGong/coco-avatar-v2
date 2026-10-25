@@ -16,6 +16,11 @@
 //     structuredOutput 的类型、净化注入到 prompt 里的来访者数据。
 //     不能指望调用方都做这些事 —— 第二个调用方（BFF）未必过滤 system，
 //     结果是两条 system 消息或一条 content 缺失的请求，网关直接 400。
+//   - **引擎**还负责保证「**至少有一条能发给网关的消息**」。
+//     网关只接受带 user/assistant 消息的请求：只有 system 的请求会被拒
+//     （2013 invalid params, chat content is empty）。素材全走注入通道
+//     （进 system prompt）的调用方手上没有对话，history 就是空的 ——
+//     那种调用方**必须自己补一条任务轮**，引擎替不了它（引擎不知道任务）。
 //   - **调用方**负责决定何时用哪个 scenario、给哪些 clientContext。
 //
 // 返回值语义：
@@ -116,6 +121,7 @@ const MAX_CONTEXT_CHARS = 4000;
 //   - invalid_structured_output  structuredOutput 不是字符串/是空串   → 400
 //   - unknown_structured_output  未知的结构化输出类型                 → 400
 //   - invalid_history            history 不是消息数组                 → 400
+//   - empty_history              history 里没有一条能发给网关的消息    → 400
 //   - invalid_schema             schemas 里的 schema 写坏了（配置错） → 500
 //   - empty_content              模型没返回任何内容                   → 502
 //   - invalid_content_type       模型返回的内容不是字符串             → 502
@@ -236,6 +242,32 @@ function renderEvidence(value) {
   return value.map(item => sanitizeShort(toText(item))).filter(item => item !== '');
 }
 
+// 一条「**能发给网关**」的消息。
+//
+// 规则来自网关（MiniMax）本身，不是我们发明的：
+//   - 网关只接受 role 为 user / assistant / system 的消息；system 只能有
+//     一条且必须在最前；
+//   - 而且**至少要有一条非 system 的消息** —— 只有 system 的请求会被拒
+//     （2013 invalid params, chat content is empty）。
+//
+// 所以「能发」= role 是 user 或 assistant，且 content 是非空字符串。
+//
+// 为什么只认 user / assistant（而不是「除了 system 都行」）：其它角色
+// （tool、developer…）本平台的会话里根本不存在，网关也不认（2013
+// invalid role）。剔掉它们，好过原样发出去换一个说不清的 502。
+//
+// 为什么导出：路由层要用**同一份**判据在调模型之前就拒掉「没有内容」的
+// 请求（省一次网关往返、不留孤儿会话）。判据必须只有一份 —— 两处各写
+// 一遍，迟早会漂。
+export function usableMessages(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .filter(m => m && typeof m === 'object' && !Array.isArray(m))
+    .filter(m => m.role === 'user' || m.role === 'assistant')
+    .filter(m => typeof m.content === 'string' && m.content.trim() !== '')
+    .map(m => ({ role: m.role, content: m.content }));
+}
+
 export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas = {} } = {}) {
   if (!getPrompt) {
     throw new CbtEngineError('createCbtEngine 需要 getPrompt：拼装 system prompt 的底座段与场景段', {
@@ -291,7 +323,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     return section;
   }
 
-  // history 的清洗：剔掉 system 消息，跳过 content 不是字符串或为空的消息。
+  // history 的清洗：剔掉 system 消息，跳过 content 不是字符串或为空的消息，
+  // 以及本平台不存在的角色（tool / developer…）。
+  //
   // 引擎自己做这件事，而不是指望调用方 —— 第二个调用方的 callModel 未必
   // 过滤 system，结果是两条 system 消息；content 缺失的消息会被
   // JSON.stringify 丢掉，让网关 400。
@@ -301,10 +335,7 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
         code: 'invalid_history',
       });
     }
-    return history
-      .filter(m => m && typeof m === 'object' && m.role !== 'system')
-      .filter(m => typeof m.content === 'string' && m.content.trim() !== '')
-      .map(m => ({ role: m.role, content: m.content }));
+    return usableMessages(history);
   }
 
   // 挑出这一轮的结构化输出。
@@ -423,6 +454,32 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     // getPromptMeta 很便宜也很纯，放在调模型之前：万一它抛错，
     // 至少不会把一次已经付过钱的生成结果连同整轮请求一起丢掉。
     const meta = getPromptMeta ? getPromptMeta(scenario) : null;
+
+    // 至少要有一条**能发给网关**的消息。
+    //
+    // 网关（MiniMax）拒绝「只有 system、没有 user/assistant」的请求：
+    // 2013 invalid params, chat content is empty。
+    // 与其花一次网关往返换一个说不清的 502，不如在本地就说清楚是
+    // 「这个请求没有内容」。
+    //
+    // 为什么引擎来挡（而不是指望调用方）：素材可能**全走注入通道** ——
+    // 也就是进了 system prompt（1v1 转写、卡点、教练手法都是这样进来的）。
+    // 那种调用方手上没有对话，history 就是空的。这正是同伴在交付线上
+    // 踩到的那个坑（server/delivery/analysis.js 的 ANALYSIS_TURN）。
+    //
+    // 引擎**替不了**它补这一条：引擎不知道「现在要做什么」，补出来的
+    // 只能是空话。所以这条只能由调用方补（补一条说清任务的用户轮），
+    // 引擎负责的是：**没人补 ⇒ 不发这个请求**。
+    //
+    // 为什么排在**调模型之前**的最后一步：更具体的错（配置写坏了、
+    // 结构化输出类型不对）应该先报出去 —— 它们要人改代码，而这一条
+    // 只是这个请求没内容。
+    if (messages.length === 0) {
+      throw new CbtEngineError(
+        'history 里至少要有一条有内容的用户或助手消息（网关不接受只有 system 的请求）',
+        { code: 'empty_history' }
+      );
+    }
 
     const result = await callModel({
       systemPrompt,

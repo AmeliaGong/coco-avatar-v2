@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import { getDb } from './db.js';
 import { createPromptRegistry, SCENARIO_IDS } from './server/promptRegistry.js';
 import { createModelClient } from './server/engine/modelClient.js';
-import { createCbtEngine } from './server/engine/cbtEngine.js';
+import { createCbtEngine, usableMessages } from './server/engine/cbtEngine.js';
 import {
   STRUCTURED_OUTPUT_TYPE_NAMES,
   STRUCTURED_SCHEMAS,
@@ -370,14 +370,28 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   // 请求会继续建会话、调模型（**模型调用是花钱的**）、写 assistant 消息，
   // 最后回 200；请求方却压根没说要聊什么。
   //
-  // 空数组 [] 是合法的 —— 它确实是数组，也是改动前的行为。
-  //
   // 让 messages.filter 去撞 TypeError 只会变成一个没人看得懂的 500
   // （而且 Express 4 不接 async handler 的异常 → 请求直接挂死）。
   if (!Array.isArray(rawMessages)) {
     return res.status(400).json({ error: 'messages 必须是数组' });
   }
   const messages = rawMessages;
+
+  // messages 里至少要有一条**能发给网关**的消息。
+  //
+  // 空数组 [] 是数组，但里面没有内容 —— 这样的请求发到网关会被拒
+  // （2013 invalid params, chat content is empty），回 502 只会让调用方
+  // 以为「AI 挂了」。同样的道理适用于「只有 system 消息」「消息的 content
+  // 是空的」「消息里有 null 元素」这几种形状。
+  //
+  // 判据用的是引擎的同一份（usableMessages，见 cbtEngine.js）—— 两处各写
+  // 一遍，迟早会漂。引擎那边还有第二道防线（empty_history），这里是第一道：
+  // 在**建会话之前**就拒掉 ⇒ 不留孤儿会话、不白调一次模型。
+  if (usableMessages(messages).length === 0) {
+    return res.status(400).json({
+      error: 'messages 里至少要有一条有内容的用户或助手消息',
+    });
+  }
 
   if (!SCENARIO_IDS.includes(scenario)) {
     return res
