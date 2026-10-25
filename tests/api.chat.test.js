@@ -791,6 +791,31 @@ test('上游 200 但没有正文 → 502，这一轮的钱**照样记账**（有
   assert.equal(usage[0].conversation_id, rows('SELECT id FROM conversations')[0].id);
 });
 
+test('网关回 200 但响应体**不是 JSON** → 502（不是 500：那不是我们自己的错）', { timeout: 15000 }, async () => {
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      // 网关回了一个 HTML 错误页 / 被截断的响应体。
+      throw new SyntaxError('Unexpected token < in JSON at position 0');
+    },
+    async text() {
+      return '<html>oops</html>';
+    },
+  });
+
+  const { res, text } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+  });
+
+  // main：response.json() 抛原生 SyntaxError，落在 try 里 ⇒ 500
+  //      {"error":"Internal server error"}。
+  // 本分支：modelClient 把解析失败包成 ModelError ⇒ 502。
+  assert.equal(res.status, 502);
+  assert.ok(!text.includes('<html>'), '把网关的 HTML 泄给了客户端');
+  assert.equal(countMessages('assistant'), 0);
+});
+
 test('失败路径上 token_usage 写不进去时，仍然回 502（记账失败不能让请求崩溃）', { timeout: 15000 }, async () => {
   const db = getDb();
   db.exec(`
@@ -934,6 +959,17 @@ test('client_id 是字符串 → 原样记进会话', { timeout: 15000 }, async 
   assert.equal(res.status, 200);
   const conv = rows('SELECT * FROM conversations')[0];
   assert.equal(conv.client_id, 'client-abc');
+});
+
+test('scenario 也记进会话行（不记就查不出「这条会话用的是哪个 prompt」）', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    scenario: 'analysis',
+  });
+  assert.equal(res.status, 200);
+  const conv = rows('SELECT * FROM conversations')[0];
+  assert.equal(conv.scenario, 'analysis');
 });
 
 test('conversation_id 不是字符串 → 400（不崩进程）', { timeout: 15000 }, async () => {
