@@ -285,6 +285,57 @@ export function createClientStore({ db }) {
     });
   }
 
+  // --- 删除客户（连同它的方案、打卡、卡点、1v1 记录）---
+  //
+  // **为什么要级联删**：这些表没有 ON DELETE CASCADE（SQLite 的外键约束
+  // 默认也不开），留着孤儿行的话，方案/打卡就会变成「查不出来也删不掉」
+  // 的半截数据 —— 那种东西比没有更糟。
+  //
+  // **会话不删，只解除挂载。** 会话里是来访者自己的对话（还可能是别人
+  // 正在用的），删客户的档案不该把别人的聊天记录一起带走。所以这里
+  // 把 client_id 置空、link_kind 退回 'test' —— 之后那条会话就回到
+  // 「未挂载」的样子。
+  //
+  // **confirm 必须是这个客户的 id** —— 没有它，一个手滑的 DELETE 就能
+  // 抹掉一个人的全部记录。返回删了多少行，调用方要把它显示给教练看
+  // （「删掉了 2 份方案、1 条打卡」这种，而不是一个空 200）。
+  function remove(clientId, { confirm } = {}) {
+    const client = get(clientId);
+    if (!client) throw new Error('客户不存在');
+    if (confirm !== clientId) {
+      throw new Error('confirm 必须是这个客户的 id —— 确认了才删');
+    }
+    // 来自游民纪元的客户（external_id 非空）**不能在这里删**：
+    // 那边是真实付费用户，档案一删，身份映射就断了（云函数那边会
+    // 404「还没有交付记录」），而且下次同步会建出一个空的新档。
+    // 这类档案要「停用」就 PATCH status='archived'。
+    if (client.external_id) {
+      const err = new Error('这个客户来自游民纪元，不能在这里删除 —— 改用归档（status=archived）');
+      err.code = 'client_from_nomad_era';
+      throw err;
+    }
+
+    const counts = {};
+    const run = db.transaction(() => {
+      counts.evidences = db
+        .prepare('DELETE FROM evidences WHERE client_id = ?')
+        .run(clientId).changes;
+      counts.practices = db
+        .prepare('DELETE FROM practices WHERE plan_id IN (SELECT id FROM plans WHERE client_id = ?)')
+        .run(clientId).changes;
+      counts.plans = db.prepare('DELETE FROM plans WHERE client_id = ?').run(clientId).changes;
+      counts.stuck_points = db.prepare('DELETE FROM stuck_points WHERE client_id = ?').run(clientId).changes;
+      counts.sessions_1v1 = db.prepare('DELETE FROM sessions_1v1 WHERE client_id = ?').run(clientId).changes;
+      // 会话不删，只解除挂载（见上面的注释）。
+      counts.unlinked_conversations = db
+        .prepare("UPDATE conversations SET client_id = NULL, link_kind = 'test' WHERE client_id = ?")
+        .run(clientId).changes;
+      db.prepare('DELETE FROM clients WHERE id = ?').run(clientId);
+    });
+    run();
+    return { client_id: clientId, display_name: client.display_name, removed: counts };
+  }
+
   return {
     create,
     list,
@@ -297,5 +348,6 @@ export function createClientStore({ db }) {
     listStuckPoints,
     addStuckPoint,
     addExtractedStuckPoint,
+    remove,
   };
 }

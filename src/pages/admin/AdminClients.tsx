@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { adminListClients, adminCreateClient } from '../../lib/api';
 import type { DeliveryClient } from '../../lib/api';
 
@@ -23,7 +23,10 @@ export function AdminClients() {
   const [phone, setPhone] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  // 「删掉了一个客户」的回执 —— 从客户详情页跳回来时带在 location.state 里。
+  const [notice, setNotice] = useState('');
   const navigate = useNavigate();
+  const location = useLocation();
 
   const load = async () => {
     setLoading(true);
@@ -42,6 +45,16 @@ export function AdminClients() {
   };
 
   useEffect(() => { load(); }, []);
+
+  // 从「客户详情 → 删除客户」跳回来时，把删了多少显示出来。
+  // 用 replaceState 清掉 state —— 否则刷新页面还会再显示一遍。
+  useEffect(() => {
+    const n = (location.state as { notice?: string } | null)?.notice;
+    if (n) {
+      setNotice(n);
+      window.history.replaceState({}, document.title);
+    }
+  }, [location.state]);
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -106,6 +119,10 @@ export function AdminClients() {
           {busy ? '建档中...' : '建档'}
         </button>
       </form>
+
+      {notice && (
+        <p className="text-sage text-sm mb-3 bg-sage/10 rounded-lg px-3 py-2">{notice}</p>
+      )}
 
       {error && <p className="text-red-500 text-sm mb-3">{error}</p>}
 

@@ -128,6 +128,31 @@ export function createAdminDeliveryRouter({
     }
   }));
 
+  // --- 删除客户 ---
+  //
+  // 级联删掉这个客户的方案、打卡、卡点、1v1 记录（见 clients.remove 的
+  // 注释：那些表没有 ON DELETE CASCADE，留孤儿行就是「查不出来也删不掉」）。
+  // **会话不删，只解除挂载** —— 会话里是来访者自己的对话。
+  //
+  // `confirm` 必须是这个客户的 id（body 或 query 都收）—— 没有它，
+  // 一个手滑的 DELETE 就能抹掉一个人的全部记录。
+  //
+  // 来自游民纪元的客户（external_id 非空）**不删**：那边是真实付费用户，
+  // 档案一删身份映射就断了。要停用就 PATCH status='archived'。
+  router.delete('/clients/:id', asyncRoute(async (req, res) => {
+    try {
+      const confirm = (req.body || {}).confirm ?? req.query?.confirm;
+      const result = clients.remove(req.params.id, { confirm });
+      res.json({ deleted: true, ...result });
+    } catch (err) {
+      if (err?.code === 'client_from_nomad_era') {
+        // 409：这个状态不是「你参数写错了」，是「这条路不能走」。
+        return res.status(409).json({ error: err.message });
+      }
+      sendError(res, err);
+    }
+  }));
+
   // --- 挂载会话并导入卡点 ---
   //
   // **两步入库要放在一个事务里**：挂了会话却没导入卡点（或反过来）会留下

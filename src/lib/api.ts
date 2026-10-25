@@ -359,6 +359,26 @@ export async function adminUpdateClient(
 }
 
 /**
+ * 删除客户（连同它的方案、打卡、卡点、1v1 记录）。
+ *
+ * `confirm` 必须是这个客户的 id —— 后端会核对，对不上就不删
+ * （防手滑，也防有人拿别人的 id 乱调）。会话不删，只解除挂载。
+ *
+ * 来自游民纪元的客户（external_id 非空）后端会拒绝（409）：那边是真实
+ * 付费用户，要停用就 PATCH status='archived'。
+ */
+export async function adminDeleteClient(id: string) {
+  return adminRequest(
+    `/api/admin/clients/${encodeURIComponent(id)}?confirm=${encodeURIComponent(id)}`,
+    {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirm: id }),
+    }
+  );
+}
+
+/**
  * 把已有 CBT 会话挂到这个客户名下。
  * 挂载时会顺带从会话里的结构化输出导入卡点 —— 响应里的
  * `stuck_points_imported` 是教练要看到的数字（「导入了 N 条卡点」）。

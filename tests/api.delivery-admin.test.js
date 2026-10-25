@@ -392,3 +392,122 @@ test('1v1 文件上传：后缀不认识 → 400', async () => {
   });
   assert.equal(res.status, 400);
 });
+
+// ---------------------------------------------------------------------------
+// 删除客户
+// ---------------------------------------------------------------------------
+
+// 造一个「什么都有」的客户：方案 + 练习 + 打卡 + 卡点 + 1v1 记录 + 挂着的会话。
+// 删客户时这些下游行必须**跟着一起消失**（不留孤儿行），
+// 而**会话必须留下**（只解除挂载）。
+function seedFullClient({ externalId = null } = {}) {
+  const db = getDb();
+  const ts = new Date().toISOString();
+  const clientId = 'client-del-1';
+  const planId = 'plan-del-1';
+  const practiceId = 'practice-del-1';
+  const convId = 'conv-del-1';
+
+  db.prepare(
+    `INSERT INTO clients (id, display_name, source, external_id, status, created_at, updated_at)
+     VALUES (?, '客户甲', 'manual', ?, 'active', ?, ?)`
+  ).run(clientId, externalId, ts, ts);
+  db.prepare(
+    `INSERT INTO plans (id, client_id, status, version, payload, round, created_at)
+     VALUES (?, ?, 'active', 1, '{}', 1, ?)`
+  ).run(planId, clientId, ts);
+  db.prepare(
+    `INSERT INTO practices (id, plan_id, day, title, sort_order) VALUES (?, ?, 1, '第一张卡', 0)`
+  ).run(practiceId, planId);
+  db.prepare(
+    `INSERT INTO evidences (id, practice_id, client_id, content, created_at) VALUES (?, ?, ?, '今天做了', ?)`
+  ).run('evidence-del-1', practiceId, clientId, ts);
+  db.prepare(
+    `INSERT INTO stuck_points (id, client_id, source, title, created_at) VALUES (?, ?, 'manual', '卡点', ?)`
+  ).run('sp-del-1', clientId, ts);
+  db.prepare(
+    `INSERT INTO sessions_1v1 (id, client_id, transcript, created_at) VALUES (?, ?, '来访者：…', ?)`
+  ).run('session-del-1', clientId, ts);
+  db.prepare(
+    "INSERT INTO conversations (id, title, created_at, status, scenario, client_id, link_kind) VALUES (?, '会话', ?, 'active', 'chat', ?, 'client')"
+  ).run(convId, ts, clientId);
+
+  return { clientId, planId, practiceId, convId };
+}
+
+test('删除客户：方案、打卡、卡点、1v1 记录一起删掉，档案消失', async () => {
+  const { clientId, planId, practiceId, convId } = seedFullClient();
+  const db = getDb();
+
+  const res = await admin(`/api/admin/clients/${clientId}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ confirm: clientId }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.deleted, true);
+  assert.equal(body.removed.plans, 1);
+  assert.equal(body.removed.practices, 1);
+  assert.equal(body.removed.evidences, 1);
+  assert.equal(body.removed.stuck_points, 1);
+  assert.equal(body.removed.sessions_1v1, 1);
+
+  // 档案与下游行都没了
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM clients WHERE id = ?').get(clientId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM plans WHERE id = ?').get(planId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM practices WHERE id = ?').get(practiceId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM evidences WHERE client_id = ?').get(clientId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM stuck_points WHERE client_id = ?').get(clientId).c, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM sessions_1v1 WHERE client_id = ?').get(clientId).c, 0);
+
+  // 会话还在，只是解除挂载
+  const conv = db.prepare('SELECT client_id, link_kind FROM conversations WHERE id = ?').get(convId);
+  assert.ok(conv, '会话不该被删');
+  assert.equal(conv.client_id, null);
+  assert.equal(conv.link_kind, 'test');
+});
+
+test('删除客户：confirm 不对 → 400，什么都没删', async () => {
+  const { clientId } = seedFullClient();
+  const db = getDb();
+
+  const res = await admin(`/api/admin/clients/${clientId}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ confirm: '别的人' }),
+  });
+  assert.equal(res.status, 400);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM clients WHERE id = ?').get(clientId).c, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM plans WHERE client_id = ?').get(clientId).c, 1);
+});
+
+test('删除客户：不带 confirm → 400', async () => {
+  const { clientId } = seedFullClient();
+  const res = await admin(`/api/admin/clients/${clientId}`, { method: 'DELETE' });
+  assert.equal(res.status, 400);
+});
+
+test('删除客户：客户不存在 → 404', async () => {
+  const res = await admin('/api/admin/clients/根本没有这个人', {
+    method: 'DELETE',
+    body: JSON.stringify({ confirm: '根本没有这个人' }),
+  });
+  assert.equal(res.status, 404);
+});
+
+test('删除客户：来自游民纪元的客户（external_id 非空）→ 409，什么都没删', async () => {
+  const { clientId } = seedFullClient({ externalId: 'nomad-user-1' });
+  const db = getDb();
+
+  const res = await admin(`/api/admin/clients/${clientId}`, {
+    method: 'DELETE',
+    body: JSON.stringify({ confirm: clientId }),
+  });
+  assert.equal(res.status, 409);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM clients WHERE id = ?').get(clientId).c, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) c FROM plans WHERE client_id = ?').get(clientId).c, 1);
+});
+
+test('删除客户：未登录 → 401', async () => {
+  const res = await fetch(`${baseUrl}/api/admin/clients/client-del-1`, { method: 'DELETE' });
+  assert.equal(res.status, 401);
+});

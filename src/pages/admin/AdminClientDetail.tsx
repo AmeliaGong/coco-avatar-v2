@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom';
 import {
   adminGetClient,
   adminUpdateClient,
+  adminDeleteClient,
   adminGetConversations,
   adminAttachConversations,
   adminAddStuckPoint,
@@ -78,6 +79,8 @@ export function AdminClientDetail() {
   const [manual, setManual] = useState(EMPTY_MANUAL);
   const [showManual, setShowManual] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
+  // 删除客户要走**两步**：先点「删除客户」展开确认区，再点「确认删除」。
+  const [showDelete, setShowDelete] = useState(false);
   const [editForm, setEditForm] = useState({ display_name: '', phone: '', email: '', notes: '', status: 'active' });
 
   const [message, setMessage] = useState('');
@@ -282,8 +285,35 @@ export function AdminClientDetail() {
     }
   };
 
-  if (loading && !client) return <p className="text-gray-400">加载中...</p>;
-  if (!client) {
+  // 删除客户。
+  //
+  // 后端会级联删掉方案、打卡、卡点、1v1 记录，会话保留（只解除挂载）。
+  // 删完回到客户列表，并把「删了多少」带过去 —— 教练要看得见结果，
+  // 不能是「点了没反应，也不知道删掉没」。
+  const handleDelete = async () => {
+    setBusyId('delete');
+    setError('');
+    setMessage('');
+    try {
+      const r: any = await adminDeleteClient(id!);
+      const rm = r?.removed || {};
+      navigate('/admin/clients', {
+        state: {
+          notice:
+            `已删除「${r?.display_name || ''}」：` +
+            `${rm.plans || 0} 份方案、${rm.evidences || 0} 条打卡、` +
+            `${rm.stuck_points || 0} 条卡点、${rm.sessions_1v1 || 0} 条 1v1 记录`,
+        },
+      });
+    } catch (e) {
+      setError((e as Error).message);
+      setShowDelete(false);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (loading && !client) return <p className="text-gray-400">加载中...</p>;  if (!client) {
     return (
       <div>
         <p className="text-gray-400 mb-4">客户不存在或加载失败。</p>
@@ -687,6 +717,69 @@ export function AdminClientDetail() {
           </ul>
         )}
       </section>
+
+      {/* 5. 危险操作：删除客户 */}
+      //
+      // 放在页面**最底下**、且要**点两次**才真的删 —— 删掉的是这个人的
+      // 全部方案、打卡、卡点与 1v1 记录，不可撤销。
+      //
+      // 「会话保留，只解除挂载」：会话里是来访者自己的对话，不跟着档案
+      // 一起消失。
+      {client.external_id ? (
+        <section className="bg-white rounded-xl border border-warm-grey/20 shadow p-4">
+          <h3 className="font-bold text-gray-800 mb-2">5. 停用</h3>
+          <p className="text-xs text-gray-500 leading-relaxed">
+            这个客户来自游民纪元（真实付费用户），不能在这里删除 ——
+            删了身份映射就断了。要停用就在上面「编辑资料」里把状态改成
+            「已归档」。
+          </p>
+        </section>
+      ) : (
+        <section className="bg-white rounded-xl border border-red-200 shadow p-4">
+          <h3 className="font-bold text-gray-800 mb-2">5. 删除客户</h3>
+          {!showDelete ? (
+            <div className="flex items-center gap-3">
+              <p className="text-xs text-gray-500 leading-relaxed flex-1">
+                会连同这个客户的方案、打卡记录、卡点、1v1 记录一起删掉，
+                <strong className="text-red-500">不可撤销</strong>。
+                会话保留（只解除挂载）。名字若是「已归档」状态，也建议直接删。
+              </p>
+              <button
+                onClick={() => setShowDelete(true)}
+                className="px-3 py-1 border border-red-200 rounded-lg text-xs text-red-500 hover:bg-red-50 transition shrink-0"
+              >
+                删除客户
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <p className="text-xs text-red-500 leading-relaxed">
+                真的要删「{client.display_name}」？
+                {plans.length > 0 && ` 现在有 ${plans.length} 份方案、`}
+                {stuckPoints.length > 0 && `${stuckPoints.length} 条卡点、`}
+                {sessions.length > 0 && `${sessions.length} 条 1v1 记录`}
+                会被一起删掉。这一步不可撤销。
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={handleDelete}
+                  disabled={busyId === 'delete'}
+                  className="px-3 py-1 bg-red-500 text-white rounded-lg text-xs disabled:opacity-40 hover:bg-red-600 transition"
+                >
+                  {busyId === 'delete' ? '删除中...' : '确认删除'}
+                </button>
+                <button
+                  onClick={() => setShowDelete(false)}
+                  disabled={busyId === 'delete'}
+                  className="px-3 py-1 border border-warm-grey/50 rounded-lg text-xs text-gray-600 hover:bg-warm-beige/40 transition"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
     </div>
   );
 }
