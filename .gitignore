@@ -53,3 +53,8 @@ pnpm-debug.log*
 
 # 内部服务间密钥（不得提交）
 .internal-token
+
+# admin 后台密码（不得提交）
+# 由 `flyctl secrets set ADMIN_PASSWORD=...` 用的同一份随机值存在本地，
+# 方便本人 `cat` 一下登录后台。权限 600，绝不进版本库、绝不过聊天记录。
+.admin-pw
