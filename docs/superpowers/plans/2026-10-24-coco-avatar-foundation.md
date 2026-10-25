@@ -2814,6 +2814,11 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 | 4 | `client_id` / `conversation_id` **类型**不对 → **400** | `main` 把它们直接丢给 better-sqlite3 与 SQL：传对象会抛 `RangeError`，而那发生在 async handler 里 → Express 4 不接 → unhandled rejection → **整个进程退出**。 | 400 远好过崩进程。（`client_id` 是**客户端自报的标签**，不进响应头，所以**不做字符集限制** —— 非 ASCII / 邮箱 / 人写的标签都合法。） | `tests/api.livepath.test.js`「差异 4」 |
 | 5 | `conversation_id` **字符集**受限 → **400** | 只允许 `A-Za-z0-9._~-`（我们自己的 id 是 `crypto.randomUUID()`）。`main` 不限字符，于是 `conversation_id: "a\nb"` 会一路走到 `res.setHeader('X-Conversation-Id', ...)` 抛 `ERR_INVALID_CHAR`。 | 那个 id 会**原样进响应头**。在本分支的「先落库、再吐流」顺序下，它抛的时候**模型已经计费、库里已经留下孤儿会话与孤儿消息**了 —— 而这是公开端点，可以重复放大成本。所以字符集必须在**任何写库 / 调模型之前**拒掉。 | `tests/api.chat.test.js`「conversation_id 含换行 / 控制字符 / 空格 → 400」 |
 | 6 | `migrateSchema` 把 `duplicate column name` 当成**成功** | 之前任何 ALTER 失败都抛错 → `getDb()` 抛 → `server.js` 模块级 `const db = getDb()` 在 `listen()` 之前就抛 → 进程退出 → crash loop。 | `PRAGMA table_info` → `ALTER TABLE ADD COLUMN` 是 check-then-act，**不是**跨进程原子的。fly 滚动部署可能短暂有两个机器对着同一个卷跑迁移，输的那一个拿到的 `duplicate column name` 恰恰是**想要的结果**（列已经存在了）。别的 ALTER 失败照旧抛。 | `tests/db.schema.test.js`「并发 ALTER 撞车」 |
+| 7 | 400 响应体里回显的用户输入**限长 40 + 去控制字符** | `Unknown scenario: ${scenario}` / `Unknown structured_output: ${structured_output}` 改成先过 `echoForError()`。合法取值**不变**（`'foo'` 还是 `'foo'`），只有超长 / 带控制字符的输入被改写。 | 这两个字段用户可控，而 `express.json()` 默认上限 100kb ⇒ 100kb 请求换来 100kb 响应（**响应放大**），而这个端点公开、可无限重复调用。控制字符还会污染日志与任何把错误体渲染成文本的地方。 | `tests/api.livepath.test.js`「差异 7」（两条） |
+
+> 表里的编号与测试名里的编号一一对应（「差异 1」…「差异 7」）。
+> 第 5、6 两条的测试在**别的文件**里，所以没有用「差异 N」开头 ——
+> 按「测试」列给出的文件与用例名去找即可。
 
 ### 本分支**修好**的（`main` 上会整站下线）—— 正面的差异
 
@@ -2828,7 +2833,7 @@ Expected: 若无改动则该命令无输出（`nothing to commit`），属正常
 **这是本分支最重要的正面差异**，也是「零行为变化」这句话必须读成
 「对**格式正确**的请求零行为变化」的原因。
 
-两条都有测试：`tests/api.livepath.test.js`「差异 5」。
+两条都有测试：`tests/api.livepath.test.js`「修好的 1」「修好的 2」。
 
 ### 仍然成立的「零行为变化」保证
 

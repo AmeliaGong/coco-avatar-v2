@@ -286,6 +286,26 @@ const MAX_CLIENT_ID_LENGTH = 128;
 // 所以上限必须在**任何写库 / 调模型之前**生效。
 const MAX_CONVERSATION_ID_LENGTH = 128;
 
+// 400 响应体里**回显**用户输入时用。
+//
+// 回显本身有用 —— 告诉调用方「哪个值不对」比「什么值都不对」好排查。
+// 但用户可以把任意内容塞进 scenario / structured_output：
+//   - express.json() 的默认上限是 100kb ⇒ 100kb 的请求能换来 100kb 的
+//     400 响应（响应放大）。而这个端点公开、可无限重复调用。
+//   - 控制字符会污染日志与任何把错误体渲染成文本的地方。
+//
+// 所以回显前统一处理：去掉控制字符 + 限长。合法取值不受影响
+// （'foo' 还是 'foo'），只有超长/带控制字符的输入会被改写。
+const MAX_ECHOED_ERROR_VALUE_LENGTH = 40;
+
+function echoForError(value) {
+  if (typeof value !== 'string') return '';
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, '');
+  return cleaned.length > MAX_ECHOED_ERROR_VALUE_LENGTH
+    ? `${cleaned.slice(0, MAX_ECHOED_ERROR_VALUE_LENGTH)}…`
+    : cleaned;
+}
+
 // conversation_id 的**字符集**上限。
 //
 // 长度上限管不住「里面的字符」。conversation_id 会**原样**进
@@ -360,7 +380,9 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
   const messages = rawMessages;
 
   if (!SCENARIO_IDS.includes(scenario)) {
-    return res.status(400).json({ error: `Unknown scenario: ${scenario}` });
+    return res
+      .status(400)
+      .json({ error: `Unknown scenario: ${echoForError(scenario)}` });
   }
 
   let structuredType = null;
@@ -369,7 +391,9 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
       typeof structured_output !== 'string' ||
       !STRUCTURED_OUTPUT_TYPE_NAMES.includes(structured_output)
     ) {
-      return res.status(400).json({ error: `Unknown structured_output: ${structured_output}` });
+      return res
+        .status(400)
+        .json({ error: `Unknown structured_output: ${echoForError(structured_output)}` });
     }
     structuredType = structured_output;
   }

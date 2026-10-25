@@ -260,7 +260,7 @@ test('差异 4：conversation_id 不是字符串 → 400（main 会抛 RangeErro
 // 「对格式正确的请求零行为变化」。
 // ---------------------------------------------------------------------------
 
-test('差异 5：{"messages":[{"role":"user"}]}（content 缺失）→ 200，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
+test('修好的 1：{"messages":[{"role":"user"}]}（content 缺失）→ 200，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
   installFetch('好的。');
   const { res } = await postChat({
     messages: [{ role: 'user' }],
@@ -271,7 +271,7 @@ test('差异 5：{"messages":[{"role":"user"}]}（content 缺失）→ 200，进
   assert.equal(rows("SELECT * FROM messages WHERE role = 'assistant'").length, 1);
 });
 
-test('差异 5：{"messages":[null]} → 200，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
+test('修好的 2：{"messages":[null]} → 200，进程不崩（main 上会整站下线）', { timeout: 15000 }, async () => {
   installFetch('好的。');
   const { res } = await postChat({
     messages: [null],
@@ -279,4 +279,74 @@ test('差异 5：{"messages":[null]} → 200，进程不崩（main 上会整站�
   assert.equal(res.status, 200);
   assert.equal(rows("SELECT * FROM messages WHERE role = 'user'").length, 0);
   assert.equal(rows("SELECT * FROM messages WHERE role = 'assistant'").length, 1);
+});
+// ---------------------------------------------------------------------------
+// 差异 7（本次总评审新增）：400 响应体里回显用户输入时必须**限长 + 去控制字符**
+//
+// main：也是回显（`Unknown scenario: ${scenario}`），但**原样**回显。
+// 本分支：回显前统一过 echoForError() —— 去掉控制字符、限长 40。
+//
+// 为什么：这两个字段是用户可控的，而 express.json() 的默认上限是 100kb
+// ⇒ 100kb 的请求能换来 100kb 的 400 响应（响应放大），而这个端点公开、
+// 可无限重复调用。控制字符还会污染日志与任何把错误体渲染成文本的地方。
+//
+// 注意：正文大小要**留出余量** —— 超过 express.json 的 100kb 上限的话，
+// 请求会在 body 解析阶段就被拒（400 'Invalid request body'），
+// 根本走不到 scenario 校验，那种情况下这条测试是**因为错误的理由**通过的。
+//
+// 控制字符用 String.fromCharCode 构造（不写进源码字面量）：
+// 源码里直接放控制字符会让文件本身带上不可见字节，评审和 diff 都看不清。
+// ---------------------------------------------------------------------------
+
+const CTRL_NUL = String.fromCharCode(0);
+const CTRL_BEL = String.fromCharCode(7);
+
+// 字符串里有没有控制字符（< 0x20 或 === 0x7f）。
+function hasControlChars(s) {
+  for (const ch of s) {
+    const code = ch.codePointAt(0);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
+test('差异 7：scenario 回显被限长（50KB 输入不会换来 50KB 响应）', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res, text } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    scenario: 'x'.repeat(50 * 1024),
+  });
+  assert.equal(res.status, 400);
+
+  // 关键：走的是 scenario 校验，不是 body 解析失败。
+  const body = JSON.parse(text);
+  assert.ok(
+    body.error.startsWith('Unknown scenario: '),
+    `走错了分支：${body.error.slice(0, 60)}`
+  );
+
+  // 响应体被限住了（不是 50KB）。
+  assert.ok(text.length < 500, `响应体被放大了：${text.length} 字节`);
+
+  // 回显值本身被截到 40 字符 + 省略号。
+  const echoed = body.error.slice('Unknown scenario: '.length);
+  assert.equal(echoed.length, 41);
+  assert.ok(echoed.endsWith('…'));
+});
+
+test('差异 7：回显里不含控制字符', { timeout: 15000 }, async () => {
+  installFetch('好的。');
+  const { res, text } = await postChat({
+    messages: [{ role: 'user', content: '你好' }],
+    structured_output: `坏${CTRL_NUL}值${CTRL_BEL}`,
+  });
+  assert.equal(res.status, 400);
+  const body = JSON.parse(text);
+  assert.ok(
+    body.error.startsWith('Unknown structured_output: '),
+    `走错了分支：${body.error.slice(0, 60)}`
+  );
+  // 控制字符（NUL / BEL）被吃掉了，只剩可打印字符。
+  assert.ok(!hasControlChars(text), '响应体里有控制字符');
+  assert.ok(body.error.includes('坏值'));
 });
