@@ -9,7 +9,7 @@ const WELCOME_MESSAGE = `你好，我是 Coco。
 
 我曾经在阿里做着别人羡慕的工作，却每天拖着身体去上班。后来我飞到了挪威，用 2 年 Gap Year 找到了自己真正想做的事，在大理创办了 WeStream 人生学校。
 
-现在，我想用 5-8 分钟的时间，陪你做一件小事——可以是听听我的故事，做一次认知小练习，或者体验一种新的学习方式。
+现在，我想用 5-8 分钟的时间，陪你做一件小事——听我和几位探索者的故事，做一次认知小练习，或者从一个你正琢磨的微创业想法开始。
 
 你想从哪个开始？`;
 
@@ -40,7 +40,7 @@ export function ChatPage() {
       <Header />
       <ChatArea
         messages={messages}
-        onQuickAction={sendMessage}
+        onQuickAction={(message, scenario) => sendMessage(message, scenario)}
         showQuickActions={showQuickActions}
       />
       <InputArea onSend={sendMessage} disabled={isLoading} />

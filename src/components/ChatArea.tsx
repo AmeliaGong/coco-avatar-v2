@@ -5,7 +5,13 @@ import type { ChatMessage } from '../hooks/useChat';
 
 interface ChatAreaProps {
   messages: ChatMessage[];
-  onQuickAction: (message: string) => void;
+  /**
+   * 快捷入口被点了。
+   *
+   * 第二个参数是**场景**：点「听听 Coco 和探索者们的故事」会给 'story'，
+   * 其余是 'chat'。场景由 useChat 记着（粘的），后面的轮次都沿用。
+   */
+  onQuickAction: (message: string, scenario: 'chat' | 'story') => void;
   showQuickActions: boolean;
 }
 

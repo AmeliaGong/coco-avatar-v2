@@ -15,6 +15,14 @@ export function useChat(initialMessage: string, conversationId?: string) {
   const [expired, setExpired] = useState(false);
   const messagesRef = useRef(messages);
 
+  // 当前会话走哪个场景。
+  //
+  // ⚠️ **粘的**：用户点了「听听 Coco 和探索者们的故事」之后，整个会话留在
+  // story 场景（故事要一段一段讲，中途掉回通用对话会把故事线打断）。
+  // 用 ref 存是因为 sendMessage 里要**立刻**读到最新值 —— setState 是异步的，
+  // 同一轮里读 state 会拿到旧值。
+  const scenarioRef = useRef<'chat' | 'story'>('chat');
+
   // Keep ref updated
   useEffect(() => {
     messagesRef.current = messages;
@@ -39,7 +47,13 @@ export function useChat(initialMessage: string, conversationId?: string) {
     });
   }, [conversationId]);
 
-  const sendMessage = useCallback(async (userMessage: string) => {
+  const sendMessage = useCallback(async (userMessage: string, scenario?: 'chat' | 'story') => {
+    // 场景一旦被指定就定下来（后面几轮都沿用）。
+    if (scenario) {
+      scenarioRef.current = scenario;
+    }
+    const activeScenario = scenarioRef.current;
+
     setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
     setIsLoading(true);
     setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
@@ -69,7 +83,7 @@ export function useChat(initialMessage: string, conversationId?: string) {
       chatMessages.push({ role: 'user', content: userMessage });
 
       let fullResponse = '';
-      for await (const chunk of streamChat(chatMessages, convId)) {
+      for await (const chunk of streamChat(chatMessages, convId, activeScenario)) {
         fullResponse += chunk;
         setMessages(prev => {
           const newMessages = [...prev];

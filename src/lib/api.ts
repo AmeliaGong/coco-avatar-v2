@@ -29,7 +29,8 @@ export async function getConversation(id: string): Promise<{
 
 export async function* streamChat(
   messages: Message[],
-  conversationId?: string
+  conversationId?: string,
+  scenario?: 'chat' | 'story' | 'cbt_quick' | 'cbt_delivery' | 'analysis'
 ): AsyncGenerator<string> {
   const response = await fetch('/api/chat', {
     method: 'POST',
@@ -37,6 +38,10 @@ export async function* streamChat(
     body: JSON.stringify({
       messages,
       conversation_id: conversationId || undefined,
+      // 场景：不传时服务端用默认值 'chat'。
+      // ⚠️ 传 'chat' 与不传**行为完全一样**（服务端默认就是 chat），
+      // 差别只在请求体里多一个字段。
+      scenario: scenario || undefined,
     }),
   });
 

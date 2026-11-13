@@ -68,12 +68,18 @@ test('数据库覆盖版本的 getPromptMeta 也返回内容哈希', () => {
   assert.equal(meta.source, 'file+db');
 });
 
-test('listScenarios 只列四个场景，不含 persona.base，并给出装配后的长度', () => {
+test('listScenarios 只列场景，不含 persona.base，并给出装配后的长度', () => {
   const registry = createPromptRegistry({ db: getDb() });
   const list = registry.listScenarios();
   assert.deepEqual(
     list.map((s) => s.id),
-    ['scenario.chat', 'scenario.cbt_quick', 'scenario.cbt_delivery', 'scenario.analysis']
+    [
+      'scenario.chat',
+      'scenario.story',
+      'scenario.cbt_quick',
+      'scenario.cbt_delivery',
+      'scenario.analysis',
+    ]
   );
   assert.ok(!list.some((s) => s.id === 'persona.base'), 'persona.base 不是场景');
   for (const item of list) {
@@ -191,10 +197,11 @@ test('getPrompt 对未知场景抛错', () => {
 });
 
 test('可覆盖 id 集合与场景 id 清单符合约定', () => {
-  assert.deepEqual(SCENARIO_IDS, ['chat', 'cbt_quick', 'cbt_delivery', 'analysis']);
+  assert.deepEqual(SCENARIO_IDS, ['chat', 'story', 'cbt_quick', 'cbt_delivery', 'analysis']);
   assert.deepEqual(OVERRIDABLE_IDS, [
     'persona.base',
     'scenario.chat',
+    'scenario.story',
     'scenario.cbt_quick',
     'scenario.cbt_delivery',
     'scenario.analysis',

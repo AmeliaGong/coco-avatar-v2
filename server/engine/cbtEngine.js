@@ -108,6 +108,19 @@ const MAX_INJECT_CHARS = 200;
 // 信息的一部分），只在一个大得多的量级上封顶。
 const MAX_KNOWLEDGE_CHARS = 2000;
 
+// 探索者故事：单段正文字数上限。
+//
+// 为什么单段要封顶：一则故事有 4-8 段，一次只注入**两段**
+// （见 server/engine/explorer.js 的「情况一」）⇒ 单段再长，两段也才
+// 6000 字上下，离 2 万的总量闸门还远。封顶是防「某一段的原文特别长」
+// 把整个注入段挤爆。
+const MAX_EXPLORER_SEGMENT_CHARS = 3000;
+
+// 探索者目录里**每个人**的画像字数上限。
+// 目录里塞的是「一句话画像 + 匹配信号」，不是正文 —— 14 个人加起来
+// 也就几千字。
+const MAX_EXPLORER_ITEM_CHARS = 300;
+
 // 1v1 转写正文的长度上限。
 //
 // 转写是**教练手写**的素材（粘贴进来的咨询记录），不是模型生成的，
@@ -348,6 +361,18 @@ function sanitizeKnowledgeBody(value) {
   return sanitizeBody(value, { max: MAX_KNOWLEDGE_CHARS, flattenMarkers: false });
 }
 
+// 探索者故事正文：保留换行（段落结构就是节奏）+ 单段 3000 字上限。
+//
+// **不压行首标记**，理由与知识库正文相同：这份内容是我们自己整理过的素材
+// （seed 脚本从本地的 md 解析进来），不是来访者随手写的东西；
+// 注入风险由 CONTEXT_DECLARATION 兜住。
+//
+// 段落结构被压平会有具体的坏处：探索者故事是**一段一段**讲的，
+// 压平之后 Coco 读到的就是一大坨文字，分段感没了。
+function sanitizeExplorerBody(value) {
+  return sanitizeBody(value, { max: MAX_EXPLORER_SEGMENT_CHARS, flattenMarkers: false });
+}
+
 // 1v1 转写正文：来访者来源的材料，保留换行 + 12000 字上限。
 //
 // **压行首标记**：转写里的 `---` 是**说话人分隔符**，不是段落分隔 ——
@@ -443,12 +468,14 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
     // ⚠️ **块的顺序就是「保命优先级」** —— 总量闸门超预算时从**最后一条**
     // 开始整条丢，所以越靠前的块越晚被丢。
     //
-    // 顺序：转写 → 手法 → 卡点 → 知识库。
+    // 顺序：转写 → 手法 → 卡点 → 探索者（选中）→ 知识库 → 探索者目录。
     // 1v1 转写排第一：它是教练分析的主素材（结论就藏在素材里）。
     // 手法库排第二：14 天 Circle 方案要落在库里的圈上，手法被丢光 =
     // 方案与库里无关。它比卡点更该保住 —— 卡点是**确认过的**单条结论，
     // 丢了下一轮还能重新问出来；手法库是教练自己攒的方法，丢了就没了。
-    // 知识库排最后：它是「可参考的补充材料」，超预算时第一个被丢。
+    // 探索者（选中）排在知识库前面：知识库是「可参考的补充材料」，
+    // 探索者的正文却是这一轮**唯一**的讲稿（丢了就没得讲）。
+    // 知识库与探索者目录排最后：它们超预算时第一个被丢。
     const blocks = [];
 
     // 1v1 转写：单条目，且**不可整条丢** —— 它是教练分析的主素材。
@@ -508,6 +535,41 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       });
     }
 
+    // 探索者故事（用户选定了的那一则）—— 排在知识库**前面**。
+    //
+    // 为什么排前面：知识库是「可参考的补充材料」，超预算时第一个被丢；
+    // 而探索者的正文是这一轮**唯一**的讲稿 —— 丢了它，Coco 就没有东西可讲。
+    //
+    // ⚠️ **不可整条丢**（droppable=false）：它要么在，要么这一轮讲不成。
+    // 超预算时的处理走下面的「按字符截断」，标注写明是探索者素材被截断。
+    if (clientContext && clientContext.explorer && clientContext.explorer.selected) {
+      const sel = clientContext.explorer.selected;
+      const lines = [];
+      const name = sanitizeShort(sel.name);
+      lines.push(`姓名：${name}`);
+      if (sel.one_liner) lines.push(`一句话：${sanitizeShort(sel.one_liner)}`);
+      const segments = Array.isArray(sel.segments) ? sel.segments : [];
+      for (let i = 0; i < segments.length; i++) {
+        const seg = segments[i];
+        if (!seg || typeof seg !== 'object') continue;
+        const body = sanitizeExplorerBody(seg.text);
+        if (!body) continue;
+        // 「第 N 段」只是给模型看的分段记号 —— prompt 里已经明说了
+        // 端上不许显示小标题/段号，模型只把它当结构用。
+        lines.push(`【第${i + 1}段】${body}`);
+      }
+      if (sel.guide) lines.push(`怎么讲（节奏与每段后的问法）：${sanitizeShort(sel.guide)}`);
+      if (sel.safety) lines.push(`安全边界（必须遵守）：${sanitizeShort(sel.safety)}`);
+      if (lines.length) {
+        blocks.push({
+          header:
+            '--- 探索者故事素材（用户已经选定了这一位；原文逐字不要改写；分段记号是内部的，端上不要显示）---',
+          entries: [{ text: lines.join('\n'), droppable: false }],
+          truncateNote: '（探索者故事素材因注入段过长被截断）',
+        });
+      }
+    }
+
     if (clientContext && Array.isArray(clientContext.knowledge) && clientContext.knowledge.length) {
       // 脏数据（null 元素）跳过，不能让整个 prompt 装配崩掉。
       const items = clientContext.knowledge.filter(
@@ -520,6 +582,34 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
         }));
         blocks.push({
           header: '--- 可参考的教练知识库（仅在相关时使用，不要复述本节标题）---',
+          entries,
+        });
+      }
+    }
+
+    // 探索者目录 —— 排**最后**：它是「挑人用的名单」，是这一轮里最不重要的
+    // 素材（超预算时第一个被丢，而且它是逐人丢的：丢一个人只是少一个候选）。
+    //
+    // 目录里**没有正文** —— 14 则正文全放进去是几万字。
+    if (clientContext && clientContext.explorer && Array.isArray(clientContext.explorer.catalog)) {
+      const items = clientContext.explorer.catalog.filter(
+        p => p && typeof p === 'object' && !Array.isArray(p)
+      );
+      if (items.length) {
+        const entries = items.map(p => {
+          const head = `- 【${sanitizeShort(p.name) || '未命名'}】${sanitizeShort(p.one_liner).slice(0, MAX_EXPLORER_ITEM_CHARS)}`;
+          const meta = [];
+          if (p.category) meta.push(`分类 ${sanitizeShort(p.category)}`);
+          if (p.education_level) meta.push(`教育层级 ${sanitizeShort(p.education_level)}`);
+          const signals = Array.isArray(p.match_signals)
+            ? p.match_signals.filter(s => typeof s === 'string' && s.trim()).slice(0, 6)
+            : [];
+          const tail = signals.length ? `｜用户可能会说：${signals.join('；')}` : '';
+          const text = meta.length ? `${head}（${meta.join(' · ')}）${tail}` : `${head}${tail}`;
+          return { text, droppable: true };
+        });
+        blocks.push({
+          header: '--- 探索者目录（挑人用：名字照抄不要改写；只在你被问到「想听谁的」时才用）---',
           entries,
         });
       }
@@ -560,21 +650,23 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       if (!removed) break; // 只剩转写了 —— 它走下面的字符截断
     }
 
-    // 只剩转写仍然超预算（转写本身超长）时：按字符截断，并写明是转写被截断。
+    // 只剩「不可丢」的条目仍然超预算时：按字符截断，并写明**是谁**被截断了。
     // 标注必须写清「是转写被截断了」—— 教练看到半截记录却以为模型看到了
-    // 全部材料，结论会整个跑偏。
+    // 全部材料，结论会整个跑偏。同理，探索者素材被截断也要写明。
     //
-    // **转写不算进「省略了 N 条」**：那条计数说的是「有几条内容被整条丢掉」，
-    // 转写是**被截短**、不是被丢掉，混在一起算出来的数字是错的。
+    // **截断不算进「省略了 N 条」**：那条计数说的是「有几条内容被整条丢掉」，
+    // 截断是**被截短**、不是被丢掉，混在一起算出来的数字是错的。
     let body = renderContextBlocks(blocks);
     if (budgetOf(body) > MAX_CONTEXT_CHARS) {
-      const transcriptBlock = blocks.find(b => b.entries.some(e => !e.droppable));
-      if (transcriptBlock) {
+      const block = blocks.find(b => b.entries.some(e => !e.droppable));
+      if (block) {
         const over = budgetOf(body) - MAX_CONTEXT_CHARS;
-        const entry = transcriptBlock.entries.find(e => !e.droppable);
+        const entry = block.entries.find(e => !e.droppable);
         // 标注本身也占字数 —— 不算进去的话，截完还是超预算
         // （闸门是「超了就砍」，砍完还超就等于没砍）。
-        const note = '\n（1v1 转写因注入段过长被截断）';
+        // 标注用这一块自己的措辞：转写与探索者素材不能共用一句话
+        // （看到「1v1 转写被截断」会以为转写被砍了，而实际被砍的是别的东西）。
+        const note = `\n${block.truncateNote || '（1v1 转写因注入段过长被截断）'}`;
         const keep = Math.max(0, entry.text.length - over - note.length);
         entry.text = entry.text.slice(0, keep) + note;
         body = renderContextBlocks(blocks);

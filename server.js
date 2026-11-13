@@ -8,6 +8,7 @@ import { getDb } from './db.js';
 import { createPromptRegistry, SCENARIO_IDS } from './server/promptRegistry.js';
 import { createModelClient } from './server/engine/modelClient.js';
 import { createCbtEngine, usableMessages } from './server/engine/cbtEngine.js';
+import { buildExplorerContext } from './server/engine/explorer.js';
 import {
   STRUCTURED_OUTPUT_TYPE_NAMES,
   STRUCTURED_SCHEMAS,
@@ -168,8 +169,23 @@ app.use(cors());
 //     256mb 内存机器上能安全吃下的量级。
 const MAX_CHAT_BODY_LIMIT = '1mb';
 app.use('/api/chat', express.json({ limit: MAX_CHAT_BODY_LIMIT }));
+
+// 探索者素材的**批量写入**接口单独放宽（其余端点仍是 100kb）。
+//
+// 为什么单独放宽：一批素材是**全文**（每则 4-11 段原文），15 则一次性灌进
+// 去是 153,429 **字节** —— 超了 100kb 默认上限，body-parser 在解析阶段就抛
+// entity.too.large ⇒ 灌数据这条路直接 400。
+//
+// ⚠️ **字节 ≠ 字符数**：JSON.stringify 给的是字符数（59,622），而请求体是
+// UTF-8 字节（中文一字 3 字节 ⇒ 153,429）。按字符数估大小会低估一半以上。
+//
+// 为什么是 2mb：素材是 15 则 × 每则几 KB，即便以后加到几十则也还远低于
+// 2mb；而这是一个**只在 admin token 下**可用的接口，不对公众开放。
+const MAX_EXPLORER_BODY_LIMIT = '2mb';
+app.use('/api/admin/explorer-stories', express.json({ limit: MAX_EXPLORER_BODY_LIMIT }));
 // 全局的那份仍然生效（100kb）：body-parser 见到 req._body 已经解析过
-// 就跳过（body-parser/lib/types/json.js），所以 /api/chat 不会被解析两次。
+// 就跳过（body-parser/lib/types/json.js），所以 /api/chat 与探索者写入
+// 都不会被解析两次。
 app.use(express.json());
 
 // --- Helper functions ---
@@ -692,6 +708,21 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     );
   }
 
+  // --- 探索者素材（只有 story 场景要）---
+  //
+  // 探索者故事是**真人可识别信息**：它只存在于数据库里（fly volume），
+  // 不在版本库、不在镜像、不在 prompt 文件里（仓库是 public 的）。
+  // 服务端在这里按会话状态把它取出来，作为 clientContext 注入 system prompt。
+  //
+  // ⚠️ **不传 clientContext 时，prompt 的字节一位都不变** —— 注入段是空的。
+  // 所以 chat 场景（以及字节级黄金快照测试）不受任何影响。
+  const explorer = buildExplorerContext({
+    db,
+    conversationId: convId,
+    history,
+    enabled: scenario === 'story',
+  });
+
   // --- 调引擎 ---
   let turn;
   try {
@@ -699,6 +730,8 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
       scenario,
       history,
       structuredOutput: structuredType,
+      // 探索者材料（可能是 null —— 那就不注入）。
+      clientContext: explorer ? { explorer } : null,
       // 契约层的校验函数：签名正好是 (payload) => ({ok, errors, value})。
       // 模型复述格式时抄的占位串会被 parseStuckPoint 拒掉 —— 这正是
       // 「落库的是真卡点、不是占位骨架」的实现方式。
@@ -1025,6 +1058,125 @@ app.put('/api/stories/:id', (req, res) => {
 
 app.delete('/api/stories/:id', (req, res) => {
   db.prepare('DELETE FROM stories WHERE id = ?').run(req.params.id);
+  res.json({ success: true });
+});
+
+// --- 探索者故事（admin）---
+//
+// ⚠️ **这些内容是真人可识别信息**，所以：
+//   - 只有带 admin token 的接口能读写它们（**没有公开读接口**）；
+//   - 它们**只在数据库里**，不在版本库、不在镜像、不在 prompt 文件里；
+//   - 内容由 scripts/seed-explorer-stories.mjs 从**本地**的
+//     docs/探索者故事/*.md 解析后写进来（那个目录在 .gitignore 里）。
+//
+// 「批量写」是刻意留的：seed 脚本要能一次灌 14 则，改了素材再重灌一次
+// （按 id 覆盖，不攒重复行）。
+
+function normalizeExplorerStory(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const id = typeof input.id === 'string' ? input.id.trim() : '';
+  const name = typeof input.name === 'string' ? input.name.trim() : '';
+  if (!id || !name) return null;
+  const segments = Array.isArray(input.segments)
+    ? input.segments
+        .filter(s => s && typeof s === 'object' && !Array.isArray(s))
+        .map(s => ({
+          // label 是原文章的小标题 —— **只是分段记号，端上不显示**。
+          label: typeof s.label === 'string' ? s.label : '',
+          text: typeof s.text === 'string' ? s.text : '',
+        }))
+        .filter(s => s.text.trim())
+    : [];
+  return {
+    id,
+    name,
+    aliases: Array.isArray(input.aliases)
+      ? input.aliases.filter(a => typeof a === 'string' && a.trim())
+      : [],
+    category: typeof input.category === 'string' ? input.category : null,
+    education_level:
+      typeof input.education_level === 'string' ? input.education_level : null,
+    one_liner: typeof input.one_liner === 'string' ? input.one_liner : '',
+    match_signals: Array.isArray(input.match_signals)
+      ? input.match_signals.filter(s => typeof s === 'string' && s.trim())
+      : [],
+    tags: Array.isArray(input.tags)
+      ? input.tags.filter(s => typeof s === 'string' && s.trim())
+      : [],
+    segments,
+    guide: typeof input.guide === 'string' ? input.guide : null,
+    safety: typeof input.safety === 'string' ? input.safety : null,
+    is_active: input.is_active !== false,
+  };
+}
+
+app.get('/api/admin/explorer-stories', requireAdmin, (req, res) => {
+  const rows = db.prepare('SELECT * FROM explorer_stories ORDER BY id').all();
+  res.json({
+    stories: rows.map(r => ({
+      ...r,
+      aliases: JSON.parse(r.aliases || '[]'),
+      match_signals: JSON.parse(r.match_signals || '[]'),
+      tags: JSON.parse(r.tags || '[]'),
+      segments: JSON.parse(r.segments || '[]'),
+      is_active: r.is_active === 1,
+    })),
+  });
+});
+
+app.post('/api/admin/explorer-stories', requireAdmin, (req, res) => {
+  const body = req.body || {};
+  const inputs = Array.isArray(body.stories) ? body.stories : [body];
+  const accepted = [];
+  const rejected = [];
+  for (const input of inputs) {
+    const story = normalizeExplorerStory(input);
+    if (!story) {
+      rejected.push({ id: input && input.id ? input.id : null });
+      continue;
+    }
+    db.prepare(
+      `INSERT INTO explorer_stories
+         (id, name, aliases, category, education_level, one_liner,
+          match_signals, tags, segments, guide, safety, is_active,
+          created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         name = excluded.name,
+         aliases = excluded.aliases,
+         category = excluded.category,
+         education_level = excluded.education_level,
+         one_liner = excluded.one_liner,
+         match_signals = excluded.match_signals,
+         tags = excluded.tags,
+         segments = excluded.segments,
+         guide = excluded.guide,
+         safety = excluded.safety,
+         is_active = excluded.is_active,
+         updated_at = excluded.updated_at`
+    ).run(
+      story.id,
+      story.name,
+      JSON.stringify(story.aliases),
+      story.category,
+      story.education_level,
+      story.one_liner,
+      JSON.stringify(story.match_signals),
+      JSON.stringify(story.tags),
+      JSON.stringify(story.segments),
+      story.guide,
+      story.safety,
+      story.is_active ? 1 : 0,
+      new Date().toISOString(),
+      new Date().toISOString()
+    );
+    accepted.push(story.id);
+  }
+  res.json({ accepted, rejected, count: accepted.length });
+});
+
+app.delete('/api/admin/explorer-stories/:id', requireAdmin, (req, res) => {
+  db.prepare('DELETE FROM explorer_stories WHERE id = ?').run(req.params.id);
   res.json({ success: true });
 });
 

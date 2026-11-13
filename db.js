@@ -110,6 +110,57 @@ function initSchema(db) {
 
     CREATE INDEX IF NOT EXISTS idx_knowledge_kind ON knowledge_entries(kind);
 
+    -- ── 探索者故事（WeStream 探索者社区的真人故事）──────────────────
+    --
+    -- ⚠️ **这张表里的内容是真人可识别信息**（化名、身份、所在地、职业、
+    -- 家庭创伤细节、诊断词）—— 它**只**存在于数据库里，
+    -- **不进版本库、不进镜像、不进 prompt 文件**。
+    --
+    -- 为什么不用 stories 表：stories 是给地球页用的（city/country/lat/lng
+    -- 必填、而且会被公开页面渲染）—— 把真人故事放进去等于往公开页面吐
+    -- 内容。所以另建一张表，**并且不提供任何公开读接口**
+    -- （只有 admin 接口与模型注入通道能读它）。
+    --
+    -- 内容由 scripts/seed-explorer-stories.mjs 从**本地**的
+    -- docs/探索者故事/*.md 解析后写进来（那个目录是 gitignored 的）。
+    CREATE TABLE IF NOT EXISTS explorer_stories (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      aliases TEXT NOT NULL DEFAULT '[]',
+      category TEXT,
+      education_level TEXT,
+      one_liner TEXT NOT NULL,
+      match_signals TEXT NOT NULL DEFAULT '[]',
+      tags TEXT NOT NULL DEFAULT '[]',
+      segments TEXT NOT NULL DEFAULT '[]',
+      guide TEXT,
+      safety TEXT,
+      is_active INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_explorer_stories_active
+      ON explorer_stories(is_active);
+
+    -- 探索者会话状态：记住「这个会话现在走到探索者线的哪一步」。
+    --
+    -- 为什么需要状态（而不是每轮重新推断）：讲一则探索者故事要**一段一段**
+    -- 讲，而服务端必须每轮都把那一则的素材重新注入（模型不记得上一轮给了它什么）。
+    -- 「现在在讲谁、讲到第几段」这件事，只能靠状态记着。
+    --
+    -- phase:
+    --   idle          —— 还没进探索者线
+    --   awaiting_pick —— 模型已经报出了候选人在等用户选
+    --   telling       —— 已经选定了某一则，正在一段一段讲
+    CREATE TABLE IF NOT EXISTS explorer_sessions (
+      conversation_id TEXT PRIMARY KEY,
+      phase TEXT NOT NULL DEFAULT 'idle',
+      selected_id TEXT,
+      base_assistant_count INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
+    );
+
     -- ── 交付模块的新表 ────────────────────────────────────────────
     --
     -- 这些表都还没上线过，所以直接改 CREATE TABLE 即可，不需要迁移脚本
