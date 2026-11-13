@@ -200,8 +200,26 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
     const story = stories.find(s => s.id === state.selected_id);
     if (story) {
       const delivered = Math.max(0, assistantTexts.length - state.base_assistant_count);
-      const start = Math.min(delivered, Math.max(0, story.segments.length - 1));
-      const slice = toRuntimeSegments(story.segments, start, 2);
+      // 全部讲完 ⇒ 收口态。
+      //
+      // 为什么不能继续注入最后一段：start 会被夹在最后一段上，于是模型
+      // 每轮都拿到同一段 ⇒ 要么反复重讲，要么自己猜「该收口了」。
+      // **收口态不再注入正文**（目录还在 —— 用户想换人仍然可以），
+      // 「这是最后一段」由下面那个显式标记在**该讲的那一轮**给出。
+      const all = toRuntimeSegments(story.segments, 0, story.segments.length);
+      const total = all.length;
+      if (total > 0 && delivered >= total) {
+        if (conversationId) {
+          store.setSession(conversationId, {
+            phase: 'closing',
+            selected_id: state.selected_id,
+            base_assistant_count: state.base_assistant_count,
+          });
+        }
+        return { catalog, phase: 'closing' };
+      }
+      const start = Math.min(delivered, Math.max(0, total - 1));
+      const slice = all.slice(start, start + 2);
       return {
         catalog,
         selected: {
@@ -211,6 +229,8 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
           segments: slice,
           guide: story.guide,
           safety: story.safety,
+          // 这一轮要讲的是 slice[0]（模型一次讲一段）⇒ 它是不是最后一段？
+          is_final: start === total - 1,
         },
         phase: 'telling',
       };
@@ -243,15 +263,18 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
           base_assistant_count: assistantTexts.length,
         });
       }
+      const pickedAll = toRuntimeSegments(picked.segments, 0, picked.segments.length);
       return {
         catalog,
         selected: {
           id: picked.id,
           name: picked.name,
           one_liner: picked.one_liner,
-          segments: toRuntimeSegments(picked.segments, 0, 2),
+          segments: pickedAll.slice(0, 2),
           guide: picked.guide,
           safety: picked.safety,
+          // 只有一段的素材 ⇒ 这一轮就是最后一段
+          is_final: pickedAll.length <= 1,
         },
         phase: 'telling',
       };

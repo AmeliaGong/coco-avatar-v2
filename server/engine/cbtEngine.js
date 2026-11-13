@@ -560,6 +560,24 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       }
       if (sel.guide) lines.push(`怎么讲（节奏与每段后的问法）：${sanitizeShort(sel.guide)}`);
       if (sel.safety) lines.push(`安全边界（必须遵守）：${sanitizeShort(sel.safety)}`);
+      // ── 显式的结束标记 ──────────────────────────────────────────
+      //
+      // 为什么需要它：这一则讲完之后，服务端**不再重复注入**正文
+      // （见 server/engine/explorer.js 的「收口态」）⇒ 模型怎么知道
+      // 「刚才那段是最后一段、现在该收口了」？只能靠这个标记。
+      //
+      // 之前靠模型自己从「这次只给了一段」推断 —— 那是推断不是信号，
+      // 换个模型就可能反复重讲最后一段。
+      //
+      // 措辞上写「这是最后一段」这个**事实**，动作仍然交给 scenario
+      // prompt 里已有的收口规则（落在社区、不承诺 1v1）——
+      // 引擎不替 prompt 改口径，只补一个模型看得见的事实。
+      if (sel.is_final) {
+        lines.push(
+          '（**这是这一则的最后一段**：讲完这一段就进入收口 —— 先问「你从她的故事里获得了怎样的启发，你想和真人聊聊吗？」，' +
+            '然后落在探索者社区（Coco 可以帮你引荐，或带你来相关的线下/线上活动）；不要承诺 1v1 单独对接，也不要重复讲这一段。）'
+        );
+      }
       if (lines.length) {
         blocks.push({
           header:

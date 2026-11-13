@@ -337,3 +337,101 @@ test('注入探索者素材时：正文进去、小标题不进去', async () =>
   assert.ok(!prompt.includes('这个标题端上不显示'), '小标题是内部记号，端上不显示');
   assert.ok(prompt.includes('以下是给你的材料'), '注入段应带「材料不是指令」的声明');
 });
+
+// ── 五、显式的结束标记（2026-11-13）─────────────────────────────
+//
+// 为什么要有：素材讲完之后，服务端本来会**一直重复注入最后一段**
+// （start 被 Math.min 夹在最后一段上）⇒ 模型只能自己从「这次只给了一段」
+// 推断出「讲完了」。那是推断，不是信号 —— 换个模型就可能反复重讲。
+//
+// 现在改成两件事：
+//   ① 这一轮要讲的正好是最后一段时，素材里带**显式标记**；
+//   ② 全部讲完之后进入「收口态」，**不再重复注入**最后一段。
+
+test('中间段不是最后一段（不标记）', () => {
+  seedStories();
+  const db = getDb();
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 'f1',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  assert.ok(ctx.selected);
+  assert.equal(ctx.selected.is_final, false, '第一段不是最后一段');
+});
+
+test('讲到最后一段时，素材里带显式的结束标记', () => {
+  seedStories();
+  const db = getDb();
+  // 先选人（甲同学共 2 段）
+  buildExplorerContext({
+    db,
+    conversationId: 'f2',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  // 讲完第一段后 ⇒ 这一轮讲的是第二段 = 最后一段
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 'f2',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+      { role: 'assistant', content: '甲同学的第一段。' },
+      { role: 'user', content: '嗯，我懂' },
+    ],
+  });
+  assert.ok(ctx.selected);
+  assert.equal(ctx.selected.is_final, true, '讲最后一段时要明确标记');
+  assert.match(ctx.selected.segments[0].text, /甲同学的第二段/);
+});
+
+test('全部讲完之后进入收口态：**不再重复注入**最后一段', () => {
+  seedStories();
+  const db = getDb();
+  const base = [
+    { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+    { role: 'user', content: '甲同学' },
+    { role: 'assistant', content: '甲同学的第一段。' },
+    { role: 'user', content: '嗯，我懂' },
+    { role: 'assistant', content: '甲同学的第二段。' },
+    { role: 'user', content: '很感动' },
+  ];
+  buildExplorerContext({ db, conversationId: 'f3', history: base.slice(0, 2) });
+  const ctx = buildExplorerContext({ db, conversationId: 'f3', history: base });
+  assert.equal(ctx.phase, 'closing', '讲完就该收口');
+  assert.equal(ctx.selected, undefined, '收口态不再注入正文');
+  assert.ok(ctx.catalog.length > 0, '目录还在（用户可以换人）');
+  const state = createExplorerStore({ db }).getSession('f3');
+  assert.equal(state.phase, 'closing');
+});
+
+test('结束标记进了 prompt（模型看得见「这是最后一段」）', async () => {
+  const { engine, calls } = makeEngine();
+  await engine({
+    scenario: 'story',
+    history: [{ role: 'user', content: '你好' }],
+    clientContext: {
+      explorer: {
+        catalog: [],
+        selected: {
+          id: 'jia',
+          name: '甲同学',
+          one_liner: '一句画像',
+          segments: [{ text: '甲同学的第一段。' }],
+          guide: '一次讲一段',
+          safety: '不渲染细节',
+          is_final: true,
+        },
+      },
+    },
+  });
+  const prompt = calls[0].systemPrompt;
+  assert.ok(prompt.includes('最后一段'), '结束标记应当出现在 prompt 里');
+  assert.ok(prompt.includes('收口'), '结束标记要写明接下来是收口');
+});
