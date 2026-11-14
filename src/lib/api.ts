@@ -1,3 +1,19 @@
+/**
+ * 会话场景。取值域与服务端 `SCENARIO_IDS` 一一对应（server/promptRegistry.js）。
+ *
+ * - `chat`   ＝ 通用对话（底座 + scenario.chat）
+ * - `story`  ＝ 故事线（Coco 的四段故事 → 探索者故事 → CBT 练习 / 微创业想法）
+ * - `idea`   ＝ 微创业想法线（只提问，不讲故事）
+ * - `cbt_quick` ＝ 认知急救箱（5 步 CBT 小练习）
+ */
+export type ChatScenario =
+  | 'chat'
+  | 'story'
+  | 'idea'
+  | 'cbt_quick'
+  | 'cbt_delivery'
+  | 'analysis';
+
 export interface Message {
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -18,6 +34,8 @@ export async function getConversation(id: string): Promise<{
   id: string;
   status: string;
   expires_at: string | null;
+  /** 这个会话当初走的场景（刷新页面后要靠它恢复场景，不能掉回 chat）。 */
+  scenario: string | null;
   messages: { role: string; content: string; created_at: string }[];
 } | null> {
   const res = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
@@ -30,7 +48,7 @@ export async function getConversation(id: string): Promise<{
 export async function* streamChat(
   messages: Message[],
   conversationId?: string,
-  scenario?: 'chat' | 'story' | 'cbt_quick' | 'cbt_delivery' | 'analysis'
+  scenario?: ChatScenario
 ): AsyncGenerator<string> {
   const response = await fetch('/api/chat', {
     method: 'POST',

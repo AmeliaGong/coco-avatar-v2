@@ -264,6 +264,10 @@ app.get('/api/conversations/:id', (req, res) => {
     created_at: conv.created_at,
     expires_at: conv.expires_at,
     status: conv.status,
+    // 场景要回给前端：刷新页面 / 重进会话时，前端靠它恢复场景，
+    // 否则会话会掉回默认的 chat（chat 的 prompt 开头是「故事模式」）。
+    // ⚠️ scenario 只是一个 prompt 标签，不含任何用户内容，可以公开。
+    scenario: conv.scenario,
     messages,
   });
 });

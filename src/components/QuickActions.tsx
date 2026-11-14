@@ -1,16 +1,23 @@
+import type { ChatScenario } from '../lib/api';
+
 interface QuickAction {
   label: string;
   message: string;
   /**
    * 这一条对话要走的场景。
    *
-   * - `chat` ＝ 通用对话（底座 + scenario.chat）
    * - `story` ＝ 故事线（Coco 的四段故事 → 探索者故事 → CBT 练习 / 微创业想法）
+   * - `cbt_quick` ＝ 认知急救箱（5 步 CBT 小练习）
+   * - `idea`   ＝ 微创业想法线（只提问，不讲故事）
    *
-   * ⚠️ **场景是「粘」的**：用户一旦点了「听听 Coco 和探索者们的故事」，
-   * 整个会话就留在 story 场景里（故事要一段一段讲，不能中途掉回通用对话）。
+   * ⚠️ **三个入口必须是三个不同的场景**：
+   * `chat`（通用对话）的 prompt 开头就是「【故事模式】+ Coco 的故事素材」，
+   * 让②③走 chat ⇒ 真模型会照着讲起故事来（本地预览时真的复现过）。
+   *
+   * ⚠️ **场景是「粘」的**：用户一旦点了某个入口，
+   * 整个会话就留在那个场景里（故事要一段一段讲，不能中途掉回通用对话）。
    */
-  scenario: 'chat' | 'story';
+  scenario: ChatScenario;
 }
 
 interface QuickActionsProps {
@@ -27,15 +34,19 @@ const QUICK_ACTIONS: QuickAction[] = [
   {
     label: '我想做出改变但遇到卡点',
     message: '我想做出改变但遇到卡点，可以带我做一次练习吗？',
-    scenario: 'chat',
+    // ⚠️ 走 cbt_quick（认知急救箱），**不走 chat** —— chat 的 prompt 以「故事模式」开头。
+    scenario: 'cbt_quick',
   },
   {
     label: '我有一个微创业想法',
-    // ⚠️ 这条**故意把指令带在用户的话里**：微创业还没有专门的 prompt
-    // （prompt 不改），所以「用跨学科的方式提问」这句话本身就是给 Coco 的指令。
+    // ⚠️ 这条**故意把指令带在用户的话里**：即使 prompt 已经有专门的
+    // 「一次只问一个问题 + 跨学科视角」，把用户的话也带上，
+    // 第一轮就能对上号（prompt 不会被误当成通用闲聊）。
     message:
       '我有一个微创业的想法，想请你用跨学科的方式对我这个想法提问，帮我拿到决策上的突破。',
-    scenario: 'chat',
+    // ⚠️ 走 idea（prompts/scenario.idea.md），**不走 chat** —— chat 的 prompt
+    // 开头是「【故事模式】+ Coco 的 9 段故事素材」，模型会先去讲故事。
+    scenario: 'idea',
   },
 ];
 

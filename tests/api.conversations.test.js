@@ -96,3 +96,15 @@ test('管理员登录成功后可用 token 访问管理接口', async () => {
   });
   assert.equal(res.status, 200);
 });
+
+// 场景要回给前端：刷新页面 / 重进会话时，前端靠它恢复场景。
+// 不恢复的话，会话掉回默认的 chat —— 而 chat 的 prompt 开头是「故事模式」，
+// 故事线会被搅乱（用户会看到 Coco 突然开始讲故事）。
+test('GET /api/conversations/:id 会把场景带回给前端', async () => {
+  const db = getDb();
+  const created = await (await fetch(`${base}/api/conversations`, { method: 'POST' })).json();
+  db.prepare('UPDATE conversations SET scenario = ? WHERE id = ?').run('idea', created.id);
+
+  const body = await (await fetch(`${base}/api/conversations/${created.id}`)).json();
+  assert.equal(body.scenario, 'idea');
+});

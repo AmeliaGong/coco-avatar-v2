@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
-import { streamChat, getConversation, type Message } from '../lib/api';
+import { streamChat, getConversation, type ChatScenario, type Message } from '../lib/api';
 
 export interface ChatMessage {
   role: 'user' | 'assistant';
@@ -21,7 +21,7 @@ export function useChat(initialMessage: string, conversationId?: string) {
   // story 场景（故事要一段一段讲，中途掉回通用对话会把故事线打断）。
   // 用 ref 存是因为 sendMessage 里要**立刻**读到最新值 —— setState 是异步的，
   // 同一轮里读 state 会拿到旧值。
-  const scenarioRef = useRef<'chat' | 'story'>('chat');
+  const scenarioRef = useRef<ChatScenario>('chat');
 
   // Keep ref updated
   useEffect(() => {
@@ -36,6 +36,12 @@ export function useChat(initialMessage: string, conversationId?: string) {
         setExpired(true);
         return;
       }
+      // ⚠️ **刷新/重进要把场景找回来**。场景存在库里的 conversations.scenario，
+      // 不恢复的话，用户在故事线讲了一半刷新一下，下一轮就掉回 chat
+      // （chat 的 prompt 开头是「故事模式」，等于把故事线搅乱）。
+      if (conv.scenario && conv.scenario !== 'chat') {
+        scenarioRef.current = conv.scenario as ChatScenario;
+      }
       if (conv.messages && conv.messages.length > 0) {
         const loaded: ChatMessage[] = conv.messages
           .filter(m => m.role === 'user' || m.role === 'assistant')
@@ -47,7 +53,7 @@ export function useChat(initialMessage: string, conversationId?: string) {
     });
   }, [conversationId]);
 
-  const sendMessage = useCallback(async (userMessage: string, scenario?: 'chat' | 'story') => {
+  const sendMessage = useCallback(async (userMessage: string, scenario?: ChatScenario) => {
     // 场景一旦被指定就定下来（后面几轮都沿用）。
     if (scenario) {
       scenarioRef.current = scenario;

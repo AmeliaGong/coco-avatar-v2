@@ -76,6 +76,7 @@ test('listScenarios 只列场景，不含 persona.base，并给出装配后的�
     [
       'scenario.chat',
       'scenario.story',
+      'scenario.idea',
       'scenario.cbt_quick',
       'scenario.cbt_delivery',
       'scenario.analysis',
@@ -197,11 +198,12 @@ test('getPrompt 对未知场景抛错', () => {
 });
 
 test('可覆盖 id 集合与场景 id 清单符合约定', () => {
-  assert.deepEqual(SCENARIO_IDS, ['chat', 'story', 'cbt_quick', 'cbt_delivery', 'analysis']);
+  assert.deepEqual(SCENARIO_IDS, ['chat', 'story', 'idea', 'cbt_quick', 'cbt_delivery', 'analysis']);
   assert.deepEqual(OVERRIDABLE_IDS, [
     'persona.base',
     'scenario.chat',
     'scenario.story',
+    'scenario.idea',
     'scenario.cbt_quick',
     'scenario.cbt_delivery',
     'scenario.analysis',

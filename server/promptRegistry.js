@@ -16,6 +16,7 @@ export const PART_FILES = {
   'persona.v2': 'persona.v2.md',
   'scenario.chat': 'scenario.chat.md',
   'scenario.story': 'scenario.story.md',
+  'scenario.idea': 'scenario.idea.md',
   'scenario.cbt_quick': 'scenario.cbt_quick.md',
   'scenario.cbt_delivery': 'scenario.cbt_delivery.md',
   'scenario.analysis': 'scenario.analysis.md',
@@ -26,13 +27,14 @@ export const OVERRIDABLE_IDS = [
   'persona.base',
   'scenario.chat',
   'scenario.story',
+  'scenario.idea',
   'scenario.cbt_quick',
   'scenario.cbt_delivery',
   'scenario.analysis',
 ];
 
 // 场景 id（用户请求体里的 scenario 字段取值域）。供路由做白名单。
-export const SCENARIO_IDS = ['chat', 'story', 'cbt_quick', 'cbt_delivery', 'analysis'];
+export const SCENARIO_IDS = ['chat', 'story', 'idea', 'cbt_quick', 'cbt_delivery', 'analysis'];
 
 // 内容版本号 = 内容哈希。文件和数据库覆盖层共用同一套编号空间：
 // 回答「这次对话是哪些文本产生的」靠的是内容，不是修订号。
