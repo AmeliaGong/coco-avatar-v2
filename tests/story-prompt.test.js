@@ -67,14 +67,14 @@ test('手稿里的内部标记没有混进素材（小标题/编号/分隔线端
 });
 
 test('4 段之后各有一句问，收口挂在第 4 段', () => {
-  const qBlock = prompt.split('【每段之后问什么】')[1].split('【故事收尾阶段】')[0];
+  const qBlock = prompt.split('\n【每段之后问什么】')[1].split('【故事收尾阶段】')[0];
   const asked = [...qBlock.matchAll(/- 第(\d+)段之后/g)].map(x => Number(x[1]));
   assert.deepEqual(asked, [1, 2, 3, 4], '每段都要有一句问');
   assert.ok(prompt.includes('【故事收尾阶段】（第4段讲完、用户回应之后）'), '收口应挂在第 4 段');
 });
 
 test('每段后的问句是她审过的那三个', () => {
-  const qBlock = prompt.split('【每段之后问什么】')[1].split('【故事收尾阶段】')[0];
+  const qBlock = prompt.split('\n【每段之后问什么】')[1].split('【故事收尾阶段】')[0];
   for (const q of [
     '你有没有过那种时刻——明明做得很“体面”、很成功，却觉得自己在一点点被消耗掉？',
     '当一件你已经全身心投入、却还没看到结果的事遇到瓶颈，你会不会问自己：我是在做它，还是在用它证明自己？',
@@ -143,4 +143,13 @@ test('探索者分支：3 个候选的固定格式（3 行 "- " 开头）+ 序�
   assert.ok(branch.includes('- 名字：一句话画像'), '要给模型的候选列表格式');
   assert.ok(branch.includes('正好 3 行，每行以 "- " 开头'), '要规定候选正好 3 行');
   assert.ok(/不是目录里的排序/.test(branch), '要写明序号指的是刚列出的三个人');
+});
+
+test('开场白和第 1 段必须在同一轮（不许只回开场白就停下）', () => {
+  // 2026-11-18 线上实测：模型只回了「那我从最开始说起吧。」就停下（26 字），
+  // 整条故事线错位一轮。
+  const opening = prompt.split('【开场】')[1].split('【怎么讲】')[0];
+  assert.ok(opening.includes('在同一轮回复里'), '要写明开场和第 1 段同一轮');
+  assert.ok(opening.includes('紧接着讲第 1 段'), '要写明紧接着讲第 1 段');
+  assert.ok(/不许只回开场白就停下/.test(opening), '要禁止只回开场白');
 });
