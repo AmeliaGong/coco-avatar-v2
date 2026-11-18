@@ -127,3 +127,20 @@ test('钩子覆盖 4 段之间的 3 个过渡', () => {
   }
   assert.equal(/第4段→第5段/.test(hookBlock), false, '只有 4 段，不该有第5段');
 });
+
+test('收尾阶段：含糊的回答（"我想想"）不算拒绝，必须把人列出来', () => {
+  // 2026-11-18 线上实测：模型回了「好，不着急。你可以先想想…」就停下，
+  // 用户面前什么都没有 → 后面「第二个」只能对着 15 人目录瞎猜。
+  const closing = prompt.split('【故事收尾阶段】（第4段讲完、用户回应之后）').pop().split('\n【探索者分支】')[0];
+  assert.ok(closing.includes('我想想'), '收尾阶段要写明"我想想"这类含糊回答');
+  assert.ok(/不是拒绝/.test(closing), '要写明含糊 ≠ 拒绝');
+  assert.ok(/不要只回一句"好，不着急"就停下/.test(closing), '要禁止只回客套话就停下');
+  assert.ok(closing.includes('下一轮一定要把 3 位探索者列出来'), '要强制下一轮列出 3 个人');
+});
+
+test('探索者分支：3 个候选的固定格式（3 行 "- " 开头）+ 序号指的是刚列出的三人', () => {
+  const branch = prompt.split('【探索者分支】').pop().split('【创业想法分支】')[0];
+  assert.ok(branch.includes('- 名字：一句话画像'), '要给模型的候选列表格式');
+  assert.ok(branch.includes('正好 3 行，每行以 "- " 开头'), '要规定候选正好 3 行');
+  assert.ok(/不是目录里的排序/.test(branch), '要写明序号指的是刚列出的三个人');
+});
