@@ -435,3 +435,67 @@ test('结束标记进了 prompt（模型看得见「这是最后一段」）', a
   assert.ok(prompt.includes('最后一段'), '结束标记应当出现在 prompt 里');
   assert.ok(prompt.includes('收口'), '结束标记要写明接下来是收口');
 });
+
+// ── 2026-11-19：模型把一段**讲成了简介**时，不能因此跳过原文 ──────
+//
+// 线上真实故障：用户选了 Lana，模型第一轮回了一段"人物简介"（不是原文）。
+// 按轮数算，"那一轮"就算讲过一段 ⇒ 下一轮直接给第 2 段
+// ⇒ **第 1 段的原文被整段跳过**，用户只读到简介，然后模型还说
+// "完整原文素材没有加载到我这里"。
+
+test('模型把第一段讲成了简介 ⇒ 下一轮仍然给第 1 段（不跳过原文）', () => {
+  seedStories();
+  const db = getDb();
+  buildExplorerContext({
+    db,
+    conversationId: 'c9',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  // 第二轮：模型把第一段**总结**了（没有逐字复述原文）
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 'c9',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+      { role: 'assistant', content: '甲同学是个测试用的人，她的第一段大概讲的是开头。' },
+      { role: 'user', content: '太短了' },
+    ],
+  });
+  assert.ok(ctx.selected, '这一轮仍然要有素材');
+  assert.equal(ctx.selected.name, '甲同学');
+  assert.match(
+    ctx.selected.segments[0].text,
+    /甲同学的第一段/,
+    '讲成简介之后，下一轮要重讲第 1 段的原文，而不是跳到第 2 段'
+  );
+  assert.equal(ctx.selected.retry, true, '要告诉模型"上一轮没逐字讲出来，请重讲"');
+});
+
+test('逐字讲完一段之后，下一轮给下一段，且不再要 retry', () => {
+  seedStories();
+  const db = getDb();
+  buildExplorerContext({
+    db,
+    conversationId: 'c10',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 'c10',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+      { role: 'assistant', content: '甲同学的第一段。第二行还是第一段。' },
+      { role: 'user', content: '嗯，我懂' },
+    ],
+  });
+  assert.match(ctx.selected.segments[0].text, /甲同学的第二段/);
+  assert.equal(ctx.selected.retry, false, '正常讲过就不该再要求重讲');
+});

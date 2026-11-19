@@ -558,8 +558,19 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
         // 端上不许显示小标题/段号，模型只把它当结构用。
         lines.push(`【第${i + 1}段】${body}`);
       }
-      if (sel.guide) lines.push(`怎么讲（节奏与每段后的问法）：${sanitizeShort(sel.guide)}`);
+      if (sel.guide) {
+        lines.push(
+          `怎么讲（节奏参考；**里面的问句不要照抄** —— 每段之后只说「你猜后面发生了什么？」）：${sanitizeShort(sel.guide)}`
+        );
+      }
       if (sel.safety) lines.push(`安全边界（必须遵守）：${sanitizeShort(sel.safety)}`);
+      // 上一轮没逐字讲出来（讲成了简介）⇒ 明确要求重讲。
+      if (sel.retry) {
+        lines.push(
+          '（**上一轮这一段没有逐字讲出来** —— 这一轮请**逐字重讲**下面第一段：' +
+            '不要总结、不要改成简介、不要用「一句话画像」开场。）'
+        );
+      }
       // ── 显式的结束标记 ──────────────────────────────────────────
       //
       // 为什么需要它：这一则讲完之后，服务端**不再重复注入**正文
@@ -574,8 +585,9 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       // 引擎不替 prompt 改口径，只补一个模型看得见的事实。
       if (sel.is_final) {
         lines.push(
-          '（**这是这一则的最后一段**：讲完这一段就进入收口 —— 先问「你从她的故事里获得了怎样的启发，你想和真人聊聊吗？」，' +
-            '然后落在探索者社区（Coco 可以帮你引荐，或带你来相关的线下/线上活动）；不要承诺 1v1 单独对接，也不要重复讲这一段。）'
+          '（**这是这一则的最后一段**：讲完这一段就进入收口 —— 讲完原文后**只问这一句**「你从她的故事里获得了怎样的启发？」；' +
+            '等用户回应之后，再落在探索者社区（Coco 可以帮你引荐，或带你来相关的线下/线上活动）；' +
+            '不要承诺 1v1 单独对接，也不要重复讲这一段。）'
         );
       }
       if (lines.length) {

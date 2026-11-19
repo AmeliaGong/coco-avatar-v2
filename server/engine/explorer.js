@@ -143,6 +143,20 @@ export function resolveSelection(userText, candidates, stories) {
  * 而让 label 一路传下去，就多了一次「小标题漏进 prompt」的机会。
  * 数据库里仍然留着 label（那是素材的原始分段信息，排障用）。
  */
+/**
+ * 一段的"指纹"：开头 8 个字（**去掉所有空白**）。
+ *
+ * 用来判断"模型到底有没有把这一段逐字讲出来"。
+ * 去掉空白是必要的 —— 模型输出时的换行、空格不一定跟素材一致。
+ * 取 8 个字是权衡：太短会撞车，太长则模型只念了半段就匹配不上。
+ */
+function segmentHead(text) {
+  if (typeof text !== 'string') return '';
+  const flat = text.replace(/\s+/g, '');
+  if (!flat.length) return '';
+  return flat.slice(0, Math.min(8, flat.length));
+}
+
 function toRuntimeSegments(segments, start, count) {
   return (Array.isArray(segments) ? segments : [])
     .slice(start, start + count)
@@ -199,7 +213,7 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
   if (state && state.phase === 'telling' && state.selected_id) {
     const story = stories.find(s => s.id === state.selected_id);
     if (story) {
-      const delivered = Math.max(0, assistantTexts.length - state.base_assistant_count);
+      const spokenCount = Math.max(0, assistantTexts.length - state.base_assistant_count);
       // 全部讲完 ⇒ 收口态。
       //
       // 为什么不能继续注入最后一段：start 会被夹在最后一段上，于是模型
@@ -208,7 +222,42 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
       // 「这是最后一段」由下面那个显式标记在**该讲的那一轮**给出。
       const all = toRuntimeSegments(story.segments, 0, story.segments.length);
       const total = all.length;
-      if (total > 0 && delivered >= total) {
+
+      // ── 「已经讲过哪几段」按**内容**判定，不按轮数判定 ──────────
+      //
+      // 2026-11-19 线上实测的真实故障：模型在用户选人后的第一轮，把整则
+      // 故事**讲成了一段简介**（"Lana是个来自大理的00后…"）。
+      // 按轮数算的话，那一轮已经算"讲过一段" ⇒ 下一轮直接给第 2 段
+      // ⇒ **第 1 段的原文被整段跳过了**，用户只读到简介。
+      //
+      // 改成按内容算：某一段的**开头几个字**出现在模型说过的话里，
+      // 才算那一段真的讲过。讲歪了（讲成简介）⇒ 只是重讲那一段，
+      // 故事不会被跳过。
+      const covered = new Set();
+      const flatSpoken = assistantTexts
+        .slice(state.base_assistant_count)
+        .map(t => (typeof t === 'string' ? t.replace(/\s+/g, '') : ''));
+      for (let i = 0; i < total; i++) {
+        const head = segmentHead(all[i].text);
+        if (!head) continue;
+        for (const text of flatSpoken) {
+          if (text && text.includes(head)) {
+            covered.add(i);
+            break;
+          }
+        }
+      }
+      let start = 0;
+      while (start < total && covered.has(start)) start++;
+
+      // 兜底：模型有足够的轮次却**一段都没逐字复述** ⇒ 别卡在第一段，
+      // 放行一段（否则用户每次说"继续"都回到同一段，永远前进不了）。
+      const stuck = covered.size === 0 && spokenCount >= 2;
+      if (stuck) start = Math.min(1, Math.max(0, total - 1));
+
+      // 讲完了 ⇒ 收口态。
+      const done = start >= total || (start === total - 1 && spokenCount >= total + 1);
+      if (total > 0 && done) {
         if (conversationId) {
           store.setSession(conversationId, {
             phase: 'closing',
@@ -218,7 +267,6 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
         }
         return { catalog, phase: 'closing' };
       }
-      const start = Math.min(delivered, Math.max(0, total - 1));
       const slice = all.slice(start, start + 2);
       return {
         catalog,
@@ -231,6 +279,8 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
           safety: story.safety,
           // 这一轮要讲的是 slice[0]（模型一次讲一段）⇒ 它是不是最后一段？
           is_final: start === total - 1,
+          // 上一轮讲成了简介（没逐字复述）⇒ 明确告诉模型"请逐字讲这一段"。
+          retry: covered.size === 0 && spokenCount > 0,
         },
         phase: 'telling',
       };
