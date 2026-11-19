@@ -548,6 +548,21 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       const name = sanitizeShort(sel.name);
       lines.push(`姓名：${name}`);
       if (sel.one_liner) lines.push(`一句话：${sanitizeShort(sel.one_liner)}`);
+      // 「介绍」（人物卡）：**不是故事段** —— 讲法不一样。
+      //
+      // 为什么单独标出来：有些素材的第 1 段是「人物卡」（说明里写着"不是故事"），真正的介绍在素材的「人物卡」小节里。
+      // 它要**压成 2-3 句**讲清她是谁，不是逐字背 —— 逐字背出来的是
+      // 一张履历清单，用户读不下去。
+      if (sel.intro) {
+        const intro = sanitizeExplorerBody(sel.intro);
+        if (intro) {
+          lines.push(
+            '介绍（**这是人物卡，不是故事段**：用 2-3 句话讲清她是谁 —— ' +
+              '可以压缩、可以挑重点，但**不要**照抄成流水账、不要念字段、不要逐字背；' +
+              `说完立刻进入第 1 段）：${intro}`
+          );
+        }
+      }
       const segments = Array.isArray(sel.segments) ? sel.segments : [];
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
@@ -567,7 +582,7 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
       // 上一轮没逐字讲出来（讲成了简介）⇒ 明确要求重讲。
       if (sel.retry) {
         lines.push(
-          '（**上一轮这一段没有逐字讲出来** —— 这一轮请**逐字重讲**下面第一段：' +
+          '（**上一轮这一段没有逐字讲出来** —— 这一轮请**逐字重讲**下面这一段：' +
             '不要总结、不要改成简介、不要用「一句话画像」开场。）'
         );
       }

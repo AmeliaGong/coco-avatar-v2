@@ -101,9 +101,9 @@ test('解析出姓名、分类、教育层级、一句话与匹配信号', () =>
 });
 
 test('并列名拆成 name + aliases', () => {
-  const { name, aliases } = parseName('# 丙同学 / 小舟（副标题）');
+  const { name, aliases } = parseName('# 丙同学 / 小丙（副标题）');
   assert.equal(name, '丙同学');
-  assert.deepEqual(aliases, ['小舟']);
+  assert.deepEqual(aliases, ['小丙']);
 });
 
 test('正文按「段」切开，正文里没有小标题，引用符被去掉', () => {
@@ -382,7 +382,7 @@ test('讲到最后一段时，素材里带显式的结束标记', () => {
     history: [
       { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
       { role: 'user', content: '甲同学' },
-      { role: 'assistant', content: '甲同学的第一段。' },
+      { role: 'assistant', content: '甲同学的第一段。第二行还是第一段。' },
       { role: 'user', content: '嗯，我懂' },
     ],
   });
@@ -397,7 +397,7 @@ test('全部讲完之后进入收口态：**不再重复注入**最后一段', (
   const base = [
     { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
     { role: 'user', content: '甲同学' },
-    { role: 'assistant', content: '甲同学的第一段。' },
+    { role: 'assistant', content: '甲同学的第一段。第二行还是第一段。' },
     { role: 'user', content: '嗯，我懂' },
     { role: 'assistant', content: '甲同学的第二段。' },
     { role: 'user', content: '很感动' },
@@ -438,7 +438,7 @@ test('结束标记进了 prompt（模型看得见「这是最后一段」）', a
 
 // ── 2026-11-19：模型把一段**讲成了简介**时，不能因此跳过原文 ──────
 //
-// 线上真实故障：用户选了 Lana，模型第一轮回了一段"人物简介"（不是原文）。
+// 线上真实故障：用户选了某一位探索者，模型第一轮回了一段"人物简介"（不是原文）。
 // 按轮数算，"那一轮"就算讲过一段 ⇒ 下一轮直接给第 2 段
 // ⇒ **第 1 段的原文被整段跳过**，用户只读到简介，然后模型还说
 // "完整原文素材没有加载到我这里"。
@@ -498,4 +498,230 @@ test('逐字讲完一段之后，下一轮给下一段，且不再要 retry', ()
   });
   assert.match(ctx.selected.segments[0].text, /甲同学的第二段/);
   assert.equal(ctx.selected.retry, false, '正常讲过就不该再要求重讲');
+});
+
+// ── 2026-11-19：段首是**标题**时，模型跳过它也要算"讲过了" ──────────
+//
+// 线上真实故障：原文第 1 段以「文章大标题 + 第一个小标题」开头，
+// 模型**正确地**跳过了那两行（那是标题，不是故事）。
+// 而"讲过了"原先是拿**开头 8 个字**当指纹的 ⇒ 指纹永远对不上
+// ⇒ 服务端永远重讲第 1 段 ⇒ 第 3、4、5 段永远轮不到
+// ⇒ 用户只读到两段，模型就自己收口了。
+//
+// 现在改成**段内分布的窗口**判定：跳过开头不影响判定。
+
+const TITLE_HEAD_MD = `# 乙同学（测试用）
+
+> 分类 02 亲密关系 ｜ 编号 99-8
+
+## 一句话
+
+这是一句用于测试的画像。
+
+## 字段
+
+| 字段 | 内容 |
+|---|---|
+| 姓名 / 化名 | 乙同学 |
+| 匹配信号 | 用户说「我想听故事」时优先推这则 |
+
+## 匹配定位
+
+- **教育层级**：**L2 自我教育** —— 用来测教育层级解析。
+- **分类**：02（主线）
+
+## 正文（按原小标题分段 · 原文逐字）
+
+### [段 0] 原文标题与开场
+
+> 乙同学的生命故事：一段用来测标题被跳过的正文。
+
+> 一、开场：一次近乎莽撞的决定
+
+> 正文第一句从这里开始，正文第一句从这里开始，正文第一句从这里开始，正文第一句从这里开始。
+
+### [段 1] 原小标题：二、接下来的事
+
+> 第二段的正文，第二段的正文，第二段的正文，第二段的正文，第二段的正文，第二段的正文。
+
+## 给 Coco Avatar 的使用说明（端上怎么讲）
+
+- 一次讲一段，讲完停一下。
+
+## 校对备注（原文照抄未改）
+
+- 这里是笔误待确认。
+`;
+
+function seedTitleStory() {
+  const store = createExplorerStore({ db: getDb() });
+  store.upsert(
+    parseExplorerMarkdown(TITLE_HEAD_MD, { id: 'yi2', fallbackCategory: '02' })
+  );
+  return store;
+}
+
+test('段首是标题、模型跳过标题 ⇒ 照样判定"讲过了"，给下一段', () => {
+  seedTitleStory();
+  const db = getDb();
+  // 模型讲了第 1 段，但**跳过了开头两行标题**（正确做法）
+  const said = '正文第一句从这里开始，正文第一句从这里开始，正文第一句从这里开始，正文第一句从这里开始。';
+  buildExplorerContext({
+    db,
+    conversationId: 't1',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '乙同学' },
+    ],
+  });
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 't1',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '乙同学' },
+      { role: 'assistant', content: said },
+      { role: 'user', content: '嗯' },
+    ],
+  });
+  assert.ok(ctx.selected);
+  assert.match(
+    ctx.selected.segments[0].text,
+    /第二段的正文/,
+    '跳过标题也算讲过了 ⇒ 下一轮该给第 2 段，而不是重讲第 1 段'
+  );
+  assert.equal(ctx.selected.retry, false, '讲过了就不该再要求重讲');
+});
+
+test('一轮只给一段（不给两段）：「第 1 段」与「下一段」必须指同一段', () => {
+  seedStories();
+  const db = getDb();
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 't2',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  assert.equal(ctx.selected.segments.length, 1, '一轮只给一段');
+  assert.match(ctx.selected.segments[0].text, /甲同学的第一段/);
+});
+
+test('「介绍」（人物卡）与故事段分开：介绍只给一次，且不进故事段序列', () => {
+  seedStories();
+  const db = getDb();
+  const first = buildExplorerContext({
+    db,
+    conversationId: 't3',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  assert.equal(first.selected.intro, null, '没有人物卡 ⇒ 没有介绍');
+  const second = buildExplorerContext({
+    db,
+    conversationId: 't3',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+      { role: 'assistant', content: '甲同学的第一段。第二行还是第一段。' },
+      { role: 'user', content: '嗯' },
+    ],
+  });
+  assert.equal(second.selected.intro, null, '介绍只在选人那一轮给');
+});
+
+// ── 编辑说明不进正文（2026-11-19）────────────────────────────────
+//
+// 素材的正文里混着写给端上的说明（「**端上处理**：……」）。
+// 它们一旦进 prompt，模型就会**照着念出来** ——
+// 用户读到的是"这是写给端上的说明"。
+
+const EDITORIAL_MD = `# 丙同学（测试用）
+
+> 分类 04 情绪与内在卡点 ｜ 编号 99-7
+
+## 一句话
+
+这是一句用于测试的画像。
+
+## 字段
+
+| 字段 | 内容 |
+|---|---|
+| 姓名 / 化名 | 丙同学 |
+| 匹配信号 | 用户说「我累了」时优先推这则 |
+
+## 匹配定位
+
+- **教育层级**：**L2 自我教育** —— 用来测教育层级解析。
+- **分类**：04（主线）
+
+## 人物卡（原文开篇 · 端上作为人物简介）
+
+> 丙同学，一个用来测人物卡解析的人。
+
+## 正文（按原小标题分段 · 原文逐字）
+
+### [段 0] 原文开篇人物卡（见上「人物卡」）
+
+> **端上处理**：人物卡，不是故事。用"Coco 介绍丙同学是谁"2-3 句带过。
+
+### [段 1] 原小标题：一、正文从这里开始
+
+> 【生命故事】
+>
+> 正文的第一句，正文的第一句，正文的第一句，正文的第一句，正文的第一句。
+>
+> ---
+>
+> ▲游离的黑暗时期：20岁之前
+
+## 给 Coco Avatar 的使用说明（端上怎么讲）
+
+- 一次讲一段，讲完停一下。
+
+## 校对备注（原文照抄未改）
+
+- 这里是笔误待确认。
+`;
+
+test('「端上处理」这类编辑说明不进正文', () => {
+  const s = parseExplorerMarkdown(EDITORIAL_MD, { id: 'bing', fallbackCategory: '04' });
+  const dumped = JSON.stringify(s.segments);
+  assert.ok(!dumped.includes('端上处理'), '编辑说明不能进正文');
+  assert.ok(!dumped.includes('【生命故事】'), '结构标签不能进正文');
+  assert.ok(!dumped.includes('---'), '分隔线不能进正文');
+  assert.ok(!dumped.includes('▲'), '排版注解不能进正文');
+});
+
+test('人物卡段被标成「介绍」，故事段序列从正文开始', () => {
+  const s = parseExplorerMarkdown(EDITORIAL_MD, { id: 'bing', fallbackCategory: '04' });
+  const intro = s.segments.find(x => x.kind === 'intro');
+  assert.ok(intro, '第 0 段是人物卡 ⇒ 标成介绍');
+  assert.match(intro.text, /丙同学，一个用来测人物卡解析的人/, '介绍用人物卡的正文');
+  const story = s.segments.filter(x => x.kind !== 'intro');
+  assert.equal(story.length, 1);
+  assert.match(story[0].text, /正文的第一句/);
+});
+
+test('「介绍」段不占故事段的位置：选人那轮同时给介绍与第 1 段', () => {
+  const store = createExplorerStore({ db: getDb() });
+  store.upsert(parseExplorerMarkdown(EDITORIAL_MD, { id: 'bing', fallbackCategory: '04' }));
+  const db = getDb();
+  const ctx = buildExplorerContext({
+    db,
+    conversationId: 't4',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和丙同学。你想先听谁的？' },
+      { role: 'user', content: '丙同学' },
+    ],
+  });
+  assert.ok(ctx.selected.intro, '这一轮要有介绍');
+  assert.match(ctx.selected.intro, /丙同学，一个用来测人物卡解析的人/);
+  assert.equal(ctx.selected.segments.length, 1);
+  assert.match(ctx.selected.segments[0].text, /正文的第一句/);
+  assert.equal(ctx.selected.is_final, true, '只有一段故事 ⇒ 这一轮就是最后一段');
 });

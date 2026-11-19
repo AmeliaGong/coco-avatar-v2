@@ -144,24 +144,76 @@ export function resolveSelection(userText, candidates, stories) {
  * 数据库里仍然留着 label（那是素材的原始分段信息，排障用）。
  */
 /**
- * 一段的"指纹"：开头 8 个字（**去掉所有空白**）。
+ * 一段的"指纹"：**分布在段内的几个窗口**（不是只看开头）。
  *
  * 用来判断"模型到底有没有把这一段逐字讲出来"。
- * 去掉空白是必要的 —— 模型输出时的换行、空格不一定跟素材一致。
- * 取 8 个字是权衡：太短会撞车，太长则模型只念了半段就匹配不上。
+ *
+ * ⚠️ 为什么不能只看开头 8 个字（2026-11-19 线上实测的故障）：
+ * 原文的第 1 段常常以「文章大标题 + 第一个小标题」开头，
+ * 而模型**会自然地跳过这两行**（那是标题，不是故事）。
+ * 只看开头 ⇒ 那一段永远判不出"讲过" ⇒ 服务端永远重讲第 1 段
+ * ⇒ 后面几段永远轮不到（用户只读到第 1、2 段，然后模型自己收口了）。
+ *
+ * 为什么用"多个窗口"而不是"最长公共子串"：
+ *   - 逐字复述 ⇒ 段内任何一段连续的字都会原样出现 ⇒ 多个窗口都命中；
+ *   - 改写/总结 ⇒ 能对上的是零散短语，连不成一个像样的窗口 ⇒ 判不出"讲过"
+ *     ⇒ 触发重讲提示（**不跳过原文**）。
+ *
+ * 去掉标点与空白：模型输出时的换行、空格、标点不一定跟素材一致。
  */
-function segmentHead(text) {
+const WINDOW_LEN = 12;
+const WINDOW_POSITIONS = [0.1, 0.3, 0.5, 0.7, 0.9];
+
+function normalizeForMatch(text) {
   if (typeof text !== 'string') return '';
-  const flat = text.replace(/\s+/g, '');
-  if (!flat.length) return '';
-  return flat.slice(0, Math.min(8, flat.length));
+  return text
+    .replace(/\s+/g, '')
+    // 去掉标点与符号（Unicode 分类）：P = 标点，S = 符号
+    .replace(/[\p{P}\p{S}]/gu, '');
 }
 
-function toRuntimeSegments(segments, start, count) {
+/**
+ * 一段的几个"指纹窗口"（分布在段内，而不是只看开头）。
+ *
+ * 段很短（≤ 窗口长度）时只有一个窗口 —— 那一段要么整段被讲了，要么没讲。
+ */
+function segmentWindows(text) {
+  const flat = normalizeForMatch(text);
+  if (!flat) return [];
+  if (flat.length <= WINDOW_LEN) return [flat];
+  const span = flat.length - WINDOW_LEN;
+  return WINDOW_POSITIONS.map(p => {
+    const start = Math.floor(span * p);
+    return flat.slice(start, start + WINDOW_LEN);
+  });
+}
+
+// 一段被模型讲出来了吗？（命中窗口数）
+function countHits(windows, said) {
+  if (!windows.length || !said) return 0;
+  let hits = 0;
+  for (const w of windows) {
+    if (w && said.includes(w)) hits++;
+  }
+  return hits;
+}
+
+// 命中几个窗口才算"讲过了"。
+//
+// 窗口多（段够长）⇒ 要 2 个：偶发的单点重合不算数。
+// 窗口只有一个（段很短）⇒ 1 个。
+function hitsNeeded(windows) {
+  return windows.length >= 3 ? 2 : 1;
+}
+
+function toRuntimeSegments(segments) {
   return (Array.isArray(segments) ? segments : [])
-    .slice(start, start + count)
     .filter(s => s && typeof s === 'object')
-    .map(s => ({ text: typeof s.text === 'string' ? s.text : '' }))
+    .map(s => ({
+      text: typeof s.text === 'string' ? s.text : '',
+      // 「介绍」段（人物卡）：**不是故事段**，讲法不一样（2-3 句）。
+      intro: s.kind === 'intro',
+    }))
     .filter(s => s.text.trim());
 }
 
@@ -208,55 +260,95 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
   // ── 情况一：已经在讲某一则（telling）────────────────────────────
   //
   // 模型上一轮讲了第 k 段，这一轮要接着讲第 k+1 段 ⇒ 必须再给一次素材。
-  // 给的是**接下来的两段**（不是全部）：一次讲一段，多给一段是给模型留余地，
-  // 全给等于让它跳着讲。
+  // **一轮只给一段**（不是两段）：两段会让「第 1 段」和「下一段」两个说法
+  // 指的不是同一段 —— 模型在用户说"继续"时可能讲掉第二段，把中间那段跳过。
+  // 一段一段给 ⇒ 每一轮给的就是唯一该讲的那一段。
   if (state && state.phase === 'telling' && state.selected_id) {
     const story = stories.find(s => s.id === state.selected_id);
     if (story) {
-      const spokenCount = Math.max(0, assistantTexts.length - state.base_assistant_count);
-      // 全部讲完 ⇒ 收口态。
-      //
-      // 为什么不能继续注入最后一段：start 会被夹在最后一段上，于是模型
-      // 每轮都拿到同一段 ⇒ 要么反复重讲，要么自己猜「该收口了」。
-      // **收口态不再注入正文**（目录还在 —— 用户想换人仍然可以），
-      // 「这是最后一段」由下面那个显式标记在**该讲的那一轮**给出。
-      const all = toRuntimeSegments(story.segments, 0, story.segments.length);
-      const total = all.length;
+      // 「介绍」（人物卡）与故事段分开：介绍只在选人那一轮给一次。
+      const all = toRuntimeSegments(story.segments);
+      const intro = all.find(s => s.intro) || null;
+      const segs = all.filter(s => !s.intro);
+      const total = segs.length;
 
       // ── 「已经讲过哪几段」按**内容**判定，不按轮数判定 ──────────
       //
-      // 2026-11-19 线上实测的真实故障：模型在用户选人后的第一轮，把整则
-      // 故事**讲成了一段简介**（"Lana是个来自大理的00后…"）。
-      // 按轮数算的话，那一轮已经算"讲过一段" ⇒ 下一轮直接给第 2 段
-      // ⇒ **第 1 段的原文被整段跳过了**，用户只读到简介。
+      // 2026-11-19 线上实测的两个故障都出在这里：
+      //   ① 模型把整则故事**讲成了一段简介**（一句话画像式的概述）
+      //      ⇒ 按轮数算的话，那一轮就算"讲过一段" ⇒ 第 1 段原文被整段跳过；
+      //   ② 模型**跳过了原文开头的大标题和小标题**（正确做法），
+      //      而指纹取的是开头 8 个字 ⇒ 第 1 段永远判不出"讲过"
+      //      ⇒ 服务端永远重讲第 1 段 ⇒ 后面几段永远轮不到。
       //
-      // 改成按内容算：某一段的**开头几个字**出现在模型说过的话里，
-      // 才算那一段真的讲过。讲歪了（讲成简介）⇒ 只是重讲那一段，
-      // 故事不会被跳过。
-      const covered = new Set();
-      const flatSpoken = assistantTexts
+      // 现在按**段内分布的窗口**判定：模型逐字讲了 ⇒ 命中；
+      // 讲成了简介/改写 ⇒ 命不中 ⇒ 只是重讲这一段，**原文不会被跳过**。
+      const said = assistantTexts
         .slice(state.base_assistant_count)
-        .map(t => (typeof t === 'string' ? t.replace(/\s+/g, '') : ''));
-      for (let i = 0; i < total; i++) {
-        const head = segmentHead(all[i].text);
-        if (!head) continue;
-        for (const text of flatSpoken) {
-          if (text && text.includes(head)) {
-            covered.add(i);
-            break;
-          }
-        }
-      }
-      let start = 0;
-      while (start < total && covered.has(start)) start++;
+        .map(t => normalizeForMatch(t))
+        .filter(t => t.length);
+      const windows = segs.map(s => segmentWindows(s.text));
 
-      // 兜底：模型有足够的轮次却**一段都没逐字复述** ⇒ 别卡在第一段，
-      // 放行一段（否则用户每次说"继续"都回到同一段，永远前进不了）。
-      const stuck = covered.size === 0 && spokenCount >= 2;
-      if (stuck) start = Math.min(1, Math.max(0, total - 1));
+      // 走一遍历史：新讲出来的段记进 told，顺带记下每一条消息有没有讲出新段。
+      const scan = (need, from = 0) => {
+        const told = new Set();
+        const added = [];
+        for (const msg of said) {
+          let n = 0;
+          for (let i = from; i < total; i++) {
+            if (told.has(i)) continue;
+            if (countHits(windows[i], msg) >= need[i]) {
+              told.add(i);
+              n++;
+            }
+          }
+          added.push(n);
+        }
+        return { told, added };
+      };
+
+      let { told, added } = scan(windows.map(hitsNeeded));
+      // 第一段没讲过的就是接下来该讲的（**不跳过**）。
+      let start = 0;
+      while (start < total && told.has(start)) start++;
+
+      // 连续失败（模型没逐字讲出来）⇒ 放宽判定：宁可算"讲过了"，
+      // 也不要让用户永远卡在同一段。
+      const failStreak = () => {
+        let n = 0;
+        for (let i = added.length - 1; i >= 0; i--) {
+          if (added[i] > 0) break;
+          n++;
+        }
+        return n;
+      };
+      let streak = failStreak();
+      if (streak >= 3) {
+        // 放宽**只对当前这一段往后生效** —— 绝不回头把前面的段标记成"讲过"，
+        // 否则一次放宽就可能悄悄吞掉一整段原文。
+        const relaxed = scan(windows.map(() => 1), start);
+        for (const i of relaxed.told) told.add(i);
+        added = relaxed.added;
+        streak = failStreak();
+        while (start < total && told.has(start)) start++;
+      }
+
+      // 兜底：连着失败很多次 ⇒ 放行这一段。
+      // 「宁可漏一段，也不要让用户永远卡在同一段」——
+      // 这是唯一会丢掉原文的地方，且只在模型连续 6 次讲不出来时发生。
+      if (streak >= 6 && start < total) {
+        told.add(start);
+        start++;
+        while (start < total && told.has(start)) start++;
+      }
 
       // 讲完了 ⇒ 收口态。
-      const done = start >= total || (start === total - 1 && spokenCount >= total + 1);
+      //
+      // 为什么不能继续注入最后一段：模型每轮都拿到同一段 ⇒ 要么反复重讲，
+      // 要么自己猜「该收口了」。
+      // **收口态不再注入正文**（目录还在 —— 用户想换人仍然可以），
+      // 「这是最后一段」由下面那个显式标记在**该讲的那一轮**给出。
+      const done = start >= total;
       if (total > 0 && done) {
         if (conversationId) {
           store.setSession(conversationId, {
@@ -267,20 +359,22 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
         }
         return { catalog, phase: 'closing' };
       }
-      const slice = all.slice(start, start + 2);
       return {
         catalog,
         selected: {
           id: story.id,
           name: story.name,
           one_liner: story.one_liner,
-          segments: slice,
+          // 一轮只给一段（见上面的说明）。
+          segments: [segs[start]],
+          // 介绍只在选人那一轮给（这里是接着讲，不该再有）。
+          intro: null,
           guide: story.guide,
           safety: story.safety,
-          // 这一轮要讲的是 slice[0]（模型一次讲一段）⇒ 它是不是最后一段？
+          // 这一轮要讲的是最后一段吗？
           is_final: start === total - 1,
-          // 上一轮讲成了简介（没逐字复述）⇒ 明确告诉模型"请逐字讲这一段"。
-          retry: covered.size === 0 && spokenCount > 0,
+          // 上一轮没逐字讲出来（讲成了简介）⇒ 明确告诉模型"请逐字讲这一段"。
+          retry: said.length > 0 && added[added.length - 1] === 0,
         },
         phase: 'telling',
       };
@@ -313,18 +407,24 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
           base_assistant_count: assistantTexts.length,
         });
       }
-      const pickedAll = toRuntimeSegments(picked.segments, 0, picked.segments.length);
+      const pickedAll = toRuntimeSegments(picked.segments);
+      const pickedIntro = pickedAll.find(s => s.intro) || null;
+      const pickedSegs = pickedAll.filter(s => !s.intro);
       return {
         catalog,
         selected: {
           id: picked.id,
           name: picked.name,
           one_liner: picked.one_liner,
-          segments: pickedAll.slice(0, 2),
+          // 「介绍」（人物卡）：这一轮先用 2-3 句讲清她是谁，
+          // 然后紧接着讲第 1 段 ⇒ 两样东西都在这一轮给。
+          intro: pickedIntro ? pickedIntro.text : null,
+          // 一轮只给一段（见上面的说明）。
+          segments: pickedSegs.slice(0, 1),
           guide: picked.guide,
           safety: picked.safety,
           // 只有一段的素材 ⇒ 这一轮就是最后一段
-          is_final: pickedAll.length <= 1,
+          is_final: pickedSegs.length <= 1,
         },
         phase: 'telling',
       };

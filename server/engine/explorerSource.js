@@ -20,6 +20,12 @@
 //   2. **小标题是内部记号，端上不显示** —— 所以 label 单独存，
 //      注入时**只给 text**；
 //   3. **校对备注不进口** —— 那些是「待确认」的笔误，不是要给用户看的内容。
+//
+// ⚠️ 2026-11-19 补一条：**编辑说明也不进口**（见下面的「编辑说明」）。
+// 素材的正文里混着写给端上的说明（「**端上处理**：……」）与结构标签
+// （「【个人项目】」）—— 它们一旦进 prompt，模型就会**照着念出来**，
+// 用户会听到"这是写给端上的说明"这种内部话。
+// 剔掉的是**编辑说明**，不是原文。
 
 const SECTION_HEADING = /^##\s+(.*)$/;
 const SUBSECTION_HEADING = /^###\s+(.*)$/;
@@ -71,10 +77,202 @@ function stripImagePlaceholders(text) {
     .join('\n');
 }
 
+// ── 编辑说明 / 结构标签：不是原文，端上不能出现 ──────────────────
+//
+// 素材的正文里混着三类**不是原文**的东西：
+//   1. 「**端上处理**：……」—— 写给端上的说明（怎么介绍、要什么钩子）；
+//   2. 「【个人项目】」「【生命故事】」这类**结构标签**（原文的分区标题）；
+//   3. 「▲某个时期：20岁之前」这类**排版注解**。
+//
+// 不剔掉的话，模型会把它们**当正文念出来** —— 用户读到的是
+// "端上处理：…"这种内部说明。
+//
+// ⚠️ 剔的只是**编辑说明**，原文一个字都不动。
+
+// 「**端上处理**：……」这类写给端上的说明（独占一行或独占一段）。
+const EDITORIAL_MARK = /^\s*\*\*端上处理\*\*/;
+// 结构标签：【个人项目】/【生命故事】/【个人简介】…
+// 第 1 组是标签名，第 2 组是标签后面**同行**的正文。
+const TAG_LINE = /^\s*【([^】]*)】\s*(.*)$/;
+// 「关键词：……」这类标签行（是清单，不是散文）。
+const KEYWORD_LINE = /^\s*(关键词|标签|Tags?)\s*[:：]/i;
+// 分隔线（markdown 的排版，不是内容）。
+const RULE_LINE = /^\s*[-*_]{3,}\s*$/;
+
+// 「人物卡 / 人物简介 / 履历清单 / 非叙事」这类小节是**人物卡**，不是故事段。
+// 它们的讲法不一样（2-3 句介绍），所以要单独标出来。
+const INTRO_LABEL = /(人物卡|人物简介|个人简介|履历清单|事实卡|非叙事)/;
+// 「【如何与你进行学习互动】」这类小节是**互动说明** —— 既不是故事，
+// 也不是人物介绍 ⇒ 整段不要。
+const NON_STORY_LABEL = /(如何与你进行学习互动|学习互动)/;
+// 人物卡里的「互动/话题/交流」小块 —— 那是"能聊什么"，不是"她是谁"。
+const NON_INTRO_CARD_TAG = /(互动|话题|交流)/;
+
+/**
+ * 剔掉编辑说明与结构标签，**保留原文**。
+ *
+ * 规则（逐行）：
+ *   - 一段里只要有一行是「**端上处理**：」⇒ **整段丢掉**
+ *     （说明常常横跨两行，只删打头那行会留下半截说明）；
+ *   - 独占一行的结构标签（`【生命故事】`）⇒ 整行丢掉；
+ *   - 跟在正文后面的结构标签（`【个人简介】热爱公益…`）⇒ 只去掉标签本身；
+ *   - 分隔线、关键词行 ⇒ 丢掉；
+ *   - 其它行 ⇒ **一字不改**。
+ */
+export function stripEditorial(text) {
+  if (typeof text !== 'string' || !text) return '';
+  const kept = [];
+  for (const para of text.split(/\n\s*\n/)) {
+    const lines = para.split('\n');
+    if (lines.some(l => EDITORIAL_MARK.test(l))) continue;
+    const out = [];
+    for (const line of lines) {
+      if (RULE_LINE.test(line)) continue;
+      if (KEYWORD_LINE.test(line)) continue;
+      const tag = TAG_LINE.exec(line);
+      if (tag) {
+        const rest = tag[2].trim();
+        if (!rest) continue; // 独占一行的结构标签 ⇒ 整行丢掉
+        out.push(rest); // 标签后面有正文 ⇒ 只去掉标签本身
+        continue;
+      }
+      out.push(line);
+    }
+    const cleaned = out.join('\n').trim();
+    if (cleaned) kept.push(cleaned);
+  }
+  return kept.join('\n\n');
+}
+
+/**
+ * 去掉排版注解：「▲某个时期：20岁之前，按部就班地上学……」
+ *
+ * 注解（`▲xxx：`）是原文的**排版标记**，不是正文 ——
+ * 但它后面常常紧接着正文，所以只吃注解本身：
+ *   - 剩下的是散文 ⇒ 留下（`▲某个时期：20岁之前，按部就班…` ⇒
+ *     留下「20岁之前，按部就班…」）；
+ *   - 剩下的只是一个年龄/年份（`▲释放时期：20-23岁`）⇒ 整行丢掉。
+ *
+ * ⚠️ 注解**可能出现在段的中间**（有一则素材的第 6 段就是），
+ * 所以按**段落**处理，不是只处理第一行。
+ */
+const ANNOTATION = /^▲[^：:]*[：:]\s*(.*)$/;
+// 只剩年份/年龄的那种（"26-27岁"、"20-23岁"）⇒ 整行都是注解。
+const AGE_ONLY = /^[\d\-\s　岁～~到至.年]*$/;
+
+function stripAnnotations(text) {
+  if (typeof text !== 'string' || !text) return '';
+  const kept = [];
+  for (const para of text.split(/\n\s*\n/)) {
+    const lines = para.split('\n');
+    const m = ANNOTATION.exec(lines[0]);
+    if (m) {
+      const rest = m[1].trim();
+      lines[0] = AGE_ONLY.test(rest) ? '' : rest;
+    }
+    const cleaned = lines.join('\n').trim();
+    if (cleaned) kept.push(cleaned);
+  }
+  return kept.join('\n\n');
+}
+
+/**
+ * 小标题的正文里也留着原文章的小标题（原文那一行小标题）。
+ *
+ * prompt 里明说了**端上不许显示小标题** —— 但模型看到的是一整段文字，
+ * 它分不清哪一行是标题。所以解析的时候就把**重复的小标题行**去掉。
+ *
+ * 判据：段**开头**的那几行里，有一行和某个小标题（从 label 里抽出来的）
+ * 几乎一模一样 ⇒ 那是标题，不是正文。
+ */
+function titleOf(label) {
+  let t = String(label || '').replace(/^\[\s*段\s*\d+\s*[a-z]?\s*\]\s*/i, '').trim();
+  const m = /原小标题[^：:]*[：:]\s*(.+)$/.exec(t);
+  if (m) return m[1].trim();
+  const q = /[「『](.+?)[」』]/.exec(t);
+  if (q) return q[1].trim();
+  return t;
+}
+
+function normTitle(text) {
+  return String(text || '').replace(/[\s　「」『』“”"'‘’（）()【】[\]]/g, '');
+}
+
+// 段开头的小标题行 ⇒ 去掉。
+function stripLeadingTitles(text, titles) {
+  if (!titles.length) return text;
+  const paras = text.split('\n\n');
+  const head = [];
+  const rest = [];
+  let count = 0;
+  for (const para of paras) {
+    if (count < 3) head.push(para);
+    else rest.push(para);
+    count += 1;
+  }
+  const keptHead = head.filter(para => {
+    const lines = para.split('\n');
+    if (lines.length !== 1) return true; // 只看独占一行的标题
+    const line = normTitle(lines[0]);
+    if (!line) return true;
+    return !titles.some(t => {
+      const nt = normTitle(t);
+      return nt && line.startsWith(nt) && line.length - nt.length <= 12;
+    });
+  });
+  return [...keptHead, ...rest].join('\n\n');
+}
+
+// ── 人物卡（介绍）───────────────────────────────────────────────
+//
+// 有些素材的正文第 0 段只有一句「**端上处理**：……」的说明，
+// 真正的介绍写在上面那个「人物卡 / 事实卡」小节里（引文正文，
+// 表格是字段、不是给端上读的）。
+//
+// ⇒ 解析出那份引文正文，当成「介绍」用（2-3 句讲清她是谁）。
+
+// 把引文正文按「【…】标签」切成小块。
+function cardBlocks(prose) {
+  const blocks = [];
+  let current = { tag: '', lines: [] };
+  for (const line of prose.split('\n')) {
+    const tag = TAG_LINE.exec(line);
+    if (tag) {
+      blocks.push(current);
+      current = { tag: tag[1], lines: [] };
+      if (tag[2].trim()) current.lines.push(tag[2].trim());
+      continue;
+    }
+    current.lines.push(line);
+  }
+  blocks.push(current);
+  return blocks;
+}
+
+// 人物卡 / 事实卡 小节里的**引文正文**（表格是字段，不给端上读）。
+export function parseCard(sections) {
+  const section =
+    sectionByPrefix(sections, '人物卡') || sectionByPrefix(sections, '事实卡');
+  if (!section) return '';
+  const body = stripQuote(bodyOf(section));
+  const proseLines = [];
+  for (const line of body.split('\n')) {
+    if (/^\s*\|/.test(line)) break; // 表格开始 ⇒ 前面的才是引文正文
+    proseLines.push(line);
+  }
+  const kept = [];
+  for (const block of cardBlocks(proseLines.join('\n'))) {
+    if (NON_INTRO_CARD_TAG.test(block.tag)) continue; // 互动说明 ⇒ 不是介绍
+    const text = stripEditorial(block.lines.join('\n')).trim();
+    if (text) kept.push(text);
+  }
+  return kept.join('\n\n');
+}
+
 // 从正文小节里切出各段。
 // 小标题（`### [段 1] 原小标题：一、逃离压抑的原生家庭`）只作为 **label**
 // 存下来 —— 它是内部记号，端上不显示。
-export function parseSegments(section) {
+export function parseSegments(section, { card = '' } = {}) {
   if (!section) return [];
   const lines = section.lines;
   const segments = [];
@@ -90,12 +288,43 @@ export function parseSegments(section) {
   }
   if (current) segments.push(current);
 
+  // 全部小标题（正文里重复出现的小标题行要靠它认出来）。
+  const titles = segments.map(seg => titleOf(seg.label)).filter(Boolean);
+
   return segments
-    .map(seg => ({
-      label: seg.label,
-      text: stripImagePlaceholders(stripQuote(seg.lines.join('\n'))).trim(),
-    }))
-    .filter(seg => seg.text);
+    .map(seg => {
+      const raw = stripImagePlaceholders(stripQuote(seg.lines.join('\n'))).trim();
+      const text = stripAnnotations(stripEditorial(raw));
+      return { label: seg.label, text: stripLeadingTitles(text, titles) };
+    })
+    // 「如何与你进行学习互动」这类小节：既不是故事，也不是介绍 ⇒ 整段不要。
+    .filter(seg => !NON_STORY_LABEL.test(seg.label))
+    .map(seg => {
+      // 人物卡段：**不是故事段**，讲法不一样（2-3 句介绍）。
+      // 正文为空（只剩「端上处理」说明）⇒ 用上面「人物卡」小节的引文补上；
+      // 正文与人物卡都有 ⇒ 两份都要（人物卡里有正文没有的细节）。
+      if (!INTRO_LABEL.test(seg.label)) return { label: seg.label, text: seg.text };
+      const text = mergeIntro(seg.text, card);
+      if (!text) return null;
+      return { label: seg.label, text, kind: 'intro' };
+    })
+    .filter(seg => seg && seg.text);
+}
+
+// 介绍 = 段自己的正文 + 人物卡里**段里没有的**那些小块。
+function mergeIntro(body, card) {
+  const parts = [];
+  if (body) parts.push(body);
+  if (card) {
+    for (const block of card.split('\n\n')) {
+      const probe = normTitle(block).slice(0, 12);
+      if (!probe) continue;
+      // 段里已经有的（有一则素材的人物卡与开篇重复）⇒ 不重复给。
+      if (parts.some(p => normTitle(p).includes(probe))) continue;
+      parts.push(block);
+    }
+  }
+  return parts.join('\n\n');
 }
 
 // 从标题里取姓名：「# 某某 / 化名（副标题）」
@@ -226,7 +455,8 @@ export function parseExplorerMarkdown(markdown, opts = {}) {
   const { name, aliases } = parseName(preamble.join('\n'));
   if (!name) return null;
 
-  const segments = parseSegments(sectionByPrefix(sections, '正文'));
+  const card = parseCard(sections);
+  const segments = parseSegments(sectionByPrefix(sections, '正文'), { card });
   if (!segments.length) return null;
 
   const edu = parseEducationLevel(markdown);
