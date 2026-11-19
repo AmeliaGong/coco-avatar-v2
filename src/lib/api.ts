@@ -153,13 +153,18 @@ export async function adminGetConversation(id: string) {
   return res.json();
 }
 
-export async function adminCreateLink(title: string, expiresInDays: number | null) {
+export async function adminCreateLink(
+  title: string,
+  expiresInDays: number | null,
+  scenario?: string
+) {
   const res = await fetch('/api/admin/conversations', {
     method: 'POST',
     headers: adminHeaders(),
     body: JSON.stringify({
       title: title || undefined,
       expires_in_days: expiresInDays,
+      scenario: scenario || undefined,
     }),
   });
   if (res.status === 401) throw new Error('Unauthorized');

@@ -1,9 +1,24 @@
 import { useState } from 'react';
 import { adminCreateLink } from '../../lib/api';
 
+/**
+ * 链接走哪条线（= 请求里的 scenario）。
+ *
+ * ⚠️ **探索者故事那条线只在 `story` 里注入**（server/engine/explorer.js 的
+ * `enabled: scenario === 'story'`）—— 选错的话，链接里根本看不到
+ * 15 位探索者的目录，模型会自己编名字。
+ */
+const SCENARIOS = [
+  { value: 'story', label: '探索者故事 —— 进页面直接挑 3 位探索者，一段一段听' },
+  { value: 'chat', label: '自由对话 —— 先听 Coco 的四段故事，再按需分流' },
+  { value: 'cbt_quick', label: '卡点急救 —— 认知急救箱五步' },
+  { value: 'idea', label: '微创业想法 —— 跨学科追问，帮你看清关键假设' },
+];
+
 export function AdminCreateLink() {
   const [title, setTitle] = useState('');
   const [expiryOption, setExpiryOption] = useState('7');
+  const [scenario, setScenario] = useState('story');
   const [result, setResult] = useState<{ id: string; expires_at: string | null } | null>(null);
   const [creating, setCreating] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -13,7 +28,7 @@ export function AdminCreateLink() {
     setResult(null);
     try {
       const days = expiryOption === 'never' ? null : parseInt(expiryOption);
-      const data = await adminCreateLink(title, days);
+      const data = await adminCreateLink(title, days, scenario);
       setResult(data);
       setTitle('');
     } catch (e) {
@@ -26,7 +41,13 @@ export function AdminCreateLink() {
     }
   };
 
-  const linkUrl = result ? `https://coco-avatar-icy-sun-5917.fly.dev/c/${result.id}` : '';
+  const linkUrl = result
+    ? scenario === 'story'
+      // 探索者故事线 ⇒ 走 /e/explorer?c=<id>：进页面第一轮就把 3 位
+      // 探索者摆出来（用后台建好的那个会话，标题与有效期都算数）。
+      ? `https://coco-avatar-icy-sun-5917.fly.dev/e/explorer?c=${result.id}`
+      : `https://coco-avatar-icy-sun-5917.fly.dev/c/${result.id}`
+    : '';
 
   const handleCopy = () => {
     navigator.clipboard.writeText(linkUrl);
@@ -48,6 +69,24 @@ export function AdminCreateLink() {
             placeholder="例如：用户体验测试 #3"
             className="w-full px-3 py-2 border border-warm-grey/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-sage/40"
           />
+        </div>
+
+        <div>
+          <label className="block text-sm text-gray-600 mb-1">对话场景</label>
+          <select
+            value={scenario}
+            onChange={e => setScenario(e.target.value)}
+            className="w-full px-3 py-2 border border-warm-grey/50 rounded-lg focus:outline-none focus:ring-2 focus:ring-sage/40"
+          >
+            {SCENARIOS.map(s => (
+              <option key={s.value} value={s.value}>
+                {s.label}
+              </option>
+            ))}
+          </select>
+          <p className="text-xs text-gray-500 mt-1">
+            探索者故事那条线只在「探索者故事」里才有 15 位探索者的目录；选别的场景模型看不到目录。
+          </p>
         </div>
 
         <div>

@@ -108,3 +108,120 @@ test('GET /api/conversations/:id 会把场景带回给前端', async () => {
   const body = await (await fetch(`${base}/api/conversations/${created.id}`)).json();
   assert.equal(body.scenario, 'idea');
 });
+
+// ── 2026-11-19：后台生成的链接要能选场景 ───────────────────────────
+//
+// 探索者的目录/选人/逐段讲故事**只在 `scenario='story'` 里注入**
+// （server/engine/explorer.js 的 `enabled: scenario === 'story'`）。
+// 后台建链接原来不写场景 ⇒ 表默认值 'chat' ⇒ 链接里跑不到那条线。
+
+async function adminToken() {
+  const login = await fetch(`${base}/api/admin/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: process.env.ADMIN_PASSWORD }),
+  });
+  const { token } = await login.json();
+  return token;
+}
+
+test('后台建链接可以指定场景（story），且公开接口读得到', async () => {
+  const token = await adminToken();
+  const res = await fetch(`${base}/api/admin/conversations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ title: '故事线', expires_in_days: 7, scenario: 'story' }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.scenario, 'story');
+
+  // 前端刷新时靠这个恢复场景（GET /api/conversations/:id）
+  const pub = await (await fetch(`${base}/api/conversations/${body.id}`)).json();
+  assert.equal(pub.scenario, 'story');
+});
+
+test('后台建链接不指定场景 ⇒ 还是 chat（不改变既有链接的含义）', async () => {
+  const token = await adminToken();
+  const res = await fetch(`${base}/api/admin/conversations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ title: '老样子', expires_in_days: 7 }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).scenario, 'chat');
+});
+
+test('后台建链接传了非法场景 ⇒ 400（不要默默改成 chat）', async () => {
+  const token = await adminToken();
+  const res = await fetch(`${base}/api/admin/conversations`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ title: '乱写的', scenario: 'not-a-scenario' }),
+  });
+  assert.equal(res.status, 400);
+});
+
+test('已经发出去的链接可以改场景（不用重发一个新链接）', async () => {
+  const token = await adminToken();
+  const created = await (
+    await fetch(`${base}/api/admin/conversations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
+      body: JSON.stringify({ title: '改成故事线' }),
+    })
+  ).json();
+  const res = await fetch(`${base}/api/admin/conversations/${created.id}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
+    body: JSON.stringify({ scenario: 'story' }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal((await res.json()).scenario, 'story');
+});
+
+test('会话里的场景会跟着这一轮实际在用的场景走（刷新不掉回 chat）', async () => {
+  // 背景：后台建的链接默认 'chat'，用户在链接里点「听听 Coco 和探索者们的
+  // 故事」⇒ 那一轮走的是 story ⇒ 刷新后必须还是 story，
+  // 否则故事线断掉、模型看不到探索者目录。
+  const token = await adminToken();
+  const created = await (
+    await fetch(`${base}/api/admin/conversations`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-admin-token': token },
+      body: JSON.stringify({ title: '点按钮那条' }),
+    })
+  ).json();
+  assert.equal(created.scenario, 'chat');
+
+  // 装一个假 fetch —— 测试环境里的网关地址是 unreachable 的（tests/helpers/testEnv.js），
+  // 不装的话这一轮会 500（模型调用失败），断言就变成在测模型了。
+  globalThis.__cocoFetchImpl = async () => ({
+    ok: true,
+    status: 200,
+    async json() {
+      return { choices: [{ message: { content: '好的' } }] };
+    },
+    async text() {
+      return '';
+    },
+  });
+
+  // 走一轮 scenario='story' 的对话
+  const chat = await fetch(`${base}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      messages: [{ role: 'user', content: '我想听听探索者们的故事' }],
+      conversation_id: created.id,
+      scenario: 'story',
+    }),
+  });
+  const chatBody = await chat.text();
+  assert.equal(chat.status, 200, chatBody.slice(0,300));
+
+  globalThis.__cocoFetchImpl = undefined;
+
+  const pub = await (await fetch(`${base}/api/conversations/${created.id}`)).json();
+  assert.equal(pub.scenario, 'story', '这一轮走的是 story ⇒ 库里也要记成 story');
+});

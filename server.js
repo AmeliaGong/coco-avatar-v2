@@ -666,6 +666,24 @@ app.post('/api/chat', asyncRoute(async (req, res) => {
     db.prepare(
       'INSERT INTO conversations (id, title, created_at, status, scenario, client_id) VALUES (?, ?, ?, ?, ?, ?)'
     ).run(convId, null, now(), 'active', scenario, client_id ?? null);
+  } else if (existing.scenario !== scenario) {
+    // 会话已经存在，但**这一轮走的场景与库里记的不一样** ⇒ 把库里的改成
+    // 这一轮实际在用的场景。
+    //
+    // 为什么（2026-11-19）：`conversations.scenario` 原来**只在会话新建那一刻**
+    // 写一次，之后 `/api/chat` 从不更新它 ⇒ 两个后果：
+    //   ① 后台建的链接（表默认值 'chat'）里点「听听Coco和探索者们的故事」
+    //      ⇒ 那一轮确实走的是 story（探索者线能跑），但**刷新页面就掉回 chat**
+    //      ⇒ 故事线断掉；
+    //   ② `/e/explorer` 体验入口同理（会话是 POST /api/conversations 建的，
+    //      默认 'chat'）⇒ 刷新后掉回 chat。
+    //
+    // 前端本来就有 `scenarioRef`（刷新时从 GET /api/conversations/:id 恢复
+    // 场景）⇒ 库里的值本来就该等于这一轮实际在用的场景。
+    //
+    // ⚠️ 场景只是 prompt 标签，不含用户内容；会话 id 本身就是凭证
+    // （链接即凭证），所以这里没有扩大任何暴露面。
+    db.prepare('UPDATE conversations SET scenario = ? WHERE id = ?').run(scenario, convId);
   }
 
   // --- 用户消息 ---
@@ -907,7 +925,7 @@ app.get('/api/admin/conversations/:id', requireAdmin, (req, res) => {
 
 // Admin: create conversation link (with optional expiry)
 app.post('/api/admin/conversations', requireAdmin, (req, res) => {
-  const { title, expires_in_days } = req.body;
+  const { title, expires_in_days, scenario } = req.body || {};
   const id = generateId();
   const createdAt = now();
   let expiresAt = null;
@@ -918,11 +936,28 @@ app.post('/api/admin/conversations', requireAdmin, (req, res) => {
     expiresAt = d.toISOString();
   }
 
-  db.prepare(
-    'INSERT INTO conversations (id, title, created_at, expires_at, status) VALUES (?, ?, ?, ?, ?)'
-  ).run(id, title || null, createdAt, expiresAt, 'active');
+  // 场景（2026-11-19 加）：链接可以指定这个会话走哪条线。
+  //
+  // 为什么后台建链接时要能选：探索者的目录/选人/逐段讲故事**只在
+  // `scenario='story'` 里注入**（explorer.js 的 `enabled: scenario === 'story'`）
+  // ⇒ 不选就是 chat，链接里跑不到那条线。
+  if (scenario !== undefined && scenario !== null && !SCENARIO_IDS.includes(scenario)) {
+    return res.status(400).json({ error: `Unknown scenario: ${echoForError(scenario)}` });
+  }
+  const linkScenario = scenario || 'chat';
 
-  res.json({ id, title, created_at: createdAt, expires_at: expiresAt, status: 'active' });
+  db.prepare(
+    'INSERT INTO conversations (id, title, created_at, expires_at, status, scenario) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(id, title || null, createdAt, expiresAt, 'active', linkScenario);
+
+  res.json({
+    id,
+    title,
+    created_at: createdAt,
+    expires_at: expiresAt,
+    status: 'active',
+    scenario: linkScenario,
+  });
 });
 
 // Admin: update an existing conversation link (title / expiry)
@@ -930,13 +965,23 @@ app.patch('/api/admin/conversations/:id', requireAdmin, (req, res) => {
   const conv = db.prepare('SELECT * FROM conversations WHERE id = ?').get(req.params.id);
   if (!conv) return res.status(404).json({ error: 'Not found' });
 
-  const { title, expires_at, expires_in_days, never } = req.body || {};
+  const { title, expires_at, expires_in_days, never, scenario } = req.body || {};
   const updates = [];
   const params = [];
 
   if (typeof title === 'string') {
     updates.push('title = ?');
     params.push(title.trim() || null);
+  }
+
+  // 场景也可以改（2026-11-19）：一个已经发出去的链接，从「自由对话」
+  // 改成「探索者故事」—— 不用重发一个新链接。
+  if (scenario !== undefined && scenario !== null) {
+    if (!SCENARIO_IDS.includes(scenario)) {
+      return res.status(400).json({ error: `Unknown scenario: ${echoForError(scenario)}` });
+    }
+    updates.push('scenario = ?');
+    params.push(scenario);
   }
 
   let newExpiresAt = conv.expires_at;
