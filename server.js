@@ -1088,6 +1088,9 @@ function normalizeExplorerStory(input) {
           // label 是原文章的小标题 —— **只是分段记号，端上不显示**。
           label: typeof s.label === 'string' ? s.label : '',
           text: typeof s.text === 'string' ? s.text : '',
+          // kind='intro' 表示这一段是**人物卡**（不是故事段）：
+          // 它只在选人那一轮给一次，不占故事段的位置。
+          kind: s.kind === 'intro' ? 'intro' : undefined,
         }))
         .filter(s => s.text.trim())
     : [];

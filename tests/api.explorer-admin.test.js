@@ -101,6 +101,33 @@ test('写进去的素材能读回来，且 label 与 text 分开', async () => {
   assert.equal(s.safety, '不渲染细节。');
 });
 
+test('人物卡段（kind=intro）写进去要能原样读回来', async () => {
+  // 为什么锁这条：素材解析出来后，有一段是**人物卡**（不是故事段）。
+  // 接口如果只放行 label/text 两个字段，kind 会在写入时被丢掉
+  // ⇒ 线上库里所有段都成了故事段 ⇒ 人物卡会占掉一个故事段的位置。
+  await fetch(`${base}/api/admin/explorer-stories`, {
+    method: 'POST',
+    headers: adminHeaders(),
+    body: JSON.stringify({
+      stories: [
+        {
+          ...STORY,
+          segments: [
+            { label: '[段 0] 人物卡', text: '甲同学的履历清单。', kind: 'intro' },
+            { label: '[段 1] 原小标题', text: '甲同学的第一段。' },
+          ],
+        },
+      ],
+    }),
+  });
+  const res = await fetch(`${base}/api/admin/explorer-stories`, { headers: adminHeaders() });
+  const body = await res.json();
+  const segs = body.stories[0].segments;
+  assert.equal(segs.length, 2);
+  assert.equal(segs[0].kind, 'intro');
+  assert.equal(segs[1].kind, undefined, '普通故事段不该带上 kind');
+});
+
 test('同一个 id 重复写入是覆盖，不攒重复行', async () => {
   for (const one_liner of ['第一版画像。', '第二版画像。']) {
     await fetch(`${base}/api/admin/explorer-stories`, {
