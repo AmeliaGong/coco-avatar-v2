@@ -153,3 +153,39 @@ test('开场白和第 1 段必须在同一轮（不许只回开场白就停下�
   assert.ok(opening.includes('紧接着讲第 1 段'), '要写明紧接着讲第 1 段');
   assert.ok(/不许只回开场白就停下/.test(opening), '要禁止只回开场白');
 });
+
+// ── 自由对话场景（scenario.chat.md）必须与故事场景用**同一份素材** ──
+//
+// 2026-11-19：chat 场景还在讲 9 段旧稿（线上实测：模型把「钉钉办公软件的消息」
+// 那段讲得跟原稿不一样）。现在 chat.md 由 scenario.story.md 的块拼成
+// （scripts/tmp-build-chat-prompt.mjs），下面两条断言锁住它们不漂移。
+
+test('scenario.chat.md 与 scenario.story.md 的故事素材逐字节相同', () => {
+  const chat = fs.readFileSync(path.join(ROOT, 'prompts/scenario.chat.md'), 'utf8');
+  const m1 = chat.split(MARK)[1].split('\n---')[0];
+  const m2 = material;
+  assert.equal(m1.trimEnd(), m2.trimEnd(), '两个场景的故事素材不一致 —— 自由对话会讲出旧稿');
+});
+
+test('scenario.chat.md 里没有 9 段旧稿的句子', () => {
+  const chat = fs.readFileSync(path.join(ROOT, 'prompts/scenario.chat.md'), 'utf8');
+  for (const line of [
+    '老子这一年就是不挣钱',
+    'Be water，We stream。',
+    '世界流动大学',
+    'Astronoland',
+  ]) {
+    assert.equal(chat.includes(line), false, `不该出现的旧稿句子：${line}`);
+  }
+  // 新版锚点必须在
+  for (const line of ['坐在布达拉宫斜对面的茶馆', '《我在大理开了一所人生学校》', 'Be water, WeStream']) {
+    assert.ok(chat.includes(line), `chat.md 里缺新版锚点：${line}`);
+  }
+});
+
+test('scenario.chat.md 的开场白和第 1 段同一轮，且 4 段都有问句', () => {
+  const chat = fs.readFileSync(path.join(ROOT, 'prompts/scenario.chat.md'), 'utf8');
+  assert.ok(/不许只回开场白就停下/.test(chat), 'chat.md 也要写明开场白不许单独一轮');
+  const asked = [...chat.matchAll(/- 第(\d+)段之后/g)].map(x => Number(x[1]));
+  assert.deepEqual(asked, [1, 2, 3, 4], 'chat.md 的每段之后也要有问句');
+});
