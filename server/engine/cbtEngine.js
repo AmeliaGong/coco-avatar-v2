@@ -559,11 +559,24 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
           lines.push(
             '介绍（**这是人物卡，不是故事段**：用 2-3 句话讲清她是谁 —— ' +
               '可以压缩、可以挑重点，但**不要**照抄成流水账、不要念字段、不要逐字背；' +
-              `说完立刻进入第 1 段）：${intro}`
+              `说完立刻进入下面那一段的原文）：${intro}`
           );
         }
       }
       const segments = Array.isArray(sel.segments) ? sel.segments : [];
+      // 标记里带**真实段号**（第 N 段，共 M 段）——
+      //
+      // 为什么不能永远是「第 1 段」：一轮只给一段，标记若按"本轮第 1 个"算，
+      // 模型讲到第 3 轮时看到的仍是「第 1 段」，而对话里第 1 段早讲过了
+      // ⇒ 它以为这一段讲过了 ⇒ 改写成概述（2026-11-19 线上实测：第 3 段起
+      // 就不再逐字讲）。
+      const segNo = Number.isInteger(sel.segmentNo) && sel.segmentNo > 0 ? sel.segmentNo : null;
+      const segTotal =
+        Number.isInteger(sel.segmentTotal) && sel.segmentTotal > 0 ? sel.segmentTotal : null;
+      const segMark = (i) => {
+        const no = segNo ? segNo + i : i + 1;
+        return segTotal ? `【第${no}段（共${segTotal}段）】` : `【第${no}段】`;
+      };
       for (let i = 0; i < segments.length; i++) {
         const seg = segments[i];
         if (!seg || typeof seg !== 'object') continue;
@@ -571,7 +584,7 @@ export function createCbtEngine({ getPrompt, getPromptMeta, callModel, schemas =
         if (!body) continue;
         // 「第 N 段」只是给模型看的分段记号 —— prompt 里已经明说了
         // 端上不许显示小标题/段号，模型只把它当结构用。
-        lines.push(`【第${i + 1}段】${body}`);
+        lines.push(`${segMark(i)}${body}`);
       }
       if (sel.guide) {
         lines.push(

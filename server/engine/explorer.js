@@ -373,6 +373,15 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
           safety: story.safety,
           // 这一轮要讲的是最后一段吗？
           is_final: start === total - 1,
+          // 这一段在整则故事里是第几段 / 一共几段。
+          //
+          // 为什么必须有这个数：注入的标记以前**永远是**【第1段】—— 一轮只给
+          // 一段，标记是按"本轮第 1 个"算的。结果模型讲到第 3 轮时，看到的
+          // 还是「第 1 段」，而对话里第 1 段早就讲过了 ⇒ 它以为这一段已经讲过
+          // ⇒ 改写成概述（实测第 3 段起就不再逐字讲了）。
+          // 标记带上真实段号，模型才知道"这一段是第 N 段，该讲的是它"。
+          segmentNo: start + 1,
+          segmentTotal: total,
           // 上一轮没逐字讲出来（讲成了简介）⇒ 明确告诉模型"请逐字讲这一段"。
           retry: said.length > 0 && added[added.length - 1] === 0,
         },
@@ -425,6 +434,9 @@ export function buildExplorerContext({ db, conversationId, history, enabled = tr
           safety: picked.safety,
           // 只有一段的素材 ⇒ 这一轮就是最后一段
           is_final: pickedSegs.length <= 1,
+          // 这一段在整则故事里是第几段 / 一共几段（见上面的说明）。
+          segmentNo: 1,
+          segmentTotal: pickedSegs.length,
         },
         phase: 'telling',
       };

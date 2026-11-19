@@ -616,6 +616,66 @@ test('一轮只给一段（不给两段）：「第 1 段」与「下一段」�
   assert.match(ctx.selected.segments[0].text, /甲同学的第一段/);
 });
 
+test('注入的段号是**真实序号**，不是永远「第 1 段」', () => {
+  // 线上真实故障（2026-11-19）：一轮只给一段，标记按"本轮第 1 个"算 ⇒
+  // **每一轮的标记都是【第1段】**。模型讲到第 3 轮时看到的还是「第 1 段」，
+  // 而对话里第 1 段早就讲过了 ⇒ 它以为这一段讲过了 ⇒ 改写成概述
+  // （实测第 3 段起就不再逐字讲，第 4～5 段干脆没讲）。
+  // ⇒ 标记必须带真实序号：第 N 段（共 M 段）。
+  seedStories();
+  const db = getDb();
+  const first = buildExplorerContext({
+    db,
+    conversationId: 't2b',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+    ],
+  });
+  assert.equal(first.selected.segmentNo, 1, '选人那轮是第 1 段');
+  assert.ok(first.selected.segmentTotal >= 2, '总数要是整则故事的段数');
+
+  const second = buildExplorerContext({
+    db,
+    conversationId: 't2b',
+    history: [
+      { role: 'assistant', content: '有两位朋友：甲同学和乙同学。你想先听谁的？' },
+      { role: 'user', content: '甲同学' },
+      { role: 'assistant', content: '甲同学的第一段。第二行还是第一段。' },
+      { role: 'user', content: '继续' },
+    ],
+  });
+  assert.equal(second.selected.segmentNo, 2, '第 2 轮该标「第 2 段」');
+  assert.equal(second.selected.segmentTotal, first.selected.segmentTotal);
+});
+
+test('prompt 里的段标记带真实序号（第 2 段不能还写成「第 1 段」）', async () => {
+  const { engine, calls } = makeEngine();
+  await engine({
+    scenario: 'story',
+    history: [{ role: 'user', content: '你好' }],
+    clientContext: {
+      explorer: {
+        catalog: [],
+        selected: {
+          id: 'jia',
+          name: '甲同学',
+          one_liner: '一句画像',
+          segments: [{ text: '甲同学的第三段。' }],
+          guide: '一次讲一段',
+          safety: '不渲染细节',
+          is_final: false,
+          segmentNo: 3,
+          segmentTotal: 5,
+        },
+      },
+    },
+  });
+  const prompt = calls[0].systemPrompt;
+  assert.ok(prompt.includes('【第3段'), '标记要写第 3 段');
+  assert.ok(prompt.includes('共5段'), '标记要写总共 5 段');
+});
+
 test('「介绍」（人物卡）与故事段分开：介绍只给一次，且不进故事段序列', () => {
   seedStories();
   const db = getDb();
