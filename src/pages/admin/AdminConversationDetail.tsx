@@ -23,9 +23,18 @@ interface ConvDetail {
   created_at: string;
   expires_at: string | null;
   status: string;
+  scenario: string | null;
   messages: Message[];
   token_usage: TokenUsage[];
 }
+
+/** 链接走哪条线 —— 探索者故事那条线只在 story 里才有目录。 */
+const SCENARIOS = [
+  { value: 'story', label: '探索者故事' },
+  { value: 'chat', label: '自由对话' },
+  { value: 'cbt_quick', label: '卡点急救' },
+  { value: 'idea', label: '微创业想法' },
+];
 
 export function AdminConversationDetail() {
   const { id } = useParams<{ id: string }>();
@@ -35,6 +44,7 @@ export function AdminConversationDetail() {
 
   // --- edit state ---
   const [editTitle, setEditTitle] = useState('');
+  const [editScenario, setEditScenario] = useState('chat');
   const [expiryMode, setExpiryMode] = useState('keep');
   const [customDate, setCustomDate] = useState('');
   const [saving, setSaving] = useState(false);
@@ -47,6 +57,7 @@ export function AdminConversationDetail() {
       .then(data => {
         setConv(data);
         setEditTitle(data.title || '');
+        setEditScenario(data.scenario || 'chat');
       })
       .catch(e => {
         if ((e as Error).message === 'Unauthorized') {
@@ -83,6 +94,10 @@ export function AdminConversationDetail() {
       const payload: Parameters<typeof adminUpdateConversation>[1] = {
         title: editTitle,
       };
+      // 场景：只有真的变了才写（省得每次保存都改一遍）。
+      if (editScenario && editScenario !== (conv?.scenario || 'chat')) {
+        payload.scenario = editScenario;
+      }
       if (expiryMode === 'keep') {
         // leave the expiry untouched
       } else if (expiryMode === 'never') {
@@ -168,6 +183,24 @@ export function AdminConversationDetail() {
               placeholder="无标题"
               className="w-full px-3 py-2 border border-warm-grey/50 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sage/40"
             />
+          </div>
+          <div>
+            <label className="block text-xs text-gray-500 mb-1">对话场景</label>
+            <select
+              value={editScenario}
+              onChange={e => setEditScenario(e.target.value)}
+              className="w-full px-3 py-2 border border-warm-grey/50 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-sage/40"
+            >
+              {SCENARIOS.map(s => (
+                <option key={s.value} value={s.value}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-xs text-gray-400 mt-1">
+              探索者故事那条线只在「探索者故事」里才有 15 位探索者的目录。
+              ⚠️ 改场景不会改已经发出去的链接地址，只改这个会话往后的对话走哪条线。
+            </p>
           </div>
           <div>
             <label className="block text-xs text-gray-500 mb-1">有效期（天数为自创建日起算）</label>

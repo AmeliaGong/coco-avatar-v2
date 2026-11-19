@@ -178,6 +178,8 @@ export async function adminUpdateConversation(
     expires_in_days?: number | null;
     expires_at?: string;
     never?: boolean;
+    /** 链接走哪条线：story / chat / cbt_quick / idea */
+    scenario?: string;
   }
 ) {
   const res = await fetch(`/api/admin/conversations/${encodeURIComponent(id)}`, {

@@ -8,9 +8,18 @@ interface Conversation {
   created_at: string;
   expires_at: string | null;
   status: string;
+  scenario: string | null;
   message_count: number;
   total_tokens: number | null;
 }
+
+/** 场景的短标签 —— 链接走哪条线，一眼能看出来。 */
+const SCENARIO_LABEL: Record<string, string> = {
+  story: '探索者故事',
+  chat: '自由对话',
+  cbt_quick: '卡点急救',
+  idea: '微创业想法',
+};
 
 export function AdminConversations() {
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -70,6 +79,7 @@ export function AdminConversations() {
               <tr>
                 <th className="text-left px-4 py-3">标题 / ID</th>
                 <th className="text-left px-4 py-3">创建时间</th>
+                <th className="text-center px-4 py-3">场景</th>
                 <th className="text-center px-4 py-3">消息数</th>
                 <th className="text-center px-4 py-3">Tokens</th>
                 <th className="text-center px-4 py-3">状态</th>
@@ -92,6 +102,11 @@ export function AdminConversations() {
                   </td>
                   <td className="px-4 py-3 text-gray-600">
                     {new Date(c.created_at).toLocaleString('zh-CN')}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <span className="px-2 py-0.5 rounded-full text-xs bg-warm-beige/60 text-olive-green">
+                      {SCENARIO_LABEL[c.scenario || 'chat'] || c.scenario}
+                    </span>
                   </td>
                   <td className="px-4 py-3 text-center">{c.message_count}</td>
                   <td className="px-4 py-3 text-center">{c.total_tokens ?? 0}</td>
