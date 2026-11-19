@@ -10,7 +10,7 @@ export function LandingPage() {
 
   // 「和 Coco 聊聊」要先建一个会话再进去。
   //
-  // ⚠️ 之前这里写的是 `/c/demo` —— 那个 id 在库里**不存在**，
+  // ⚠️ 之前这里写死了一个**库里不存在**的会话 id，
   // `GET /api/conversations/demo` 返回 404 ⇒ 前端把会话判成「过期」
   // ⇒ 一点进去就跳到「已过期」页。线上实测确认过（404）。
   const startChat = async () => {

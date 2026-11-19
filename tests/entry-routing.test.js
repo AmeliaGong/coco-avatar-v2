@@ -54,3 +54,17 @@ test('三个入口按钮各自指向自己的场景', () => {
   assert.equal(entry('我想做出改变但遇到卡点'), 'cbt_quick');
   assert.equal(entry('我有一个微创业想法'), 'idea');
 });
+
+test('探索者体验入口 /e/explorer 走 story 场景（目录只在 story 场景注入）', () => {
+  const src = read('src/pages/ExplorerEntry.tsx');
+  assert.ok(src.includes("scenario: 'story'"), '体验入口必须走 story 场景');
+  assert.ok(src.includes('createConversation'), '体验入口要先建会话再进页面');
+  const app = read('src/App.tsx');
+  assert.ok(app.includes('/e/explorer'), 'App.tsx 里要注册 /e/explorer 路由');
+});
+
+test('落地页「和 Coco 聊聊」不再是写死的 /c/demo（那个 id 不存在 ⇒ 一点就跳过期页）', () => {
+  const src = read('src/pages/LandingPage.tsx');
+  assert.equal(src.includes('/c/demo'), false, '不能写死 /c/demo —— 库里没这个会话');
+  assert.ok(src.includes('createConversation'), '要先建会话再跳 /c/:id');
+});
