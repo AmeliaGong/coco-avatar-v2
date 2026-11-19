@@ -1,9 +1,28 @@
-import { useState, Suspense } from 'react';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { GlobeScene } from './GlobeScene';
-import { Link } from 'react-router-dom';
+import { createConversation } from '../lib/api';
 
 export function LandingPage() {
   const [nodeCount] = useState(22);
+  const navigate = useNavigate();
+  const [starting, setStarting] = useState(false);
+
+  // 「和 Coco 聊聊」要先建一个会话再进去。
+  //
+  // ⚠️ 之前这里写的是 `/c/demo` —— 那个 id 在库里**不存在**，
+  // `GET /api/conversations/demo` 返回 404 ⇒ 前端把会话判成「过期」
+  // ⇒ 一点进去就跳到「已过期」页。线上实测确认过（404）。
+  const startChat = async () => {
+    if (starting) return;
+    setStarting(true);
+    try {
+      const conv = await createConversation();
+      navigate(`/c/${conv.id}`);
+    } catch {
+      setStarting(false);
+    }
+  };
 
   return (
     <div
@@ -21,12 +40,13 @@ export function LandingPage() {
           </div>
           <span className="text-white/70 text-sm font-light tracking-wide">WeStream 人生学校</span>
         </div>
-        <Link
-          to="/c/demo"
-          className="text-white/40 text-xs hover:text-white/70 transition"
+        <button
+          onClick={startChat}
+          disabled={starting}
+          className="text-white/40 text-xs hover:text-white/70 transition disabled:opacity-50"
         >
-          和 Coco 聊聊 →
-        </Link>
+          {starting ? '正在准备…' : '和 Coco 聊聊 →'}
+        </button>
       </header>
 
       {/* Globe — full screen background */}

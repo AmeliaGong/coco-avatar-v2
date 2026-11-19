@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { LandingPage } from './pages/LandingPage';
 import { ChatPage } from './pages/ChatPage';
+import { ExplorerEntry } from './pages/ExplorerEntry';
 import { ExpiredPage } from './pages/ExpiredPage';
 import { StoryPage } from './pages/StoryPage';
 import { AdminLayout } from './pages/admin/AdminLayout';
@@ -21,6 +22,8 @@ function App() {
         <Route path="/" element={<LandingPage />} />
         <Route path="/chat" element={<Navigate to="/" replace />} />
         <Route path="/c/:id" element={<ChatPage />} />
+        {/* 探索者体验入口：跳过 Coco 的四段故事，第一轮直接给 3 位探索者。 */}
+        <Route path="/e/explorer" element={<ExplorerEntry />} />
         {/* 交付方案页：用户打开自己的链接就能看到今天该练哪张卡、在这里打卡。
             「链接即凭证」与 /c/:id 同一套信任模型。 */}
         <Route path="/c/:id/plan" element={<PlanPage />} />
