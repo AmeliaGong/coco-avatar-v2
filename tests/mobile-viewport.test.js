@@ -82,6 +82,14 @@ test('根上不再全局禁用触摸手势（Android 上会连消息区都滑不
   assert.ok(css.includes('touch-action: manipulation'), '没有把 touch-action 换成 manipulation');
 });
 
+test('地球那一块自己独占触摸手势（原来靠全局 touch-action:none 兜的）', () => {
+  const globe = read('src/pages/GlobeScene.tsx');
+  assert.ok(
+    /touch-none/.test(globe),
+    '3D 地球没有 touch-none —— 手机上拖不动（全局手势已经被收回了）'
+  );
+});
+
 test('viewport meta 里有 interactive-widget（Android 键盘弹出时布局视口要缩）', () => {
   assert.ok(html.includes('interactive-widget=resizes-content'), 'viewport meta 缺 interactive-widget');
   assert.ok(html.includes('viewport-fit=cover'), 'viewport meta 缺 viewport-fit=cover（safe-area 会失效）');

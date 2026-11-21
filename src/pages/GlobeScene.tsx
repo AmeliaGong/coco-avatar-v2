@@ -188,7 +188,11 @@ function Globe() {
 
 export function GlobeScene() {
   return (
-    <div className="absolute inset-0">
+    // ⚠️ `touch-none`：地球的拖拽要独占触摸手势。
+    //   以前是 `html, body { touch-action: none }` 全局关掉触摸手势来保证它，
+    //   但那会让 **Android 上连聊天页的消息区都滑不动**（2026-11-21 已改掉全局的）。
+    //   ⇒ 手势权限收回到这一小块自己身上：地球归地球，聊天页的滑动归聊天页。
+    <div className="absolute inset-0 touch-none">
       <Canvas
         camera={{ position: [0, 0, 5], fov: 50 }}
         style={{ background: 'transparent' }}
