@@ -195,7 +195,10 @@ export function GlobeScene() {
     <div className="absolute inset-0 touch-none">
       <Canvas
         camera={{ position: [0, 0, 5], fov: 50 }}
-        style={{ background: 'transparent' }}
+        // touchAction 也写在 canvas 的容器上（容器是 canvas 的直接父元素）：
+        // 触摸手势看的是「元素 + 祖先」的交集，祖先里有 none 就够了，
+        // 这里再写一遍是双保险（也让"这一块独占手势"在代码里看得见）。
+        style={{ background: 'transparent', touchAction: 'none' }}
         gl={{ antialias: true, alpha: true }}
       >
         <Globe />
