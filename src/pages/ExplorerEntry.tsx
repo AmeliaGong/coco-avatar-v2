@@ -42,7 +42,7 @@ export function ExplorerEntry() {
 
   if (!convId) {
     return (
-      <div className="flex items-center justify-center h-screen bg-warm-beige/10 text-gray-500 text-sm">
+      <div className="flex items-center justify-center h-app bg-warm-beige/10 text-gray-500 text-sm">
         正在准备会话…
       </div>
     );

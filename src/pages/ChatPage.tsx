@@ -63,7 +63,7 @@ export function ChatPage({ conversationId: idProp, autoStart }: ChatPageProps) {
   const showQuickActions = messages.length === 1 && !isLoading && !autoSentRef.current;
 
   return (
-    <div className="flex flex-col h-screen bg-warm-beige/10">
+    <div className="flex flex-col h-app bg-warm-beige/10">
       <Header />
       <ChatArea
         messages={messages}

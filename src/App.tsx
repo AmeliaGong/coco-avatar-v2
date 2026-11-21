@@ -1,4 +1,5 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { useViewportHeight } from './hooks/useViewportHeight';
 import { LandingPage } from './pages/LandingPage';
 import { ChatPage } from './pages/ChatPage';
 import { ExplorerEntry } from './pages/ExplorerEntry';
@@ -16,6 +17,10 @@ import { PlanEditorPage } from './pages/plan/PlanEditorPage';
 import { PlanPage } from './pages/plan/PlanPage';
 
 function App() {
+  // 手机上「看得见的高度」实时写进 --app-h（地址栏/软键盘变了就跟着变）。
+  // 少了它，聊天页底部的输入框会被顶到屏幕外（2026-11-21 手机端反馈）。
+  useViewportHeight();
+
   return (
     <BrowserRouter>
       <Routes>

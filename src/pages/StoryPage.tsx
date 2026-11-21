@@ -24,7 +24,7 @@ export function StoryPage() {
   if (loading) {
     return (
       <div
-        className="min-h-screen flex items-center justify-center"
+        className="min-h-app flex items-center justify-center"
         style={{ background: 'linear-gradient(160deg, #2C2416 0%, #3D3020 50%, #5C4A30 100%)' }}
       >
         <p className="text-white/40 text-sm tracking-widest">Loading...</p>
@@ -35,7 +35,7 @@ export function StoryPage() {
   if (!story) {
     return (
       <div
-        className="min-h-screen flex flex-col items-center justify-center gap-6"
+        className="min-h-app flex flex-col items-center justify-center gap-6"
         style={{ background: 'linear-gradient(160deg, #2C2416 0%, #3D3020 50%, #5C4A30 100%)' }}
       >
         <p className="text-white/50 text-base">故事未找到</p>
@@ -48,7 +48,7 @@ export function StoryPage() {
 
   return (
     <div
-      className="min-h-screen"
+      className="min-h-app"
       style={{
         background: 'linear-gradient(160deg, #2C2416 0%, #3D3020 35%, #5C4A30 65%, #F5E6D3 100%)',
       }}

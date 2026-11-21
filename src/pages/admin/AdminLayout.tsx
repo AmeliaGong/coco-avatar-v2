@@ -26,7 +26,7 @@ export function AdminLayout() {
 
   if (!authed) {
     return (
-      <div className="flex items-center justify-center h-screen bg-warm-beige/30">
+      <div className="flex items-center justify-center h-app bg-warm-beige/30">
         <form onSubmit={handleLogin} className="bg-white p-8 rounded-xl shadow-md w-80 border border-warm-grey/30">
           <h1 className="text-xl font-bold mb-4 text-gray-800">管理后台</h1>
           <input
@@ -53,7 +53,7 @@ export function AdminLayout() {
     `px-4 py-2 rounded-lg text-sm transition ${isActive ? 'bg-sage text-white' : 'text-gray-600 hover:bg-warm-beige/60'}`;
 
   return (
-    <div className="h-screen bg-warm-beige/20 flex flex-col">
+    <div className="h-app bg-warm-beige/20 flex flex-col">
       <header className="shrink-0 bg-gradient-to-r from-warm-beige to-soft-apricot border-b border-warm-grey/30 shadow-sm px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-4">
           <h1 className="font-bold text-gray-800">Coco Admin</h1>

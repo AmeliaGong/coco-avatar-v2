@@ -3,7 +3,10 @@
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <!-- viewport-fit=cover：让页面铺到刘海/home indicator 区域，配合输入框的 safe-area 留白。
+         interactive-widget=resizes-content（Chrome 108+）：软键盘弹出时**布局视口跟着缩**，
+         配合 --app-h 的 visualViewport 兜底 ⇒ 输入框不会被键盘顶出去。 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content" />
     <title>coco-avatar</title>
   </head>
   <body>

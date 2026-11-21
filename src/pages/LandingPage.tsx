@@ -26,7 +26,7 @@ export function LandingPage() {
 
   return (
     <div
-      className="min-h-screen relative overflow-hidden"
+      className="min-h-app relative overflow-hidden"
       style={{
         background:
           'linear-gradient(160deg, #0f0a05 0%, #1a1208 20%, #2C2416 50%, #3D3020 75%, #1a1208 100%)',
@@ -55,7 +55,7 @@ export function LandingPage() {
       </div>
 
       {/* Overlay: title + CTA */}
-      <div className="relative z-10 flex flex-col items-center justify-end min-h-screen px-6 pb-24 text-center pointer-events-none">
+      <div className="relative z-10 flex flex-col items-center justify-end min-h-app px-6 pb-24 text-center pointer-events-none">
         {/* Brand text */}
         <div className="pointer-events-auto">
           <h1

@@ -23,7 +23,9 @@ export function ChatArea({ messages, onQuickAction, showQuickActions }: ChatArea
   }, [messages]);
 
   return (
-    <div className="flex-1 overflow-y-auto px-4 py-6 bg-gradient-to-b from-warm-beige/20 to-white">
+    // ⚠ `min-h-0`：flex 子项默认 `min-height: auto`（= 内容高度），
+    // 不给它放开的话，消息一多就把整列撑高 ⇒ 输入框被顶出屏幕。
+    <div className="flex-1 min-h-0 overflow-y-auto px-4 py-6 bg-gradient-to-b from-warm-beige/20 to-white">
       <div className="max-w-4xl mx-auto">
         {messages.map((message, index) => (
           <MessageBubble key={index} role={message.role} content={message.content} />

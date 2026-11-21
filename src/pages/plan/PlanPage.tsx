@@ -165,7 +165,7 @@ export function PlanPage() {
 
   if (loadError) {
     return (
-      <div className="h-screen flex flex-col items-center justify-center bg-warm-beige/10 gap-3 px-6">
+      <div className="h-app flex flex-col items-center justify-center bg-warm-beige/10 gap-3 px-6">
         <p className="text-gray-500 text-sm">打不开这份方案：{loadError}</p>
         <Link to={`/c/${id}`} className="px-4 py-2 bg-sage text-white rounded-lg text-sm">
           回到对话
@@ -176,7 +176,7 @@ export function PlanPage() {
 
   if (!view) {
     return (
-      <div className="h-screen flex items-center justify-center bg-warm-beige/10 text-gray-400">
+      <div className="h-app flex items-center justify-center bg-warm-beige/10 text-gray-400">
         加载中...
       </div>
     );
@@ -184,7 +184,7 @@ export function PlanPage() {
 
   if (!view.has_plan) {
     return (
-      <div className="h-screen flex flex-col items-center justify-center bg-warm-beige/10 gap-3 px-6">
+      <div className="h-app flex flex-col items-center justify-center bg-warm-beige/10 gap-3 px-6">
         <p className="text-gray-500">还没有给你安排练习。</p>
         <Link to={`/c/${id}`} className="px-4 py-2 bg-sage text-white rounded-lg text-sm">
           回到对话
@@ -197,7 +197,7 @@ export function PlanPage() {
   const evidences = view.evidences || [];
 
   return (
-    <div className="h-screen flex flex-col bg-warm-beige/10">
+    <div className="h-app flex flex-col bg-warm-beige/10">
       {/* 全局 html/body 是 overflow:hidden —— 页面必须自建滚动容器 */}
       <div className="flex-1 min-h-0 overflow-y-auto touch-auto">
         <div className="max-w-2xl mx-auto px-5 py-8 space-y-6">

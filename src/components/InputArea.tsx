@@ -26,7 +26,11 @@ export function InputArea({ onSend, disabled }: InputAreaProps) {
   return (
     <form
       onSubmit={handleSubmit}
-      className="border-t border-warm-grey/30 bg-white px-4 py-4 shadow-lg"
+      // ⚠ `shrink-0`：输入框是整页唯一能发消息的地方，绝不能被消息区挤扁。
+      // ⚠ 底部留出 iPhone 的 home indicator（safe-area），
+      //   否则输入框的最下面那条会被系统横条盖住、点不到发送键。
+      className="shrink-0 border-t border-warm-grey/30 bg-white px-4 pt-4 shadow-lg"
+      style={{ paddingBottom: 'max(1rem, env(safe-area-inset-bottom))' }}
     >
       <div className="max-w-4xl mx-auto flex gap-3 items-end">
         <textarea

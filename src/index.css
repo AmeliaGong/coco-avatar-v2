@@ -2,6 +2,36 @@
 @tailwind components;
 @tailwind utilities;
 
+/**
+ * 「当前看得见的高度」—— 全站唯一的满屏高度来源。
+ *
+ * 为什么不能用 100vh（2026-11-21 手机端反馈：有的用户看不到对话框）：
+ *   手机浏览器的 `100vh` = **大视口**（地址栏收起时的高度），
+ *   比**实际可见区域**高出一截（地址栏那 60–100px）。
+ *   而 html/body 是 `overflow: hidden` ⇒ 页面**滚不动** ⇒
+ *   聊天页那根 `h-screen` 的 flex 列比屏幕高 ⇒
+ *   **底部的输入框被顶到屏幕外，用户看不见、也滑不到**。
+ *
+ * 三层兜底，从上到下：
+ *   1. `100dvh`  —— 现代浏览器（Chrome 108+ / Safari 15.4+）会跟着地址栏变。
+ *   2. `--app-h` 的 JS 实测值 —— `visualViewport.height`：
+ *      **软键盘弹出时 iOS 的 layout viewport 不变、只有 visual viewport 变**，
+ *      所以 dvh 单独用**挡不住键盘**；这一层才挡得住。
+ *   3. `100vh`   —— 上面都不支持时的老底。
+ *
+ * JS 那层直接写 `documentElement.style.setProperty('--app-h', …)`，
+ * 行内样式**压过**下面两条 @supports/@media 规则 ⇒ 优先级天然正确。
+ */
+:root {
+  --app-h: 100vh;
+}
+
+@supports (height: 100dvh) {
+  :root {
+    --app-h: 100dvh;
+  }
+}
+
 * {
   margin: 0;
   padding: 0;
@@ -9,9 +39,8 @@
 }
 
 html, body {
-  height: 100%;
+  height: var(--app-h);
   overflow: hidden;
-  touch-action: none;
   -webkit-tap-highlight-color: transparent;
   -webkit-touch-callout: none;
   -webkit-user-select: text;
@@ -27,9 +56,20 @@ body {
 }
 
 #root {
-  height: 100%;
+  height: var(--app-h);
   overflow: hidden;
   overflow: clip;
+}
+
+@layer utilities {
+  /* 满屏高度统一走 --app-h（见上面的说明）。 */
+  .h-app {
+    height: var(--app-h);
+  }
+
+  .min-h-app {
+    min-height: var(--app-h);
+  }
 }
 
 @keyframes fadeIn {
@@ -45,6 +85,25 @@ body {
 
 .animate-fade-in {
   animation: fadeIn 0.4s ease-in;
+}
+
+/**
+ * 触摸手势（2026-11-21 修）：
+ *
+ * 原来 `html, body` 上是 `touch-action: none` —— 那会把**整页**的
+ * 触摸手势（滑动、捏合）全部关掉：Android Chrome 上连消息区都滑不动，
+ * 用户往上翻不到旧消息，只能看到最后一屏。
+ *
+ * 现在改成：
+ *   · 页面层面 `touch-action: manipulation`（保留双击缩放关闭，去掉滚动禁用）；
+ *   · 需要独占手势的地方（3D 地球的拖拽）自己在那一小块上声明。
+ *
+ * ⚠️ `touch-action: none` 曾在 `html, body` 上，是为了压住 3D 地球的拖拽。
+ * 地球用的 drei `<OrbitControls>` 会**自己**在 canvas 元素上写
+ * `style.touchAction = 'none'` ⇒ 不再需要全局关手势。
+ */
+html, body {
+  touch-action: manipulation;
 }
 
 /* Mobile touch fixes */

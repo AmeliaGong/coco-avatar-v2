@@ -4,7 +4,7 @@ export function ExpiredPage() {
   const navigate = useNavigate();
 
   return (
-    <div className="flex items-center justify-center h-screen bg-warm-beige/10">
+    <div className="flex items-center justify-center h-app bg-warm-beige/10">
       <div className="text-center p-8 max-w-md">
         <div className="text-6xl mb-4">&#128337;</div>
         <h1 className="text-2xl font-bold text-gray-800 mb-2">
